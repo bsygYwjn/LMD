@@ -1,0 +1,5 @@
+allowBuilds:
+  # esbuild：Vite 依赖，postinstall 校验/修复平台二进制。
+  esbuild: true
+  # lfa-ponyfill：JASSUB 字幕渲染的字体列表生成依赖。
+  lfa-ponyfill: true

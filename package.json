@@ -1,0 +1,40 @@
+{
+  "name": "lmd-local-medium",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "contributors": [
+    "bsygYwjn",
+    "Codex"
+  ],
+  "scripts": {
+    "dev": "vite --config vite.local.config.ts --host 127.0.0.1",
+    "build": "tsc -b && vite build --config vite.local.config.ts",
+    "preview": "vite preview --config vite.local.config.ts --host 127.0.0.1",
+    "server": "node server/index.mjs",
+    "test:access": "node server/access-control.test.mjs",
+    "test:remux": "node server/remux-acceleration.test.mjs",
+    "test:catalog": "node server/catalog-folder-tree.test.mjs && node server/catalog-id-migration.test.mjs",
+    "test:compat-copy": "node server/compatible-copy-directory.test.mjs",
+    "test:rollback": "node server/scan-final-save-rollback.test.mjs",
+    "test:state-save": "node server/state-save-recovery.test.mjs",
+    "test:turbo": "node server/turbo-scan.test.mjs",
+    "test:security": "node server/security-hardening.test.mjs",
+    "test:ffmpeg-install": "node server/ffmpeg-install.test.mjs",
+    "test:all": "npm run test:access && npm run test:remux && npm run test:catalog && npm run test:compat-copy && npm run test:rollback && npm run test:state-save && npm run test:turbo && npm run test:security && npm run test:ffmpeg-install"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "6.0.2",
+    "jassub": "2.4.1",
+    "lucide-react": "^0.468.0",
+    "qrcode": "1.5.4",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "typescript": "5.9.3",
+    "vite": "8.0.13"
+  }
+}
