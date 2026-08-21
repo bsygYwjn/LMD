@@ -11,9 +11,12 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
-public static class LvdNativeWindow {
+public static class LmdNativeWindow {
   [DllImport("user32.dll")]
   public static extern bool ShowWindow(IntPtr windowHandle, int command);
+
+  [DllImport("user32.dll")]
+  public static extern bool SetForegroundWindow(IntPtr windowHandle);
 }
 "@
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -37,6 +40,13 @@ $stopUrl = "http://127.0.0.1:$port/api/service/stop"
 $qrImagePath = Join-Path ([System.IO.Path]::GetTempPath()) ("LMD-tray-qr-{0}.png" -f $PID)
 $runningTrayIconPath = Join-Path $ProjectDirectory "assets\tray-running.ico"
 $stoppedTrayIconPath = Join-Path $ProjectDirectory "assets\tray-stopped.ico"
+$trayLogPath = Join-Path ([System.IO.Path]::GetTempPath()) "LMD-tray.log"
+
+function Write-TrayLog([string]$message) {
+  try {
+    Add-Content -LiteralPath $trayLogPath -Encoding UTF8 -Value ("{0:o} [PID {1}] {2}" -f [DateTime]::Now, $PID, $message)
+  } catch { }
+}
 
 $mutexName = "Local\LMD.Tray.Controller"
 $activationEventName = "Local\LMD.Tray.Activate"
@@ -44,16 +54,21 @@ $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
 
 if (-not $createdNew) {
+  Write-TrayLog "existing tray detected; requesting control panel"
   try {
     $existingEvent = [System.Threading.EventWaitHandle]::OpenExisting($activationEventName)
     [void]$existingEvent.Set()
     $existingEvent.Dispose()
-  } catch { }
+    Write-TrayLog "activation signal sent"
+  } catch {
+    Write-TrayLog ("activation signal failed: {0}" -f $_.Exception.Message)
+  }
   $mutex.Dispose()
   exit 0
 }
 
 $activationEvent = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, $activationEventName)
+Write-TrayLog ("tray started; autostart={0}" -f $Autostart)
 $script:serviceRunning = $false
 $script:primaryViewingUrl = ""
 $script:lastQrUrl = ""
@@ -71,7 +86,7 @@ function New-UiFont([float]$size, [System.Drawing.FontStyle]$style = [System.Dra
   return New-Object System.Drawing.Font("Microsoft YaHei UI", $size, $style, [System.Drawing.GraphicsUnit]::Point)
 }
 
-function Get-LvdHealth {
+function Get-LmdHealth {
   try {
     $health = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 1
     if ($health.name -eq "LMD" -and $health.ok) { return $health }
@@ -139,7 +154,7 @@ function Update-ServiceState {
   if ($script:isUpdating) { return }
   $script:isUpdating = $true
   try {
-    $health = Get-LvdHealth
+    $health = Get-LmdHealth
     $script:serviceRunning = $null -ne $health
 
     if ($script:serviceRunning) {
@@ -194,7 +209,7 @@ function Update-ServiceState {
 }
 
 function Start-SharingService([switch]$Quiet) {
-  if (Get-LvdHealth) {
+  if (Get-LmdHealth) {
     Update-ServiceState
     return
   }
@@ -216,7 +231,7 @@ function Start-SharingService([switch]$Quiet) {
     do {
       [System.Windows.Forms.Application]::DoEvents()
       Start-Sleep -Milliseconds 180
-      $health = Get-LvdHealth
+      $health = Get-LmdHealth
     } while (-not $health -and [DateTime]::UtcNow -lt $deadline -and -not $serviceProcess.HasExited)
 
     Update-ServiceState
@@ -253,7 +268,7 @@ function Invoke-ServiceWatchdog {
 }
 
 function Stop-SharingService {
-  if (-not (Get-LvdHealth)) {
+  if (-not (Get-LmdHealth)) {
     $script:manualStop = $true
     Update-ServiceState
     return
@@ -265,7 +280,7 @@ function Stop-SharingService {
     do {
       [System.Windows.Forms.Application]::DoEvents()
       Start-Sleep -Milliseconds 160
-      $health = Get-LvdHealth
+      $health = Get-LmdHealth
     } while ($health -and [DateTime]::UtcNow -lt $deadline)
 
     Update-ServiceState
@@ -400,7 +415,7 @@ $exitMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem("退出托盘�
 [void]$contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 [void]$contextMenu.Items.Add($exitMenuItem)
 
-function Import-LvdTrayIcon([string]$path) {
+function Import-LmdTrayIcon([string]$path) {
   if (Test-Path -LiteralPath $path) {
     try { return New-Object System.Drawing.Icon($path) }
     catch { }
@@ -408,8 +423,8 @@ function Import-LvdTrayIcon([string]$path) {
   return [System.Drawing.Icon][System.Drawing.SystemIcons]::Application.Clone()
 }
 
-$runningTrayIcon = Import-LvdTrayIcon $runningTrayIconPath
-$stoppedTrayIcon = Import-LvdTrayIcon $stoppedTrayIconPath
+$runningTrayIcon = Import-LmdTrayIcon $runningTrayIconPath
+$stoppedTrayIcon = Import-LmdTrayIcon $stoppedTrayIconPath
 
 $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $notifyIcon.Icon = $stoppedTrayIcon
@@ -419,13 +434,21 @@ $notifyIcon.Visible = $true
 $form.Icon = $stoppedTrayIcon
 
 function Show-ControlPanel {
-  Update-ServiceState
-  if (-not $form.Visible) { $form.Show() }
-  if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+  Write-TrayLog "show control panel requested"
+  try {
+    Update-ServiceState
+    $form.ShowInTaskbar = $true
+    if (-not $form.Visible) { $form.Show() }
     $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+    [void][LmdNativeWindow]::ShowWindow($form.Handle, 5)
+    [void][LmdNativeWindow]::SetForegroundWindow($form.Handle)
+    $form.Activate()
+    $form.BringToFront()
+    Write-TrayLog ("control panel shown; visible={0}; handle={1}" -f $form.Visible, $form.Handle)
+  } catch {
+    Write-TrayLog ("show control panel failed: {0}" -f $_.Exception.ToString())
+    Show-TrayMessage "LMD" "无法打开托盘控制面板，请重新启动 LMD。" ([System.Windows.Forms.ToolTipIcon]::Warning)
   }
-  $form.Activate()
-  $form.BringToFront()
 }
 
 function Open-AdminPage {
@@ -476,25 +499,20 @@ $statusTimer.Start()
 
 $activationTimer = New-Object System.Windows.Forms.Timer
 $activationTimer.Interval = 250
-$activationTimer.Add_Tick({ if ($activationEvent.WaitOne(0)) { Show-ControlPanel } })
-$activationTimer.Start()
-
-if ($Autostart) { $form.ShowInTaskbar = $false }
-$form.Add_Shown({
-  if ($Autostart) {
-    $form.Hide()
-    $form.ShowInTaskbar = $true
-  } else {
-    [void][LvdNativeWindow]::ShowWindow($form.Handle, 5)
-    $form.Activate()
+$activationTimer.Add_Tick({
+  if ($activationEvent.WaitOne(0)) {
+    Write-TrayLog "activation signal received"
+    Show-ControlPanel
   }
 })
+$activationTimer.Start()
 
 Start-SharingService
 Update-ServiceState
+if (-not $Autostart) { Show-ControlPanel }
 
 try {
-  [System.Windows.Forms.Application]::Run($form)
+  [System.Windows.Forms.Application]::Run()
 } finally {
   $statusTimer.Stop()
   $activationTimer.Stop()

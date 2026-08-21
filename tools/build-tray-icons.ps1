@@ -19,7 +19,7 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 
-public static class LvdTrayIconRenderer
+public static class LmdTrayIconRenderer
 {
     private static double Luma(byte red, byte green, byte blue)
     {
@@ -183,7 +183,7 @@ function Write-MultiSizeIcon {
 
   $sizes = @(16, 20, 24, 32, 40, 48, 64, 128, 256)
   $images = New-Object 'System.Collections.Generic.List[byte[]]'
-  foreach ($size in $sizes) { $images.Add([LvdTrayIconRenderer]::RenderPng($Bitmap, $size)) }
+  foreach ($size in $sizes) { $images.Add([LmdTrayIconRenderer]::RenderPng($Bitmap, $size)) }
   $stream = New-Object System.IO.MemoryStream
   $writer = New-Object System.IO.BinaryWriter($stream)
   try {
@@ -223,7 +223,7 @@ function Build-TrayIcon {
   if (-not (Test-Path -LiteralPath $Source)) { throw "Icon source not found: $Source" }
   $assetsDirectory = Join-Path $projectDirectory "assets"
   [System.IO.Directory]::CreateDirectory($assetsDirectory) | Out-Null
-  $bitmap = [LvdTrayIconRenderer]::ExtractForeground($Source)
+  $bitmap = [LmdTrayIconRenderer]::ExtractForeground($Source)
   try {
     $pngPath = Join-Path $assetsDirectory "$Name.png"
     $icoPath = Join-Path $assetsDirectory "$Name.ico"

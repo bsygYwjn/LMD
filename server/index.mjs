@@ -547,7 +547,7 @@ async function setAutostart(enabled) {
     "Set lmdShell = Nothing",
     "",
   ].join("\r\n");
-  await writeFile(AUTOSTART_FILE, script, "utf8");
+  await writeFile(AUTOSTART_FILE, `\uFEFF${script}`, "utf16le");
   return getAutostartStatus();
 }
 
