@@ -8,34 +8,34 @@ importers:
 
   .:
     dependencies:
-      '@vitejs/plugin-react':
-        specifier: 6.0.2
-        version: 6.0.2(vite@8.0.13(@types/node@22.19.19)(esbuild@0.28.1)(jiti@2.7.0)(terser@5.49.0)(tsx@4.23.1))
-      jassub:
-        specifier: 2.4.1
-        version: 2.4.1
-      lucide-react:
-        specifier: ^0.468.0
-        version: 0.468.0(react@19.2.6)
       music-metadata:
         specifier: 11.9.0
         version: 11.9.0
       qrcode:
         specifier: 1.5.4
         version: 1.5.4
-      react:
-        specifier: 19.2.6
-        version: 19.2.6
-      react-dom:
-        specifier: 19.2.6
-        version: 19.2.6(react@19.2.6)
     devDependencies:
+      '@vitejs/plugin-react':
+        specifier: 6.0.2
+        version: 6.0.2(vite@8.0.13(@types/node@22.19.19)(esbuild@0.28.1)(jiti@2.7.0)(terser@5.49.0)(tsx@4.23.1))
       '@types/react':
         specifier: 19.2.14
         version: 19.2.14
       '@types/react-dom':
         specifier: 19.2.3
         version: 19.2.3(@types/react@19.2.14)
+      jassub:
+        specifier: 2.4.1
+        version: 2.4.1
+      lucide-react:
+        specifier: ^0.468.0
+        version: 0.468.0(react@19.2.6)
+      react:
+        specifier: 19.2.6
+        version: 19.2.6
+      react-dom:
+        specifier: 19.2.6
+        version: 19.2.6(react@19.2.6)
       typescript:
         specifier: 5.9.3
         version: 5.9.3

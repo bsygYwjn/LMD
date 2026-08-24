@@ -25,17 +25,17 @@
     "test:all": "node server/access-control.test.mjs && node server/remux-acceleration.test.mjs && node server/catalog-folder-tree.test.mjs && node server/catalog-id-migration.test.mjs && node server/compatible-copy-directory.test.mjs && node server/scan-final-save-rollback.test.mjs && node server/state-save-recovery.test.mjs && node server/turbo-scan.test.mjs && node server/security-hardening.test.mjs && node server/music-library.test.mjs && node server/ffmpeg-install.test.mjs"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "6.0.2",
-    "jassub": "2.4.1",
-    "lucide-react": "^0.468.0",
     "music-metadata": "11.9.0",
-    "qrcode": "1.5.4",
-    "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "qrcode": "1.5.4"
   },
   "devDependencies": {
+    "@vitejs/plugin-react": "6.0.2",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
+    "jassub": "2.4.1",
+    "lucide-react": "^0.468.0",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
     "typescript": "5.9.3",
     "vite": "8.0.13"
   }

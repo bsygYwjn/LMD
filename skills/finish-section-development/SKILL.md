@@ -27,6 +27,6 @@ description: Finish an LMD feature branch when the user says “结束此分区�
 
 ## 发布包边界
 
-发布包包含运行所需的 `assets`、`dist`、`node_modules`、`runtime`、`server`、`tools`、托盘脚本、启动脚本和使用说明；只创建空的 `data/cache` 结构。源码、Git 元数据、开发 skill、测试缓存和真实状态不进入发布包。
+发布包包含运行所需的 `assets`、`dist`、生产依赖、`runtime`、`server`、`tools`、托盘脚本、启动脚本和使用说明；生产依赖必须从锁文件和本地 pnpm store 重新部署，不能直接复制含绝对 junction 的开发 `node_modules`。只创建空的 `data/cache` 结构，源码、Git 元数据、开发 skill、测试缓存和真实状态不进入发布包。
 
 默认发布根目录是 `C:\Users\dytdy\Desktop\LMD发布版`。打包脚本返回目录、ZIP、SHA-256 和文件大小，后续 GitHub Release 必须使用这份已验证的 ZIP。

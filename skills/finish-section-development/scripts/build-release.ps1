@@ -34,8 +34,8 @@ if ($package.version -ne $expectedPackageVersion) {
   throw "package.json 版本为 $($package.version)，期望 $expectedPackageVersion。"
 }
 
-$requiredDirectories = @('assets', 'dist', 'node_modules', 'runtime', 'server', 'tools')
-$requiredFiles = @('启动LMD.vbs', 'LMD使用说明.md', 'README.md', 'package.json', 'tray-qr.mjs', 'tray.ps1')
+$requiredDirectories = @('assets', 'dist', 'runtime', 'server', 'tools')
+$requiredFiles = @('启动LMD.vbs', 'LMD使用说明.md', 'README.md', 'package.json', 'pnpm-lock.yaml', 'tray-qr.mjs', 'tray.ps1')
 foreach ($relativePath in @($requiredDirectories + $requiredFiles)) {
   if (-not (Test-Path -LiteralPath (Join-Path $projectRootFull $relativePath))) {
     throw "发布所需文件不存在：$relativePath"
@@ -52,6 +52,20 @@ try {
   }
   foreach ($file in $requiredFiles) {
     Copy-Item -LiteralPath (Join-Path $projectRootFull $file) -Destination (Join-Path $releaseDirectory $file) -Force
+  }
+
+  $pnpmCommand = Get-Command pnpm.cmd -ErrorAction Stop
+  $pnpmStore = (Resolve-Path -LiteralPath (Join-Path $projectRootFull '.pnpm-store')).Path
+  $previousCi = $env:CI
+  try {
+    $env:CI = 'true'
+    Push-Location -LiteralPath $releaseDirectory
+    & $pnpmCommand.Source install --prod --offline --frozen-lockfile --ignore-scripts --store-dir $pnpmStore --config.node-linker=hoisted
+    if ($LASTEXITCODE -ne 0) { throw "安装发布版运行依赖失败，pnpm 返回 $LASTEXITCODE。" }
+  }
+  finally {
+    Pop-Location
+    $env:CI = $previousCi
   }
 
   foreach ($cachePath in @('data\cache\fonts', 'data\cache\subtitles', 'data\cache\thumbnails', 'data\cache\music-covers', 'data\cache\music-lyrics')) {
