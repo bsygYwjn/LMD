@@ -1,5 +1,5 @@
 import { writeFile } from "node:fs/promises";
-import QRCode from "./vendor/qrcode.cjs";
+import QRCode from "qrcode";
 
 const [, , viewingUrl, outputPath] = process.argv;
 

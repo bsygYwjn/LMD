@@ -1,18 +1,34 @@
 {
-  "name": "lvd-local-video",
-  "version": "0.3.0",
+  "name": "lmd-local-medium",
+  "version": "0.2.0-beta",
   "private": true,
   "type": "module",
+  "contributors": [
+    "bsygYwjn",
+    "Codex"
+  ],
   "scripts": {
     "dev": "vite --config vite.local.config.ts --host 127.0.0.1",
     "build": "tsc -b && vite build --config vite.local.config.ts",
     "preview": "vite preview --config vite.local.config.ts --host 127.0.0.1",
-    "server": "node server/index.mjs"
+    "server": "node server/index.mjs",
+    "test:access": "node server/access-control.test.mjs",
+    "test:remux": "node server/remux-acceleration.test.mjs",
+    "test:catalog": "node server/catalog-folder-tree.test.mjs && node server/catalog-id-migration.test.mjs",
+    "test:compat-copy": "node server/compatible-copy-directory.test.mjs",
+    "test:rollback": "node server/scan-final-save-rollback.test.mjs",
+    "test:state-save": "node server/state-save-recovery.test.mjs",
+    "test:turbo": "node server/turbo-scan.test.mjs",
+    "test:security": "node server/security-hardening.test.mjs",
+    "test:music": "node server/music-library.test.mjs",
+    "test:ffmpeg-install": "node server/ffmpeg-install.test.mjs",
+    "test:all": "node server/access-control.test.mjs && node server/remux-acceleration.test.mjs && node server/catalog-folder-tree.test.mjs && node server/catalog-id-migration.test.mjs && node server/compatible-copy-directory.test.mjs && node server/scan-final-save-rollback.test.mjs && node server/state-save-recovery.test.mjs && node server/turbo-scan.test.mjs && node server/security-hardening.test.mjs && node server/music-library.test.mjs && node server/ffmpeg-install.test.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "6.0.2",
     "jassub": "2.4.1",
     "lucide-react": "^0.468.0",
+    "music-metadata": "11.9.0",
     "qrcode": "1.5.4",
     "react": "19.2.6",
     "react-dom": "19.2.6"

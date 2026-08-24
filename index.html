@@ -4,11 +4,11 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0b0d12" />
-    <title>LVD · 局域网视频库</title>
+    <title>LMD · 局域网视频库</title>
     <script>
       (() => {
         try {
-          const storedTheme = localStorage.getItem("lvd-theme");
+          const storedTheme = localStorage.getItem("lmd-theme");
           const theme = storedTheme === "light" || storedTheme === "dark"
             ? storedTheme
             : matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
