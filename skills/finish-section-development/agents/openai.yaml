@@ -1,0 +1,5 @@
+interface:
+  display_name: "结束分区开发"
+  short_description: "合并主分支、发布 GitHub 版本并生成本地发行包"
+  default_prompt: "Use $finish-section-development to finish the current LMD branch and publish a verified release."
+

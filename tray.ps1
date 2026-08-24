@@ -14,6 +14,8 @@ using System.Runtime.InteropServices;
 public static class LvdNativeWindow {
   [DllImport("user32.dll")]
   public static extern bool ShowWindow(IntPtr windowHandle, int command);
+  [DllImport("user32.dll")]
+  public static extern bool IsWindowVisible(IntPtr windowHandle);
 }
 "@
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -31,32 +33,31 @@ if (-not (Test-Path -LiteralPath $nodeExecutable)) {
 $serverEntry = Join-Path $ProjectDirectory "server\index.mjs"
 $qrHelper = Join-Path $ProjectDirectory "tray-qr.mjs"
 $port = if ($env:LMD_PORT) { [int]$env:LMD_PORT } else { 8096 }
-$healthUrl = "http://127.0.0.1:$port/api/health"
 $adminUrl = "http://127.0.0.1:$port/admin"
-$stopUrl = "http://127.0.0.1:$port/api/service/stop"
 $qrImagePath = Join-Path ([System.IO.Path]::GetTempPath()) ("LMD-tray-qr-{0}.png" -f $PID)
 $runningTrayIconPath = Join-Path $ProjectDirectory "assets\tray-running.ico"
 $stoppedTrayIconPath = Join-Path $ProjectDirectory "assets\tray-stopped.ico"
 
 $mutexName = "Local\LMD.Tray.Controller"
-$activationEventName = "Local\LMD.Tray.Activate"
+$activationFlagPath = Join-Path ([System.IO.Path]::GetTempPath()) "LMD-tray-activate.flag"
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
 
 if (-not $createdNew) {
-  try {
-    $existingEvent = [System.Threading.EventWaitHandle]::OpenExisting($activationEventName)
-    [void]$existingEvent.Set()
-    $existingEvent.Dispose()
-  } catch { }
+  # 已有托盘实例在运行：写激活旗标让它弹出控制面板，本实例随即退出。
+  # （不用命名 EventWaitHandle：实测跨进程 Set 后托盘侧 WaitOne(0) 收不到
+  # 信号，原因不明；旗标文件完全确定性且便于排查。）
+  try { Set-Content -LiteralPath $activationFlagPath -Value "activate" -Encoding ASCII } catch { }
   $mutex.Dispose()
   exit 0
 }
 
-$activationEvent = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, $activationEventName)
+# 接管为唯一实例后，清掉上次残留的旗标，避免开机后误弹面板。
+try { Remove-Item -LiteralPath $activationFlagPath -Force -ErrorAction SilentlyContinue } catch { }
 $script:serviceRunning = $false
 $script:primaryViewingUrl = ""
 $script:lastQrUrl = ""
+$script:qrFailureUntil = $null
 $script:isUpdating = $false
 $script:allowFormClose = $false
 $script:trayIconState = ""
@@ -71,9 +72,44 @@ function New-UiFont([float]$size, [System.Drawing.FontStyle]$style = [System.Dra
   return New-Object System.Drawing.Font("Microsoft YaHei UI", $size, $style, [System.Drawing.GraphicsUnit]::Point)
 }
 
-function Get-LvdHealth {
+# 健康检查用同步 TCP + 硬超时，不用 Invoke-RestMethod（系统代理下可能长时间
+# 不返回）也不用 HttpClient（STA 线程上 .GetResult() 会因同步上下文死锁），
+# 两者都会把托盘 UI 线程整个卡死（表现为托盘图标点不开）。
+function Invoke-LmdHttpRequest([string]$method, [string]$path) {
+  $client = $null
   try {
-    $health = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 1
+    $client = New-Object System.Net.Sockets.TcpClient
+    $client.Connect("127.0.0.1", $port)
+    $stream = $client.GetStream()
+    $stream.ReadTimeout = 1500
+    $stream.WriteTimeout = 1500
+    $request = ("{0} {1} HTTP/1.0`r`nHost: 127.0.0.1:{2}`r`nContent-Length: 0`r`nConnection: close`r`n`r`n" -f $method, $path, $port)
+    $payload = [System.Text.Encoding]::ASCII.GetBytes($request)
+    $stream.Write($payload, 0, $payload.Length)
+
+    $buffer = New-Object byte[] 16384
+    $builder = New-Object System.Text.StringBuilder
+    do {
+      $read = $stream.Read($buffer, 0, $buffer.Length)
+      if ($read -gt 0) {
+        [void]$builder.Append([System.Text.Encoding]::UTF8.GetString($buffer, 0, $read))
+      }
+    } while ($read -gt 0)
+    return $builder.ToString()
+  } catch {
+    return $null
+  } finally {
+    if ($null -ne $client) { $client.Close() }
+  }
+}
+
+function Get-LvdHealth {
+  $raw = Invoke-LmdHttpRequest "GET" "/api/health"
+  if (-not $raw) { return $null }
+  $bodyStart = $raw.IndexOf("`r`n`r`n")
+  if ($bodyStart -lt 0) { return $null }
+  try {
+    $health = $raw.Substring($bodyStart + 4) | ConvertFrom-Json
     if ($health.name -eq "LMD" -and $health.ok) { return $health }
   } catch { }
   return $null
@@ -105,34 +141,49 @@ function Clear-QrImage {
 
 function Set-QrImage([string]$url) {
   if (-not $url -or ($script:lastQrUrl -eq $url -and $qrPicture.Image)) { return }
+  # 二维码生成失败后进入冷却，避免状态定时器每 3 秒重复拉起一次 node 子进程。
+  if ($null -ne $script:qrFailureUntil -and [DateTime]::UtcNow -lt $script:qrFailureUntil) { return }
 
-  $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-  $startInfo.FileName = $nodeExecutable
-  $startInfo.Arguments = ('"{0}" "{1}" "{2}"' -f $qrHelper, $url, $qrImagePath)
-  $startInfo.WorkingDirectory = $ProjectDirectory
-  $startInfo.UseShellExecute = $false
-  $startInfo.CreateNoWindow = $true
-  $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-
-  $generator = New-Object System.Diagnostics.Process
-  $generator.StartInfo = $startInfo
-  [void]$generator.Start()
-  $generator.WaitForExit()
-  if ($generator.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $qrImagePath)) { return }
-
-  $bytes = [System.IO.File]::ReadAllBytes($qrImagePath)
-  $memory = New-Object System.IO.MemoryStream(,$bytes)
   try {
-    $sourceImage = [System.Drawing.Image]::FromStream($memory)
-    try { $newImage = New-Object System.Drawing.Bitmap($sourceImage) }
-    finally { $sourceImage.Dispose() }
-  } finally {
-    $memory.Dispose()
-  }
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $nodeExecutable
+    $startInfo.Arguments = ('"{0}" "{1}" "{2}"' -f $qrHelper, $url, $qrImagePath)
+    $startInfo.WorkingDirectory = $ProjectDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
 
-  if ($qrPicture.Image) { $qrPicture.Image.Dispose() }
-  $qrPicture.Image = $newImage
-  $script:lastQrUrl = $url
+    $generator = New-Object System.Diagnostics.Process
+    $generator.StartInfo = $startInfo
+    [void]$generator.Start()
+    # 必须带超时等待：无超时的 WaitForExit 一旦子进程卡住，托盘 UI 线程会被永久冻结。
+    if (-not $generator.WaitForExit(5000)) {
+      try { $generator.Kill() } catch { }
+      $script:qrFailureUntil = [DateTime]::UtcNow.AddSeconds(60)
+      return
+    }
+    if ($generator.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $qrImagePath)) {
+      $script:qrFailureUntil = [DateTime]::UtcNow.AddSeconds(60)
+      return
+    }
+
+    $bytes = [System.IO.File]::ReadAllBytes($qrImagePath)
+    $memory = New-Object System.IO.MemoryStream(,$bytes)
+    try {
+      $sourceImage = [System.Drawing.Image]::FromStream($memory)
+      try { $newImage = New-Object System.Drawing.Bitmap($sourceImage) }
+      finally { $sourceImage.Dispose() }
+    } finally {
+      $memory.Dispose()
+    }
+
+    if ($qrPicture.Image) { $qrPicture.Image.Dispose() }
+    $qrPicture.Image = $newImage
+    $script:lastQrUrl = $url
+    $script:qrFailureUntil = $null
+  } catch {
+    $script:qrFailureUntil = [DateTime]::UtcNow.AddSeconds(60)
+  }
 }
 
 function Update-ServiceState {
@@ -214,7 +265,8 @@ function Start-SharingService([switch]$Quiet) {
 
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
-      [System.Windows.Forms.Application]::DoEvents()
+      # 不用 DoEvents：消息泵重入会让 PowerShell 引擎在同一线程上嵌套执行
+      # 脚本块，STA 下会死锁（自启动时托盘点不开的另一个根因）。
       Start-Sleep -Milliseconds 180
       $health = Get-LvdHealth
     } while (-not $health -and [DateTime]::UtcNow -lt $deadline -and -not $serviceProcess.HasExited)
@@ -260,10 +312,9 @@ function Stop-SharingService {
   }
 
   try {
-    Invoke-RestMethod -Uri $stopUrl -Method Post -TimeoutSec 3 | Out-Null
+    [void](Invoke-LmdHttpRequest "POST" "/api/service/stop")
     $deadline = [DateTime]::UtcNow.AddSeconds(6)
     do {
-      [System.Windows.Forms.Application]::DoEvents()
       Start-Sleep -Milliseconds 160
       $health = Get-LvdHealth
     } while ($health -and [DateTime]::UtcNow -lt $deadline)
@@ -419,13 +470,14 @@ $notifyIcon.Visible = $true
 $form.Icon = $stoppedTrayIcon
 
 function Show-ControlPanel {
-  Update-ServiceState
+  # 先把窗口亮出来，再刷新状态：即便状态刷新出错，面板也必须能打开。
   if (-not $form.Visible) { $form.Show() }
   if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
     $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
   }
   $form.Activate()
   $form.BringToFront()
+  try { Update-ServiceState } catch { }
 }
 
 function Open-AdminPage {
@@ -466,38 +518,48 @@ $copyButton.Add_Click({
 })
 $exitMenuItem.Add_Click({ Exit-Tray })
 
-$statusTimer = New-Object System.Windows.Forms.Timer
-$statusTimer.Interval = 3000
-$statusTimer.Add_Tick({
-  Update-ServiceState
-  Invoke-ServiceWatchdog
-})
-$statusTimer.Start()
-
-$activationTimer = New-Object System.Windows.Forms.Timer
-$activationTimer.Interval = 250
-$activationTimer.Add_Tick({ if ($activationEvent.WaitOne(0)) { Show-ControlPanel } })
-$activationTimer.Start()
-
-if ($Autostart) { $form.ShowInTaskbar = $false }
-$form.Add_Shown({
-  if ($Autostart) {
-    $form.Hide()
-    $form.ShowInTaskbar = $true
-  } else {
-    [void][LvdNativeWindow]::ShowWindow($form.Handle, 5)
-    $form.Activate()
+# 单一 250ms 脉冲定时器：既轮询激活旗标，也每 12 跳（约 3 秒）刷新一次服务
+# 状态。不再使用双 Timer 方案——实测 statusTimer 会在首轮后被静默停掉，
+# 健康检查和看门狗随之失效；而这个 250ms 定时器可连续跳动数分钟以上。
+$trayPulseTimer = New-Object System.Windows.Forms.Timer
+$trayPulseTimer.Interval = 250
+$script:pulseCount = 0
+$trayPulseTimer.Add_Tick({
+  $script:pulseCount += 1
+  if (Test-Path -LiteralPath $activationFlagPath) {
+    try { Remove-Item -LiteralPath $activationFlagPath -Force -ErrorAction SilentlyContinue } catch { }
+    Show-ControlPanel
   }
+  if (($script:pulseCount % 12) -eq 0) {
+    # 状态刷新里的异常绝不能漏进消息循环，否则托盘会整体失联。
+    try {
+      Update-ServiceState
+      Invoke-ServiceWatchdog
+    } catch { }
+  }
+})
+$trayPulseTimer.Start()
+
+$form.Add_Shown({
+  [void][LvdNativeWindow]::ShowWindow($form.Handle, 5)
+  $form.Activate()
 })
 
 Start-SharingService
 Update-ServiceState
 
 try {
-  [System.Windows.Forms.Application]::Run($form)
+  if ($Autostart) {
+    # Autostart 模式只跑消息循环、窗体保持不显示。不能用 Run($form)（它会
+    # 强制显示窗体）再在 Shown 里 Hide：实测该组合会让 WinForms 可见状态机
+    # 错乱——之后 Visible=true 但原生窗口没有 WS_VISIBLE，面板怎么 Show
+    # 都弹不出来（表现即“托盘图标点不开”）。
+    [System.Windows.Forms.Application]::Run()
+  } else {
+    [System.Windows.Forms.Application]::Run($form)
+  }
 } finally {
-  $statusTimer.Stop()
-  $activationTimer.Stop()
+  $trayPulseTimer.Stop()
   Clear-QrImage
   $notifyIcon.Visible = $false
   $notifyIcon.Dispose()
@@ -505,7 +567,7 @@ try {
   $stoppedTrayIcon.Dispose()
   $contextMenu.Dispose()
   $form.Dispose()
-  $activationEvent.Dispose()
+  try { Remove-Item -LiteralPath $activationFlagPath -Force -ErrorAction SilentlyContinue } catch { }
   Remove-Item -LiteralPath $qrImagePath -Force -ErrorAction SilentlyContinue
   try { $mutex.ReleaseMutex() } catch { }
   $mutex.Dispose()

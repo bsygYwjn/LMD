@@ -8,6 +8,7 @@ import { availableParallelism, networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { createMusicService } from "./music.mjs";
 
 // 这台电脑既是“视频硬盘”，也是局域网服务器。这个文件负责全部本地 API。
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -108,13 +109,15 @@ function defaultAccessCategories() {
   return ["全年龄", "R-18"].map((name) => ({ id: randomUUID(), name, folderIds: [], createdAt: now, updatedAt: now }));
 }
 
-const STATE_VERSION = 8;
+const STATE_VERSION = 9;
 
 function defaultState() {
   return {
     version: STATE_VERSION,
     libraries: [],
     media: [],
+    musicLibraries: [],
+    musicTracks: [],
     jobs: [],
     displayGroups: [],
     accessControl: {
@@ -164,6 +167,8 @@ async function loadState() {
     version: STATE_VERSION,
     libraries: Array.isArray(stored.libraries) ? stored.libraries : defaults.libraries,
     media: Array.isArray(stored.media) ? stored.media : defaults.media,
+    musicLibraries: Array.isArray(stored.musicLibraries) ? stored.musicLibraries : defaults.musicLibraries,
+    musicTracks: Array.isArray(stored.musicTracks) ? stored.musicTracks : defaults.musicTracks,
     jobs: Array.isArray(stored.jobs) ? stored.jobs : defaults.jobs,
     displayGroups: Array.isArray(stored.displayGroups) ? stored.displayGroups : defaults.displayGroups,
     accessControl: {
@@ -190,6 +195,7 @@ async function loadState() {
 }
 
 let appState = await loadState();
+let musicService = null;
 
 // A queued/running FFmpeg process cannot survive a server restart. Mark old
 // records clearly instead of leaving the management page stuck at “processing”.
@@ -402,13 +408,16 @@ function requireViewerAccess(request, response) {
   return null;
 }
 
-function canAccessMedia(context, media) {
+function canAccessFolderId(context, folderId) {
   if (context?.fullAccess) return true;
-  const folderId = stableId(folderPathForMedia(media));
   if (context?.legacyFolderIds?.has(folderId)) return true;
   const category = appState.accessControl.categories.find((item) => item.folderIds.includes(folderId));
   if (category) return Boolean(context?.categoryIds?.has(category.id));
   return Boolean(context?.categoryIds?.has(UNCATEGORIZED_ACCESS_CATEGORY_ID));
+}
+
+function canAccessMedia(context, media) {
+  return canAccessFolderId(context, stableId(folderPathForMedia(media)));
 }
 
 function accessibleMedia(context) {
@@ -846,12 +855,25 @@ function downloadFile(url, destinationPath, onProgress) {
   });
 }
 
-function extractZipWithPowerShell(archivePath, destinationDirectory) {
-  const script = `Expand-Archive -LiteralPath '${archivePath}' -DestinationPath '${destinationDirectory}' -Force`;
-  const encodedScript = Buffer.from(script, "utf16le").toString("base64");
-  return runCommand("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encodedScript], 5 * 60 * 1000, {
-    onChild: (child) => { mediaToolsInstall.activeChild = child; },
-  });
+async function extractZipArchive(archivePath, destinationDirectory) {
+  await mkdir(destinationDirectory, { recursive: true });
+  try {
+    // Windows 10/11 自带的 bsdtar 不依赖 PowerShell.Archive 模块，在精简版
+    // PowerShell 或模块损坏时仍可可靠解压下载的 FFmpeg ZIP。
+    return await runCommand("tar.exe", ["-xf", archivePath, "-C", destinationDirectory], 5 * 60 * 1000, {
+      onChild: (child) => { mediaToolsInstall.activeChild = child; },
+    });
+  } catch (tarError) {
+    const script = `Expand-Archive -LiteralPath '${archivePath.replaceAll("'", "''")}' -DestinationPath '${destinationDirectory.replaceAll("'", "''")}' -Force`;
+    const encodedScript = Buffer.from(script, "utf16le").toString("base64");
+    try {
+      return await runCommand("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encodedScript], 5 * 60 * 1000, {
+        onChild: (child) => { mediaToolsInstall.activeChild = child; },
+      });
+    } catch (powerShellError) {
+      throw new Error(`无法解压 FFmpeg：${tarError.message}; ${powerShellError.message}`);
+    }
+  }
 }
 
 function throwIfInstallCancelled() {
@@ -909,7 +931,7 @@ async function installMediaTools() {
     mediaToolsInstall.status = "extracting";
     mediaToolsInstall.progress = 84;
     mediaToolsInstall.message = "正在解压 FFmpeg…";
-    await extractZipWithPowerShell(archivePath, extractDirectory);
+    await extractZipArchive(archivePath, extractDirectory);
     throwIfInstallCancelled();
 
     const extractedEntries = await readdir(extractDirectory, { withFileTypes: true });
@@ -2209,8 +2231,22 @@ function contentTypeFor(filePath) {
     ".mov": "video/quicktime",
     ".mkv": "video/x-matroska",
     ".webm": "video/webm",
+    ".mp3": "audio/mpeg",
+    ".aac": "audio/aac",
+    ".m4a": "audio/mp4",
+    ".flac": "audio/flac",
+    ".wav": "audio/wav",
+    ".wave": "audio/wav",
+    ".aif": "audio/aiff",
+    ".aiff": "audio/aiff",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg; codecs=opus",
+    ".ape": "audio/x-ape",
+    ".wv": "audio/wavpack",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
     ".ass": "text/x-ssa; charset=utf-8",
     ".ssa": "text/x-ssa; charset=utf-8",
     ".srt": "application/x-subrip; charset=utf-8",
@@ -2250,7 +2286,7 @@ async function streamFile(request, response, filePath, trackPlayback = false) {
   }
 
   if (trackPlayback && request.method !== "HEAD") {
-    if (activeVideoTransfers.size >= appState.settings.maxStreams) return sendJson(response, 503, { error: "当前已有 10 路视频正在传输，请稍后重试。", code: "STREAM_LIMIT" });
+    if (activeVideoTransfers.size >= appState.settings.maxStreams) return sendJson(response, 503, { error: "当前已有 10 路音视频正在传输，请稍后重试。", code: "STREAM_LIMIT" });
     const transferId = randomUUID();
     activeVideoTransfers.add(transferId);
     const release = () => activeVideoTransfers.delete(transferId);
@@ -2539,13 +2575,15 @@ async function moveFilePreservingData(sourcePath, destinationPath) {
 }
 
 async function updateCompatibleCopyDirectory(directoryPath, moveExisting) {
-  if (activeScan) throw new Error("媒体目录正在扫描，请等待扫描完成后再迁移兼容视频。");
-  if (appState.jobs.some((job) => job.status === "queued" || job.status === "running")) throw new Error("仍有兼容视频处理任务，请等待任务完成后再迁移。");
-  if (activeVideoTransfers.size) throw new Error("当前有视频正在传输，请停止播放后再迁移。");
+  if (activeScan || musicService?.isScanning()) throw new Error("媒体目录正在扫描，请等待扫描完成后再迁移兼容副本。");
+  if (appState.jobs.some((job) => job.status === "queued" || job.status === "running")) throw new Error("仍有兼容副本处理任务，请等待任务完成后再迁移。");
+  if (activeVideoTransfers.size) throw new Error("当前有音视频正在传输，请停止播放后再迁移。");
 
   const previousDirectory = compatibleCopyDirectory();
   const nextDirectory = await ensureWritableCompatibleCopyDirectory(directoryPath);
   const sources = new Set(appState.media.map((media) => media.remuxPath).filter(Boolean).map((filePath) => path.resolve(filePath)));
+  const musicSources = new Set((musicService?.compatibleFiles() || []).map((filePath) => path.resolve(filePath).toLowerCase()));
+  for (const filePath of musicService?.compatibleFiles() || []) sources.add(path.resolve(filePath));
   if (pathsAreEqual(previousDirectory, CACHE_DIR)) {
     const cacheEntries = await readdir(CACHE_DIR, { withFileTypes: true });
     for (const entry of cacheEntries) {
@@ -2559,7 +2597,11 @@ async function updateCompatibleCopyDirectory(directoryPath, moveExisting) {
   let movedBytes = 0;
   if (moveExisting) {
     for (const sourcePath of sources) {
-      const destinationPath = path.join(nextDirectory, path.basename(sourcePath));
+      const isMusicCopy = musicSources.has(path.resolve(sourcePath).toLowerCase());
+      const destinationPath = isMusicCopy
+        ? path.join(nextDirectory, "audio", path.basename(sourcePath))
+        : path.join(nextDirectory, path.basename(sourcePath));
+      await mkdir(path.dirname(destinationPath), { recursive: true });
       const result = await moveFilePreservingData(sourcePath, destinationPath);
       if (!result.moved) continue;
       movedFiles += 1;
@@ -2567,6 +2609,7 @@ async function updateCompatibleCopyDirectory(directoryPath, moveExisting) {
       for (const media of appState.media) {
         if (media.remuxPath && pathsAreEqual(media.remuxPath, sourcePath)) media.remuxPath = destinationPath;
       }
+      if (isMusicCopy) musicService?.replaceCompatiblePath(sourcePath, destinationPath);
       await saveState();
     }
   }
@@ -2805,6 +2848,15 @@ async function queueAutomaticCompatibleCopies() {
       if (recovery.changed) stateChanged = true;
       if (recovery.recovered) recovered += 1;
       if (recovery.ready) continue;
+      const currentSignature = mediaSourceSignature(media);
+      const sameSourceAlreadyFailed = appState.jobs.some((job) =>
+        job.mediaId === media.id
+        && job.status === "failed"
+        && job.sourceSignature === currentSignature);
+      // 对同一源文件已经完整执行并校验失败时，不再由每轮自动扫描无限重试。
+      // 管理端的手动重封装入口仍直接调用 startRemuxJob，可在更新 FFmpeg 或
+      // 调整源文件后主动再试；源签名变化也会自然解除这里的熔断。
+      if (sameSourceAlreadyFailed) continue;
       const alreadyActive = remuxTasksByMediaId.has(media.id);
       startRemuxJob(media, true, false);
       if (!alreadyActive) queued += 1;
@@ -3040,7 +3092,10 @@ function catalogFolderNodes(mediaItems, displayIndex = null) {
 }
 
 function validAccessFolderIds(folderIds, displayIndex = null) {
-  const availableIds = new Set(displayFolderSummaries(displayIndex).map((folder) => folder.id));
+  const availableIds = new Set([
+    ...displayFolderSummaries(displayIndex).map((folder) => folder.id),
+    ...(musicService?.allFolderIds() || []),
+  ]);
   return [...new Set(Array.isArray(folderIds) ? folderIds.map(String) : [])].filter((id) => availableIds.has(id));
 }
 
@@ -3054,7 +3109,10 @@ function validAccessCategoryIds(categoryIds) {
 
 function uncategorizedAccessFolderIds(displayIndex = null) {
   const categorizedIds = new Set(appState.accessControl.categories.flatMap((category) => validAccessFolderIds(category.folderIds, displayIndex)));
-  return displayFolderSummaries(displayIndex).map((folder) => folder.id).filter((id) => !categorizedIds.has(id));
+  return [
+    ...displayFolderSummaries(displayIndex).map((folder) => folder.id),
+    ...(musicService?.allFolderIds() || []),
+  ].filter((id) => !categorizedIds.has(id));
 }
 
 function accessControlOverview(displayIndex = null) {
@@ -3130,6 +3188,23 @@ async function serveStatic(response, pathname) {
   return true;
 }
 
+musicService = createMusicService({
+  appState,
+  cacheDirectory: CACHE_DIR,
+  saveState,
+  stableId,
+  getMediaTools: () => mediaTools,
+  getCompatibleCopyDirectory: compatibleCopyDirectory,
+  runCommand,
+  streamFile,
+  sendJson,
+  readJson,
+  requireLocalManagement,
+  requireViewerAccess,
+  canAccessFolderId,
+  pathIsSameOrDescendant,
+});
+
 const server = createServer(async (request, response) => {
   response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   response.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
@@ -3152,6 +3227,7 @@ const server = createServer(async (request, response) => {
 
   try {
     if (!sameOriginMutation(request)) return sendJson(response, 403, { error: "已拒绝跨站操作。", code: "ORIGIN_REJECTED" });
+    if (await musicService.handleRequest(request, response, url, pathname)) return;
     if (request.method === "POST" && pathname === "/api/service/stop") {
       if (!requireLocalManagement(request, response)) return;
       sendJson(response, 202, { ok: true, message: "共享服务正在关闭，系统托盘会继续运行。" });
@@ -3281,7 +3357,7 @@ const server = createServer(async (request, response) => {
       return sendJson(response, 200, {
         libraries: appState.libraries,
         media: compact ? [] : appState.media.map((item) => publicMedia(item, true, displayIndex)),
-        displayFolders: displayFolderSummaries(displayIndex),
+        displayFolders: [...displayFolderSummaries(displayIndex), ...musicService.accessFolderSummaries()],
         jobs: appState.jobs,
         settings: appState.settings,
         tools: mediaTools,
@@ -3428,7 +3504,8 @@ const server = createServer(async (request, response) => {
     if (request.method === "PATCH" && /^\/api\/access-control\/folders\/[^/]+$/.test(pathname)) {
       if (!requireLocalManagement(request, response)) return;
       const folderId = pathname.split("/").pop();
-      if (!displayFolderSummaries().some((folder) => folder.id === folderId)) return sendJson(response, 404, { error: "找不到这个视频文件夹，请先重新扫描。" });
+      const accessFolders = [...displayFolderSummaries(), ...musicService.accessFolderSummaries()];
+      if (!accessFolders.some((folder) => folder.id === folderId)) return sendJson(response, 404, { error: "找不到这个媒体文件夹，请先重新扫描。" });
       const body = await readJson(request);
       const categoryId = body.categoryId === null || body.categoryId === "" ? null : String(body.categoryId || "");
       if (categoryId && !appState.accessControl.categories.some((category) => category.id === categoryId)) return sendJson(response, 400, { error: "选择的文件夹分类不存在。" });
@@ -3666,33 +3743,46 @@ const server = createServer(async (request, response) => {
 });
 
 let autoScanTimer = null;
+let scheduledScanRunning = false;
 
-function runScheduledAutoScan() {
-  if (!appState.settings.autoScanEnabled || !appState.libraries.length || activeScan || pendingScanMode || sharingServiceIsStopping) return;
-  const lastStartedMilliseconds = Date.parse(lastScanStartedAt || "") || 0;
+async function runScheduledAutoScan() {
+  if (!appState.settings.autoScanEnabled || (!appState.libraries.length && !appState.musicLibraries.length) || activeScan || musicService.isScanning() || pendingScanMode || scheduledScanRunning || sharingServiceIsStopping) return;
+  const lastStartedMilliseconds = Math.max(Date.parse(lastScanStartedAt || "") || 0, Date.parse(musicService.scanStatus().lastStartedAt || "") || 0);
   if (Date.now() - lastStartedMilliseconds < normalizedAutoScanIntervalSeconds() * 1000) return;
-  scanLibraries().catch((error) => console.error(`自动扫描媒体目录失败：${error.message}`));
+  scheduledScanRunning = true;
+  try {
+    if (appState.libraries.length) await scanLibraries();
+    if (appState.musicLibraries.length) await musicService.scanLibraries();
+  } catch (error) {
+    console.error(`自动扫描媒体目录失败：${error.message}`);
+  } finally {
+    scheduledScanRunning = false;
+  }
 }
 
 function startAutoScanScheduler() {
   if (autoScanTimer) return;
-  autoScanTimer = setInterval(runScheduledAutoScan, AUTO_SCAN_SCHEDULER_TICK_MS);
+  autoScanTimer = setInterval(() => void runScheduledAutoScan(), AUTO_SCAN_SCHEDULER_TICK_MS);
   autoScanTimer.unref();
-  runScheduledAutoScan();
+  void runScheduledAutoScan();
 }
 
 async function prepareStartupMedia() {
-  if (appState.settings.autoScanEnabled && appState.libraries.length) {
-    await scanLibraries();
+  if (appState.settings.autoScanEnabled && (appState.libraries.length || appState.musicLibraries.length)) {
+    if (appState.libraries.length) await scanLibraries();
+    if (appState.musicLibraries.length) await musicService.scanLibraries();
     return;
   }
   await queueAutomaticCompatibleCopies();
+  await musicService.queueAutomaticCompatibleCopies();
   await cleanOrphanedCacheFiles().catch((error) => console.error(`启动时清理孤儿缓存失败：${error.message}`));
+  await musicService.cleanOrphanedCacheFiles().catch((error) => console.error(`启动时清理音乐缓存失败：${error.message}`));
 }
 
 async function stopSharingService() {
   if (sharingServiceIsStopping) return;
   sharingServiceIsStopping = true;
+  musicService.requestStopScan();
   let serverClosed = false;
   let cleanupComplete = false;
   const exitWhenReady = () => {
