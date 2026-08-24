@@ -60,7 +60,7 @@ try {
   try {
     $env:CI = 'true'
     Push-Location -LiteralPath $releaseDirectory
-    & $pnpmCommand.Source install --prod --offline --frozen-lockfile --ignore-scripts --store-dir $pnpmStore --config.node-linker=hoisted
+    & $pnpmCommand.Source install --prod --frozen-lockfile --ignore-scripts --store-dir $pnpmStore --config.node-linker=hoisted --config.trust-lockfile=true
     if ($LASTEXITCODE -ne 0) { throw "安装发布版运行依赖失败，pnpm 返回 $LASTEXITCODE。" }
   }
   finally {
