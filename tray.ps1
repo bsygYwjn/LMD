@@ -346,7 +346,7 @@ $form.Font = New-UiFont 9
 $titleLabel = New-Object System.Windows.Forms.Label
 $titleLabel.Location = New-Object System.Drawing.Point(28, 24)
 $titleLabel.Size = New-Object System.Drawing.Size(400, 35)
-$titleLabel.Text = "LMD 局域网视频共享"
+$titleLabel.Text = "LMD 局域网媒体与阅读共享"
 $titleLabel.Font = New-UiFont 18 ([System.Drawing.FontStyle]::Bold)
 $titleLabel.ForeColor = [System.Drawing.Color]::FromArgb(20, 35, 60)
 $form.Controls.Add($titleLabel)

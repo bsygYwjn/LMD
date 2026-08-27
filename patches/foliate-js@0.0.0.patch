@@ -1,0 +1,185 @@
+diff --git a/view.js b/view.js
+index 9bdaf022e29f8b491cddfa601a643a2b9df1e990..1c37b516ec22e6c40b824066a6a4acf6d218b3e6 100644
+--- a/view.js
++++ b/view.js
+@@ -10,13 +10,6 @@ const isZip = async file => {
+     return arr[0] === 0x50 && arr[1] === 0x4b && arr[2] === 0x03 && arr[3] === 0x04
+ }
+ 
+-const isPDF = async file => {
+-    const arr = new Uint8Array(await file.slice(0, 5).arrayBuffer())
+-    return arr[0] === 0x25
+-        && arr[1] === 0x50 && arr[2] === 0x44 && arr[3] === 0x46
+-        && arr[4] === 0x2d
+-}
+-
+ const isCBZ = ({ name, type }) =>
+     type === 'application/vnd.comicbook+zip' || name.endsWith('.cbz')
+ 
+@@ -27,19 +20,32 @@ const isFBZ = ({ name, type }) =>
+     type === 'application/x-zip-compressed-fb2'
+     || name.endsWith('.fb2.zip') || name.endsWith('.fbz')
+ 
+-const makeZipLoader = async file => {
++const MAX_ARCHIVE_ENTRIES = 20_000
++const MAX_ARCHIVE_DECLARED_BYTES = 1024 * 1024 * 1024
++const MAX_ARCHIVE_ENTRY_BYTES = 256 * 1024 * 1024
++
++const makeZipLoader = async (file, { sha1 } = {}) => {
+     const { configure, ZipReader, BlobReader, TextWriter, BlobWriter } =
+         await import('./vendor/zip.js')
+     configure({ useWebWorkers: false })
+     const reader = new ZipReader(new BlobReader(file))
+     const entries = await reader.getEntries()
++    if (entries.length > MAX_ARCHIVE_ENTRIES)
++        throw new Error(`Archive contains too many entries (${entries.length})`)
++    const declaredBytes = entries.reduce((sum, entry) =>
++        sum + Math.max(0, Number(entry.uncompressedSize) || 0), 0)
++    if (declaredBytes > MAX_ARCHIVE_DECLARED_BYTES)
++        throw new Error('Archive declared uncompressed size exceeds 1 GiB')
++    if (entries.some(entry => (Number(entry.uncompressedSize) || 0)
++        > MAX_ARCHIVE_ENTRY_BYTES))
++        throw new Error('Archive contains an entry larger than 256 MiB')
+     const map = new Map(entries.map(entry => [entry.filename, entry]))
+     const load = f => (name, ...args) =>
+         map.has(name) ? f(map.get(name), ...args) : null
+     const loadText = load(entry => entry.getData(new TextWriter()))
+     const loadBlob = load((entry, type) => entry.getData(new BlobWriter(type)))
+     const getSize = name => map.get(name)?.uncompressedSize ?? 0
+-    return { entries, loadText, loadBlob, getSize }
++    return { entries, loadText, loadBlob, getSize, sha1 }
+ }
+ 
+ const getFileEntries = async entry => entry.isFile ? entry
+@@ -76,7 +82,7 @@ const fetchFile = async url => {
+     return new File([await res.blob()], new URL(res.url).pathname)
+ }
+ 
+-export const makeBook = async file => {
++export const makeBook = async (file, options = {}) => {
+     if (typeof file === 'string') file = await fetchFile(file)
+     let book
+     if (file.isDirectory) {
+@@ -86,7 +92,7 @@ export const makeBook = async file => {
+     }
+     else if (!file.size) throw new NotFoundError('File not found')
+     else if (await isZip(file)) {
+-        const loader = await makeZipLoader(file)
++        const loader = await makeZipLoader(file, options)
+         if (isCBZ(file)) {
+             const { makeComicBook } = await import('./comic-book.js')
+             book = makeComicBook(loader, file)
+@@ -103,10 +109,6 @@ export const makeBook = async file => {
+             book = await new EPUB(loader).init()
+         }
+     }
+-    else if (await isPDF(file)) {
+-        const { makePDF } = await import('./pdf.js')
+-        book = await makePDF(file)
+-    }
+     else {
+         const { isMOBI, MOBI } = await import('./mobi.js')
+         if (await isMOBI(file)) {
+diff --git a/paginator.js b/paginator.js
+--- a/paginator.js
++++ b/paginator.js
+@@ -252,8 +252,16 @@ class View {
+     }
+     async load(src, afterLoad, beforeRender) {
+         if (typeof src !== 'string') throw new Error(`${src} is not string`)
++        let srcdoc
++        try {
++            const response = await fetch(src)
++            const type = response.headers.get('content-type') ?? ''
++            if (/html|xhtml/i.test(type)) srcdoc = await response.text()
++        } catch (e) {
++            console.warn(e)
++        }
+         return new Promise(resolve => {
+-            this.#iframe.addEventListener('load', () => {
++            const finish = () => {
+                 const doc = this.document
+                 afterLoad?.(doc)
+ 
+@@ -278,8 +286,17 @@ class View {
+                 doc.fonts.ready.then(() => this.expand())
+ 
+                 resolve()
+-            }, { once: true })
+-            this.#iframe.src = src
++            }
++            if (srcdoc != null) {
++                const doc = this.document
++                doc.open()
++                doc.write(srcdoc)
++                doc.close()
++                finish()
++            } else {
++                this.#iframe.addEventListener('load', finish, { once: true })
++                this.#iframe.src = src
++            }
+         })
+     }
+     render(layout) {
+@@ -812,7 +829,7 @@ export class Paginator extends HTMLElement {
+             Math.max(min, Math.min(max, (start + end) / 2
+                 + (isNaN(d) ? 0 : d))) / size)
+ 
+-        this.#scrollToPage(page, 'snap').then(() => {
++        return this.#scrollToPage(page, 'snap').then(() => {
+             const dir = page <= 0 ? -1 : page >= pages - 1 ? 1 : null
+             if (dir) return this.#goTo({
+                 index: this.#adjacentIndex(dir),
+@@ -894,7 +911,7 @@ export class Paginator extends HTMLElement {
+         if (element[scrollProp] === offset) {
+             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
+             this.#afterScroll(reason)
+-            return
++            return Promise.resolve()
+         }
+         // FIXME: vertical-rl only, not -lr
+         if (this.scrolled && this.#vertical) offset = -offset
+@@ -909,6 +926,7 @@ export class Paginator extends HTMLElement {
+             element[scrollProp] = offset
+             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
+             this.#afterScroll(reason)
++            return Promise.resolve()
+         }
+     }
+     async #scrollToPage(page, reason, smooth) {
+@@ -1020,7 +1038,6 @@ export class Paginator extends HTMLElement {
+         }
+     }
+     async goTo(target) {
+-        if (this.#locked) return
+         const resolved = await target
+         if (this.#canGoToIndex(resolved.index)) return this.#goTo(resolved)
+     }
+@@ -1058,16 +1075,18 @@ export class Paginator extends HTMLElement {
+             if (this.sections[index]?.linear !== 'no') return index
+     }
+     async #turnPage(dir, distance) {
+-        if (this.#locked) return
+         this.#locked = true
+-        const prev = dir === -1
+-        const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
+-        if (shouldGo) await this.#goTo({
+-            index: this.#adjacentIndex(dir),
+-            anchor: prev ? () => 1 : () => 0,
+-        })
+-        if (shouldGo || !this.hasAttribute('animated')) await wait(100)
+-        this.#locked = false
++        try {
++            const prev = dir === -1
++            const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
++            if (shouldGo) await this.#goTo({
++                index: this.#adjacentIndex(dir),
++                anchor: prev ? () => 1 : () => 0,
++            })
++            if (shouldGo || !this.hasAttribute('animated')) await wait(100)
++        } finally {
++            this.#locked = false
++        }
+     }
+     prev(distance) {
+         return this.#turnPage(-1, distance)

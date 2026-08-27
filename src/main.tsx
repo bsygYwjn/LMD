@@ -9,6 +9,7 @@ import wasmUrl from "jassub/dist/wasm/jassub-worker.wasm?url";
 import modernWasmUrl from "jassub/dist/wasm/jassub-worker-modern.wasm?url";
 import {
   AlertTriangle,
+  BookOpen,
   Bot,
   Captions,
   ChevronDown,
@@ -27,6 +28,7 @@ import {
   LockKeyhole,
   LogOut,
   Moon,
+  Music2,
   Play,
   Power,
   RefreshCw,
@@ -44,12 +46,19 @@ import {
   MusicAdminPanel,
   MusicFolderView,
   MusicFullPlayer,
-  MusicHomeSection,
   MusicPlayerProvider,
   type MusicCatalog,
   type MusicOverview,
   type MusicTrack,
 } from "./music";
+import {
+  ReadingAdminPanel,
+  ReadingLibraryView,
+  type ReadingCatalog,
+  type ReadingFilter,
+  type ReadingItem,
+  type ReadingOverview,
+} from "./reading";
 import "./styles.css";
 
 type Subtitle = { id: string; name: string; format: string; language: string; url: string; size?: number; modifiedAt?: string };
@@ -91,7 +100,7 @@ type Media = {
 };
 type LibraryFolder = { id: string; name: string; path: string };
 type DisplayGroup = { id: string; folderName?: string; title: string; season: number; configured: boolean; mediaCount: number };
-type DisplayFolder = DisplayGroup & { path: string; customTitle: string; sampleAlias: string; kind?: "music" | "video" };
+type DisplayFolder = DisplayGroup & { path: string; customTitle: string; sampleAlias: string; kind?: "music" | "video" | "reading"; ebookCount?: number; spreadsheetCount?: number };
 type CatalogFolder = {
   id: string;
   parentId: string | null;
@@ -240,7 +249,7 @@ async function api<T>(url: string, options?: RequestInit): Promise<T> {
   return result as T;
 }
 
-async function optionalMusicApi<T>(url: string, fallback: T): Promise<T> {
+async function optionalFeatureApi<T>(url: string, fallback: T): Promise<T> {
   try { return await api<T>(url); }
   catch (error) {
     // 兼容正在安全完成旧版转换任务、尚未重启到音乐后端的 8096 服务。
@@ -383,8 +392,10 @@ function App() {
   const [theme, setTheme] = useState<ThemeMode>(initialTheme);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [musicOverview, setMusicOverview] = useState<MusicOverview | null>(null);
+  const [readingOverview, setReadingOverview] = useState<ReadingOverview | null>(null);
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [musicCatalog, setMusicCatalog] = useState<MusicCatalog | null>(null);
+  const [readingCatalog, setReadingCatalog] = useState<ReadingCatalog | null>(null);
   const [accessStatus, setAccessStatus] = useState<AccessStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -399,6 +410,7 @@ function App() {
   const adminScanActive = Boolean(overview?.scanning || scanIsActive(overview?.scan));
   const adminJobsActive = Boolean(overview?.jobs.some((job) => job.status === "queued" || job.status === "running"));
   const musicAdminActive = Boolean(musicOverview?.scanning || musicOverview?.jobs.some((job) => job.status === "queued" || job.status === "running"));
+  const readingAdminActive = Boolean(readingOverview?.scanning);
 
   const refresh = useCallback(async (quiet = false) => {
     const sequence = ++refreshSequence.current;
@@ -411,9 +423,10 @@ function App() {
         if (!quiet && !initialAdminOverviewLoaded.current) {
           bootstrapActivity = await api("/api/scan/status");
         }
-        const [nextOverview, nextMusicOverview] = await Promise.all([
+        const [nextOverview, nextMusicOverview, nextReadingOverview] = await Promise.all([
           api<Overview>(bootstrapActivity?.scanning ? "/api/overview?compact=1" : "/api/overview"),
-          optionalMusicApi<MusicOverview>("/api/music/overview", { libraries: [], tracks: [], jobs: [], scanning: false, scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
+          optionalFeatureApi<MusicOverview>("/api/music/overview", { libraries: [], tracks: [], jobs: [], scanning: false, scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
+          optionalFeatureApi<ReadingOverview>("/api/reading/overview", { libraries: [], items: [], scanning: false, scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
         ]);
         if (sequence !== refreshSequence.current) return;
         if (bootstrapActivity) {
@@ -425,6 +438,7 @@ function App() {
         initialAdminOverviewLoaded.current = true;
         setOverview(nextOverview);
         setMusicOverview(nextMusicOverview);
+        setReadingOverview(nextReadingOverview);
       } else {
         const nextAccessStatus = await api<AccessStatus>("/api/auth/status");
         if (sequence !== refreshSequence.current) return;
@@ -432,15 +446,18 @@ function App() {
         if (nextAccessStatus.enabled && !nextAccessStatus.authenticated) {
           setCatalog(null);
           setMusicCatalog(null);
+          setReadingCatalog(null);
         }
         else {
-          const [nextCatalog, nextMusicCatalog] = await Promise.all([
+          const [nextCatalog, nextMusicCatalog, nextReadingCatalog] = await Promise.all([
             api<Catalog>("/api/catalog"),
-            optionalMusicApi<MusicCatalog>("/api/music/catalog", { tracks: [], folders: [], scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
+            optionalFeatureApi<MusicCatalog>("/api/music/catalog", { tracks: [], folders: [], scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
+            optionalFeatureApi<ReadingCatalog>("/api/reading/catalog", { items: [], folders: [], scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
           ]);
           if (sequence !== refreshSequence.current) return;
           setCatalog(nextCatalog);
           setMusicCatalog(nextMusicCatalog);
+          setReadingCatalog(nextReadingCatalog);
         }
       }
       setError("");
@@ -478,10 +495,10 @@ function App() {
     return () => window.clearInterval(timer);
   }, [adminJobsActive, adminScanActive, isAdminPath, refreshAdminActivity]);
   useEffect(() => {
-    if (!isAdminPath || !musicAdminActive) return;
+    if (!isAdminPath || (!musicAdminActive && !readingAdminActive)) return;
     const timer = window.setInterval(() => void refresh(true), 1200);
     return () => window.clearInterval(timer);
-  }, [isAdminPath, musicAdminActive, refresh]);
+  }, [isAdminPath, musicAdminActive, readingAdminActive, refresh]);
   useEffect(() => {
     const scanFinished = previousAdminScanActive.current && !adminScanActive;
     const jobsFinished = previousAdminJobsActive.current && !adminJobsActive;
@@ -518,6 +535,7 @@ function App() {
     await api("/api/auth/logout", { method: "POST" });
     setCatalog(null);
     setMusicCatalog(null);
+    setReadingCatalog(null);
     await refresh();
   };
 
@@ -533,6 +551,7 @@ function App() {
         <AdminApp
           overview={overview}
           musicOverview={musicOverview}
+          readingOverview={readingOverview}
           error={error}
           notice={notice}
           section={adminSection}
@@ -545,7 +564,7 @@ function App() {
           onToggleTheme={toggleTheme}
         />
       ) : (
-        <ClientApp catalog={catalog} musicCatalog={musicCatalog} error={error} onRefresh={refresh} accessStatus={accessStatus} onLogout={logout} theme={theme} onToggleTheme={toggleTheme} />
+        <ClientApp catalog={catalog} musicCatalog={musicCatalog} readingCatalog={readingCatalog} error={error} onRefresh={refresh} accessStatus={accessStatus} onLogout={logout} theme={theme} onToggleTheme={toggleTheme} />
       )}
       {isAdminPath && selectedMedia && <PlayerModal media={selectedMedia} onClose={() => setSelectedMedia(null)} />}
     </div>
@@ -590,8 +609,8 @@ function AccessLoginScreen({ theme, onToggleTheme, onAuthenticated }: {
       <section className="access-login-card">
         <div className="access-login-icon"><LockKeyhole size={28} /></div>
         <span className="eyebrow">LAN ACCESS</span>
-        <h1>登录后访问视频</h1>
-        <p>这台 LMD 已开启局域网访问控制。请输入服务器管理员为你分配的六位数字访问码。</p>
+        <h1>登录后访问媒体库</h1>
+        <p>这台 LMD 已开启局域网访问控制。请输入服务器管理员为你分配的六位数字访问码，以浏览获准的视频、音乐和阅读目录。</p>
         <form onSubmit={login}>
           <label><span>六位访问码</span><input className="six-digit-access-input" type="password" inputMode="numeric" pattern="[0-9]{6}" autoComplete="one-time-code" value={accessCode} onChange={(event) => setAccessCode(event.target.value.replace(/\D/g, "").slice(0, 6))} maxLength={6} autoFocus placeholder="••••••" aria-label="六位数字访问码" /></label>
           {error && <div className="access-login-error"><AlertTriangle size={16} /><span>{error}</span></div>}
@@ -663,9 +682,27 @@ function ViewerSession({ accessStatus, onLogout }: { accessStatus: AccessStatus 
   );
 }
 
-function ClientApp({ catalog, musicCatalog, error, onRefresh, accessStatus, onLogout, theme, onToggleTheme }: {
+type ViewerSection = "video" | "music" | "reading";
+
+function sectionFromLocation(): ViewerSection {
+  const value = new URLSearchParams(window.location.search).get("section");
+  return value === "music" || value === "reading" ? value : "video";
+}
+
+function ViewerModeSwitch({ section, onSelect }: { section: ViewerSection; onSelect: (section: ViewerSection) => void }) {
+  return (
+    <nav className="viewer-mode-switch" aria-label="媒体模式">
+      <button type="button" className={section === "video" ? "active" : ""} onClick={() => onSelect("video")}><Film size={16} /><span>视频</span></button>
+      <button type="button" className={section === "music" ? "active" : ""} onClick={() => onSelect("music")}><Music2 size={16} /><span>音乐</span></button>
+      <button type="button" className={section === "reading" ? "active" : ""} onClick={() => onSelect("reading")}><BookOpen size={16} /><span>电子书</span></button>
+    </nav>
+  );
+}
+
+function ClientApp({ catalog, musicCatalog, readingCatalog, error, onRefresh, accessStatus, onLogout, theme, onToggleTheme }: {
   catalog: Catalog | null;
   musicCatalog: MusicCatalog | null;
+  readingCatalog: ReadingCatalog | null;
   error: string;
   onRefresh: (quiet?: boolean) => Promise<void>;
   accessStatus: AccessStatus | null;
@@ -674,15 +711,24 @@ function ClientApp({ catalog, musicCatalog, error, onRefresh, accessStatus, onLo
   onToggleTheme: () => void;
 }) {
   const [search, setSearch] = useState("");
-  const [section, setSection] = useState<"video" | "music">(() => new URLSearchParams(window.location.search).get("section") === "music" ? "music" : "video");
+  const [section, setSection] = useState<ViewerSection>(sectionFromLocation);
   const [selectedMusicFolderId, setSelectedMusicFolderId] = useState<string | null>(() => {
     const parameters = new URLSearchParams(window.location.search);
     return parameters.get("section") === "music" ? parameters.get("folder") : null;
   });
   const [selectedTrackId, setSelectedTrackId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("track"));
+  const [selectedReadingFolderId, setSelectedReadingFolderId] = useState<string | null>(() => {
+    const parameters = new URLSearchParams(window.location.search);
+    return parameters.get("section") === "reading" ? parameters.get("folder") : null;
+  });
+  const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("document"));
+  const [readingFilter, setReadingFilter] = useState<ReadingFilter>(() => {
+    const value = new URLSearchParams(window.location.search).get("kind");
+    return value === "ebook" || value === "spreadsheet" ? value : "all";
+  });
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(() => {
     const parameters = new URLSearchParams(window.location.search);
-    return parameters.get("folder") || parameters.get("series");
+    return sectionFromLocation() === "video" ? parameters.get("folder") || parameters.get("series") : null;
   });
   const [selectedMediaId, setSelectedMediaId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("video"));
   const [scanBusy, setScanBusy] = useState(false);
@@ -773,10 +819,14 @@ function ClientApp({ catalog, musicCatalog, error, onRefresh, accessStatus, onLo
   useEffect(() => {
     const syncRouteFromHistory = () => {
       const parameters = new URLSearchParams(window.location.search);
-      const nextSection = parameters.get("section") === "music" ? "music" : "video";
+      const nextSection = sectionFromLocation();
       setSection(nextSection);
       setSelectedMusicFolderId(nextSection === "music" ? parameters.get("folder") : null);
       setSelectedTrackId(nextSection === "music" ? parameters.get("track") : null);
+      setSelectedReadingFolderId(nextSection === "reading" ? parameters.get("folder") : null);
+      setSelectedDocumentId(nextSection === "reading" ? parameters.get("document") : null);
+      const nextFilter = parameters.get("kind");
+      setReadingFilter(nextFilter === "ebook" || nextFilter === "spreadsheet" ? nextFilter : "all");
       setSelectedFolderId(nextSection === "video" ? parameters.get("folder") || parameters.get("series") : null);
       setSelectedMediaId(nextSection === "video" ? parameters.get("video") : null);
       setSearch("");
@@ -784,6 +834,25 @@ function ClientApp({ catalog, musicCatalog, error, onRefresh, accessStatus, onLo
     window.addEventListener("popstate", syncRouteFromHistory);
     return () => window.removeEventListener("popstate", syncRouteFromHistory);
   }, []);
+
+  const switchSection = (nextSection: ViewerSection) => {
+    if (nextSection === section && !selectedMediaId && !selectedTrackId && !selectedDocumentId) return;
+    const nextUrl = new URL(window.location.href);
+    for (const key of ["folder", "series", "video", "track", "document", "kind"]) nextUrl.searchParams.delete(key);
+    if (nextSection === "video") nextUrl.searchParams.delete("section");
+    else nextUrl.searchParams.set("section", nextSection);
+    window.history.pushState({ section: nextSection }, "", nextUrl);
+    setSection(nextSection);
+    setSelectedFolderId(null);
+    setSelectedMediaId(null);
+    setSelectedMusicFolderId(null);
+    setSelectedTrackId(null);
+    setSelectedReadingFolderId(null);
+    setSelectedDocumentId(null);
+    setReadingFilter("all");
+    setSearch("");
+    window.scrollTo({ top: 0, left: 0 });
+  };
 
   const openFolder = (folderId: string) => {
     const folder = folderById.get(folderId);
@@ -833,12 +902,17 @@ function ClientApp({ catalog, musicCatalog, error, onRefresh, accessStatus, onLo
     nextUrl.searchParams.delete("video");
     nextUrl.searchParams.delete("section");
     nextUrl.searchParams.delete("track");
+    nextUrl.searchParams.delete("document");
+    nextUrl.searchParams.delete("kind");
     window.history.pushState({ folder: null }, "", nextUrl);
     setSelectedFolderId(null);
     setSelectedMediaId(null);
     setSection("video");
     setSelectedMusicFolderId(null);
     setSelectedTrackId(null);
+    setSelectedReadingFolderId(null);
+    setSelectedDocumentId(null);
+    setReadingFilter("all");
     setSearch("");
     window.scrollTo({ top: 0, left: 0 });
   };
@@ -856,6 +930,8 @@ function ClientApp({ catalog, musicCatalog, error, onRefresh, accessStatus, onLo
     setSelectedTrackId(null);
     setSelectedFolderId(null);
     setSelectedMediaId(null);
+    setSelectedReadingFolderId(null);
+    setSelectedDocumentId(null);
     setSearch("");
     window.scrollTo({ top: 0, left: 0 });
   };
@@ -873,18 +949,86 @@ function ClientApp({ catalog, musicCatalog, error, onRefresh, accessStatus, onLo
     setSelectedTrackId(track.id);
     setSelectedFolderId(null);
     setSelectedMediaId(null);
+    setSelectedReadingFolderId(null);
+    setSelectedDocumentId(null);
     setSearch("");
     window.scrollTo({ top: 0, left: 0 });
+  };
+
+  const openReadingFolder = (folderId: string) => {
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.set("section", "reading");
+    nextUrl.searchParams.set("folder", folderId);
+    nextUrl.searchParams.delete("document");
+    nextUrl.searchParams.delete("track");
+    nextUrl.searchParams.delete("video");
+    nextUrl.searchParams.delete("series");
+    nextUrl.searchParams.delete("document");
+    nextUrl.searchParams.delete("kind");
+    if (readingFilter === "all") nextUrl.searchParams.delete("kind");
+    else nextUrl.searchParams.set("kind", readingFilter);
+    window.history.pushState({ section: "reading", folder: folderId }, "", nextUrl);
+    setSection("reading");
+    setSelectedReadingFolderId(folderId);
+    setSelectedDocumentId(null);
+    setSelectedMusicFolderId(null);
+    setSelectedTrackId(null);
+    setSelectedFolderId(null);
+    setSelectedMediaId(null);
+    setSearch("");
+    window.scrollTo({ top: 0, left: 0 });
+  };
+
+  const openReadingLibrary = () => {
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.set("section", "reading");
+    nextUrl.searchParams.delete("folder");
+    nextUrl.searchParams.delete("document");
+    if (readingFilter === "all") nextUrl.searchParams.delete("kind");
+    else nextUrl.searchParams.set("kind", readingFilter);
+    window.history.pushState({ section: "reading" }, "", nextUrl);
+    setSection("reading");
+    setSelectedReadingFolderId(null);
+    setSelectedDocumentId(null);
+    setSearch("");
+    window.scrollTo({ top: 0, left: 0 });
+  };
+
+  const openReadingDocument = (item: ReadingItem) => {
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.set("section", "reading");
+    nextUrl.searchParams.set("folder", item.folderId);
+    nextUrl.searchParams.set("document", item.id);
+    if (readingFilter === "all") nextUrl.searchParams.delete("kind");
+    else nextUrl.searchParams.set("kind", readingFilter);
+    nextUrl.searchParams.delete("track");
+    nextUrl.searchParams.delete("video");
+    nextUrl.searchParams.delete("series");
+    window.history.pushState({ section: "reading", folder: item.folderId, document: item.id }, "", nextUrl);
+    setSection("reading");
+    setSelectedReadingFolderId(item.folderId);
+    setSelectedDocumentId(item.id);
+    setSearch("");
+    window.scrollTo({ top: 0, left: 0 });
+  };
+
+  const changeReadingFilter = (filter: ReadingFilter) => {
+    const nextUrl = new URL(window.location.href);
+    if (filter === "all") nextUrl.searchParams.delete("kind");
+    else nextUrl.searchParams.set("kind", filter);
+    window.history.replaceState({ ...window.history.state, kind: filter }, "", nextUrl);
+    setReadingFilter(filter);
   };
 
   const scanNow = async () => {
     setScanBusy(true);
     const musicMode = section === "music";
-    setScanNotice({ text: musicMode ? "正在扫描音乐目录、标签、封面与歌词…" : "正在扫描视频目录并刷新文件列表…", tone: "success" });
+    const readingMode = section === "reading";
+    setScanNotice({ text: musicMode ? "正在扫描音乐目录、标签、封面与歌词…" : readingMode ? "正在扫描电子书与表格目录…" : "正在扫描视频目录并刷新文件列表…", tone: "success" });
     try {
-      const result = await api<{ count: number }>(musicMode ? "/api/music/catalog/scan" : "/api/catalog/scan", { method: "POST" });
+      const result = await api<{ count: number }>(musicMode ? "/api/music/catalog/scan" : readingMode ? "/api/reading/catalog/scan" : "/api/catalog/scan", { method: "POST" });
       await onRefresh(true);
-      setScanNotice({ text: musicMode ? `扫描完成，当前共有 ${result.count} 首歌曲。` : `扫描完成，当前共有 ${result.count} 个视频文件。`, tone: "success" });
+      setScanNotice({ text: musicMode ? `扫描完成，当前共有 ${result.count} 首歌曲。` : readingMode ? `扫描完成，当前共有 ${result.count} 个阅读文件。` : `扫描完成，当前共有 ${result.count} 个视频文件。`, tone: "success" });
     } catch (operationError) {
       setScanNotice({ text: operationError instanceof Error ? operationError.message : "扫描刷新失败", tone: "warning" });
     } finally { setScanBusy(false); }
@@ -893,7 +1037,7 @@ function ClientApp({ catalog, musicCatalog, error, onRefresh, accessStatus, onLo
   if (section === "music" && selectedTrackId && musicCatalog) {
     return (
       <div className="client-page client-player-page music-route-page">
-        <header className="client-header"><Brand onHome={openLibrary} /><div className="header-actions"><ViewerSession accessStatus={accessStatus} onLogout={onLogout} /><ThemeToggle theme={theme} onToggle={onToggleTheme} /></div></header>
+        <header className="client-header"><Brand onHome={openLibrary} /><ViewerModeSwitch section={section} onSelect={switchSection} /><div className="header-actions"><ViewerSession accessStatus={accessStatus} onLogout={onLogout} /><ThemeToggle theme={theme} onToggle={onToggleTheme} /></div></header>
         <main className="client-player-main music-player-main">
           <MusicFullPlayer catalog={musicCatalog} trackId={selectedTrackId} />
         </main>
@@ -906,6 +1050,7 @@ function ClientApp({ catalog, musicCatalog, error, onRefresh, accessStatus, onLo
       <div className="client-page music-route-page">
         <header className="client-header">
           <Brand onHome={openLibrary} />
+          <ViewerModeSwitch section={section} onSelect={switchSection} />
           <div className="header-actions">
             <ViewerSession accessStatus={accessStatus} onLogout={onLogout} />
             <ThemeToggle theme={theme} onToggle={onToggleTheme} />
@@ -922,10 +1067,31 @@ function ClientApp({ catalog, musicCatalog, error, onRefresh, accessStatus, onLo
     );
   }
 
+  if (section === "reading" && readingCatalog) {
+    return (
+      <div className={`client-page reading-route-page${selectedDocumentId ? " client-player-page" : ""}`}>
+        <header className="client-header">
+          <Brand onHome={openLibrary} />
+          <ViewerModeSwitch section={section} onSelect={switchSection} />
+          <div className="header-actions">
+            <ViewerSession accessStatus={accessStatus} onLogout={onLogout} />
+            <ThemeToggle theme={theme} onToggle={onToggleTheme} />
+            {!selectedDocumentId && <><button className="client-scan-now" onClick={scanNow} disabled={scanBusy} title="立即扫描阅读目录"><RefreshCw size={16} className={scanBusy ? "spin" : ""} /><span>刷新阅读</span></button><label className="search-box"><Search size={17} /><input aria-label="搜索电子书、表格或格式" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索书名、表格、格式…" /></label></>}
+          </div>
+        </header>
+        <main className={selectedDocumentId ? "client-player-main reading-player-main" : "client-main reading-client-main"}>
+          {error && <StatusBanner tone="warning" icon={<AlertTriangle size={18} />}>{error}</StatusBanner>}
+          {scanNotice && !selectedDocumentId && <StatusBanner tone={scanNotice.tone} icon={scanNotice.tone === "warning" ? <AlertTriangle size={18} /> : <CheckCircle2 size={18} />}>{scanNotice.text}</StatusBanner>}
+          <ReadingLibraryView catalog={readingCatalog} folderId={selectedReadingFolderId} documentId={selectedDocumentId} filter={readingFilter} search={search} theme={theme} onOpenFolder={openReadingFolder} onOpenDocument={openReadingDocument} onBackToLibrary={openReadingLibrary} onFilterChange={changeReadingFilter} />
+        </main>
+      </div>
+    );
+  }
+
   if (selectedMedia) {
     return (
       <div className="client-page client-player-page">
-        <header className="client-header"><Brand onHome={openLibrary} /><div className="header-actions"><ViewerSession accessStatus={accessStatus} onLogout={onLogout} /><ThemeToggle theme={theme} onToggle={onToggleTheme} /></div></header>
+        <header className="client-header"><Brand onHome={openLibrary} /><ViewerModeSwitch section={section} onSelect={switchSection} /><div className="header-actions"><ViewerSession accessStatus={accessStatus} onLogout={onLogout} /><ThemeToggle theme={theme} onToggle={onToggleTheme} /></div></header>
         <main className="client-player-main">
           <PlayerModal
             media={selectedMedia}
@@ -944,6 +1110,7 @@ function ClientApp({ catalog, musicCatalog, error, onRefresh, accessStatus, onLo
     <div className="client-page" style={{ "--hero-hue": currentCover?.posterHue || 205 } as React.CSSProperties}>
       <header className="client-header">
         <Brand onHome={openLibrary} />
+        <ViewerModeSwitch section={section} onSelect={switchSection} />
         <div className="header-actions">
           <ViewerSession accessStatus={accessStatus} onLogout={onLogout} />
           <ThemeToggle theme={theme} onToggle={onToggleTheme} />
@@ -972,17 +1139,16 @@ function ClientApp({ catalog, musicCatalog, error, onRefresh, accessStatus, onLo
           </div>
         </section>
         <section className="media-section">
-          <div className="section-heading">
-            <div><span className="section-kicker">{currentFolder ? "FOLDER" : "LIBRARY"}</span><h2>{currentFolder ? "文件夹内容" : "全部视频目录"}</h2></div>
+          {currentFolder && <div className="section-heading">
+            <div><span className="section-kicker">FOLDER</span><h2>文件夹内容</h2></div>
             <span className="media-count">{visibleFolders.length} 个文件夹 · {visibleMedia.length} 个视频</span>
-          </div>
+          </div>}
           <div className="media-grid">
             {visibleFolders.map((folder) => <FolderCard key={folder.id} folder={folder} cover={folder.coverMediaId ? mediaById.get(folder.coverMediaId) || null : null} onOpen={() => openFolder(folder.id)} />)}
             {visibleMedia.map((item) => <MediaCard key={item.id} media={item} onPlay={() => openMedia(item)} />)}
           </div>
           {!visibleFolders.length && !visibleMedia.length && <div className="client-empty"><Library size={30} /><strong>{normalizedSearch ? "没有匹配的内容" : currentFolder ? "这个文件夹暂时为空" : "媒体库暂时为空"}</strong><span>{normalizedSearch ? "请尝试其他文件夹名或视频名。" : currentFolder ? "此处没有可播放视频或包含视频的子文件夹。" : "请添加视频目录，或把视频放入已有目录后重新扫描。"}</span></div>}
         </section>
-        {!currentFolder && <MusicHomeSection catalog={musicCatalog} search={search} onOpenFolder={openMusicFolder} onOpenTrack={openMusicTrack} />}
       </main>
     </div>
   );
@@ -1126,6 +1292,7 @@ function RapidScanDialog({ state, scan, starting, startError, onStart, onClose }
 function AdminApp(props: {
   overview: Overview | null;
   musicOverview: MusicOverview | null;
+  readingOverview: ReadingOverview | null;
   error: string;
   notice: string;
   section: AdminSection;
@@ -1137,7 +1304,7 @@ function AdminApp(props: {
   theme: ThemeMode;
   onToggleTheme: () => void;
 }) {
-  const { overview, musicOverview, error, notice, section, onSectionChange, onRefresh, onNotice, onError, onPlay, theme, onToggleTheme } = props;
+  const { overview, musicOverview, readingOverview, error, notice, section, onSectionChange, onRefresh, onNotice, onError, onPlay, theme, onToggleTheme } = props;
   const [rapidScanDialog, setRapidScanDialog] = useState<RapidScanDialogState | null>(null);
   const [turboActionBusy, setTurboActionBusy] = useState(false);
   const [turboStartError, setTurboStartError] = useState("");
@@ -1208,7 +1375,7 @@ function AdminApp(props: {
         <header className="admin-topbar"><div><span className="eyebrow">LMD LOCAL CONTROL</span><h1>{sectionTitle}</h1></div><ThemeToggle theme={theme} onToggle={onToggleTheme} /></header>
         {error && <StatusBanner tone="warning" icon={<AlertTriangle size={18} />}>{error}</StatusBanner>}
         {notice && <StatusBanner tone="success" icon={<CheckCircle2 size={18} />}>{notice}</StatusBanner>}
-        {section === "overview" && <OverviewPanel overview={overview} musicOverview={musicOverview} onRefresh={onRefresh} onNotice={onNotice} onLibraryAdded={promptForTurboScan} onPlay={onPlay} />}
+        {section === "overview" && <OverviewPanel overview={overview} musicOverview={musicOverview} readingOverview={readingOverview} onRefresh={onRefresh} onNotice={onNotice} onLibraryAdded={promptForTurboScan} onPlay={onPlay} />}
         {section === "access" && overview?.accessControl.enabled && <AccessControlPanel overview={overview} onRefresh={onRefresh} onNotice={onNotice} />}
         {section === "settings" && <SettingsPanel overview={overview} onRefresh={onRefresh} onNotice={onNotice} onError={onError} onOpenAccess={() => onSectionChange("access")} onStartTurboScan={() => void startTurboScan()} onStopTurboScan={() => void stopTurboScan()} turboActionBusy={turboActionBusy} />}
       </main>
@@ -1217,7 +1384,7 @@ function AdminApp(props: {
   );
 }
 
-function OverviewPanel({ overview, musicOverview, onRefresh, onNotice, onLibraryAdded, onPlay }: { overview: Overview | null; musicOverview: MusicOverview | null; onRefresh: (quiet?: boolean) => Promise<void>; onNotice: (value: string) => void; onLibraryAdded: (library: LibraryFolder) => void; onPlay: (media: Media) => void }) {
+function OverviewPanel({ overview, musicOverview, readingOverview, onRefresh, onNotice, onLibraryAdded, onPlay }: { overview: Overview | null; musicOverview: MusicOverview | null; readingOverview: ReadingOverview | null; onRefresh: (quiet?: boolean) => Promise<void>; onNotice: (value: string) => void; onLibraryAdded: (library: LibraryFolder) => void; onPlay: (media: Media) => void }) {
   const [folderPath, setFolderPath] = useState("");
   const [busy, setBusy] = useState(false);
   const [compatibilityExpanded, setCompatibilityExpanded] = useState(false);
@@ -1339,7 +1506,9 @@ function OverviewPanel({ overview, musicOverview, onRefresh, onNotice, onLibrary
 
       <MusicAdminPanel overview={musicOverview} onRefresh={onRefresh} onNotice={onNotice} />
 
-      <DisplayFoldersPanel folders={(overview?.displayFolders || []).filter((folder) => folder.kind !== "music")} onRefresh={onRefresh} onNotice={onNotice} />
+      <ReadingAdminPanel overview={readingOverview} onRefresh={onRefresh} onNotice={onNotice} />
+
+      <DisplayFoldersPanel folders={(overview?.displayFolders || []).filter((folder) => folder.kind !== "music" && folder.kind !== "reading")} onRefresh={onRefresh} onNotice={onNotice} />
 
       <section className={`panel media-table-panel collapsible-panel${compatibilityExpanded ? "" : " is-collapsed"}`}>
         <div className="panel-title"><div><span className="panel-icon"><Library size={20} /></span><div><h2>自动兼容处理</h2><p>扫描或启动时会自动检测 MKV、FLAC/Opus 等浏览器不易直放的组合，当前最多同时生成 {remuxConcurrency} 个 MP4 + AAC 副本；视频不重新压缩。</p></div></div><div className="panel-actions"><span className="table-count">{media.length} 个文件 · {pendingCompatibility.length} 个等待/处理中</span><button className="secondary-button" onClick={prepareCompatibleCopies} disabled={busy || !pendingCompatibility.length}><RefreshCw size={16} className={activeJobs ? "spin" : ""} />重新检查自动队列</button><button type="button" className="collapse-button" onClick={() => setCompatibilityExpanded((expanded) => !expanded)} aria-expanded={compatibilityExpanded} aria-controls="compatibility-list" aria-label={compatibilityExpanded ? "折叠自动兼容处理" : "展开自动兼容处理"} title={compatibilityExpanded ? "折叠" : "展开"}><ChevronDown size={18} /></button></div></div>
@@ -1461,7 +1630,7 @@ function AccessControlPanel({ overview, onRefresh, onNotice }: {
       <section className="panel access-mode-panel is-enabled">
         <div className="access-mode-summary">
           <span className="access-mode-icon"><ShieldCheck size={28} /></span>
-          <div><span className="eyebrow">CLASSIFIED ACCESS</span><h2>分类访问控制已开启</h2><p>未归类的视频或音乐文件夹会自动进入“未分类”，可与“全年龄”“R-18”等分类一样授权给六位访问码用户。关闭功能请前往“运行设置”。</p></div>
+          <div><span className="eyebrow">CLASSIFIED ACCESS</span><h2>分类访问控制已开启</h2><p>未归类的视频、音乐或阅读文件夹会自动进入“未分类”，可与“全年龄”“R-18”等分类一样授权给六位访问码用户。关闭功能请前往“运行设置”。</p></div>
         </div>
         <div className="access-mode-actions">
           <div><strong>{accessControl?.users.filter((user) => user.enabled).length || 0}</strong><span>位已启用用户</span></div>
@@ -1531,13 +1700,17 @@ function FolderCategoriesPanel({ folders, categories, onRefresh, onNotice }: {
   const categoryForFolder = (folderId: string) => editableCategories.find((category) => category.folderIds.includes(folderId))?.id || "";
   return (
     <section className="panel access-categories-panel">
-      <div className="panel-title"><div><span className="panel-icon"><FolderOpen size={20} /></span><div><h2>文件夹分类</h2><p>每个视频或音乐文件夹归入一个分类；未手动归类的文件夹会自动进入“未分类”，并可单独授权。</p></div></div><span className="table-count">{categories.length} 个分类</span></div>
+      <div className="panel-title"><div><span className="panel-icon"><FolderOpen size={20} /></span><div><h2>文件夹分类</h2><p>每个视频、音乐或阅读文件夹归入一个分类；未手动归类的文件夹会自动进入“未分类”，并可单独授权。</p></div></div><span className="table-count">{categories.length} 个分类</span></div>
       <div className="category-create-row"><input value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && name.trim()) void addCategory(); }} maxLength={40} placeholder="新分类，例如：儿童专区" /><button className="primary-button" onClick={addCategory} disabled={busy || !name.trim()}><FolderOpen size={16} />建立分类</button></div>
       <div className="category-editor-list">
         {categories.map((category) => <AccessCategoryEditor key={category.id} category={category} onRefresh={onRefresh} onNotice={onNotice} />)}
       </div>
       <div className="folder-classification-list">
-        {folders.length ? folders.map((folder) => <div className="folder-classification-row" key={folder.id}><div><strong>{folder.title}</strong><span>{folder.folderName} · {folder.mediaCount} {folder.kind === "music" ? "首歌曲" : "个视频"} · {folder.kind === "music" ? "音乐" : "视频"}</span></div><select value={categoryForFolder(folder.id)} onChange={(event) => void assignFolder(folder, event.target.value)} disabled={busy}><option value="">未分类</option>{editableCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></div>) : <div className="access-empty-folders">请先在“总览”添加媒体目录并完成扫描。</div>}
+        {folders.length ? folders.map((folder) => {
+          const typeLabel = folder.kind === "music" ? "音乐" : folder.kind === "reading" ? "阅读" : "视频";
+          const countLabel = folder.kind === "music" ? `${folder.mediaCount} 首歌曲` : folder.kind === "reading" ? `${folder.ebookCount || 0} 本书 · ${folder.spreadsheetCount || 0} 个表格` : `${folder.mediaCount} 个视频`;
+          return <div className="folder-classification-row" key={folder.id}><div><strong>{folder.title}</strong><span>{folder.folderName} · {countLabel} · {typeLabel}</span></div><select value={categoryForFolder(folder.id)} onChange={(event) => void assignFolder(folder, event.target.value)} disabled={busy}><option value="">未分类</option>{editableCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></div>;
+        }) : <div className="access-empty-folders">请先在“总览”添加媒体目录并完成扫描。</div>}
       </div>
     </section>
   );

@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -74,6 +74,16 @@ try {
   const health = await waitForHealth(localBaseUrl, serverProcess);
   assert.ok(health.lanAddresses.length, "测试需要至少一个局域网 IPv4 地址");
   const lanBaseUrl = health.lanAddresses[0];
+
+  const pageResponse = await fetch(`${localBaseUrl}/`);
+  const csp = pageResponse.headers.get("content-security-policy") || "";
+  assert.match(csp, /script-src 'self'/, "页面应只允许执行本地脚本");
+  assert.match(csp, /object-src 'none'/, "页面应禁止对象嵌入");
+  assert.match(csp, /worker-src 'self' blob:/, "PDF、字幕和表格 Worker 应受显式 CSP 约束");
+  assert.match(csp, /connect-src 'self' blob:/, "电子书章节应只允许读取本地接口与受控 Blob 资源");
+  assert.equal(pageResponse.headers.get("x-content-type-options"), "nosniff");
+  const builtIndex = await readFile(path.join(PROJECT_DIR, "dist", "index.html"), "utf8");
+  assert.equal(/<script(?![^>]*\bsrc=)[^>]*>/i.test(builtIndex), false, "生产首页不得保留内联主题脚本");
 
   // ---------- 1. 畸形 URL 不再导致进程崩溃 ----------
   for (const badPath of ["/%zz", "/api/%E0%A4%A", "/test%2"]) {

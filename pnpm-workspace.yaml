@@ -3,3 +3,5 @@ allowBuilds:
   esbuild: true
   # lfa-ponyfill：JASSUB 字幕渲染的字体列表生成依赖。
   lfa-ponyfill: true
+patchedDependencies:
+  foliate-js@0.0.0: patches/foliate-js@0.0.0.patch
