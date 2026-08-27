@@ -34,7 +34,7 @@ if ($package.version -ne $expectedPackageVersion) {
   throw "package.json 版本为 $($package.version)，期望 $expectedPackageVersion。"
 }
 
-$requiredDirectories = @('assets', 'dist', 'runtime', 'server', 'tools')
+$requiredDirectories = @('assets', 'dist', 'patches', 'runtime', 'server', 'tools')
 $requiredFiles = @('启动LMD.vbs', 'LMD使用说明.md', 'README.md', 'package.json', 'pnpm-lock.yaml', 'tray-qr.mjs', 'tray.ps1')
 foreach ($relativePath in @($requiredDirectories + $requiredFiles)) {
   if (-not (Test-Path -LiteralPath (Join-Path $projectRootFull $relativePath))) {
