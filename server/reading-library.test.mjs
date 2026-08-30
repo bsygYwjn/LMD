@@ -227,7 +227,7 @@ try {
   assert.equal(request.result.count, formats.length, "增量扫描应清理已删除文件的索引");
 
   const storedState = JSON.parse(await readFile(path.join(dataDirectory, "state.json"), "utf8"));
-  assert.equal(storedState.version, 10);
+  assert.equal(storedState.version, 11);
   assert.equal(storedState.readingLibraries.length, 2);
   assert.equal(storedState.readingItems.length, formats.length);
 

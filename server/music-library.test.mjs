@@ -246,7 +246,7 @@ try {
   assert.equal((await compatibleResponse.arrayBuffer()).byteLength, 16);
 
   const storedState = JSON.parse(await readFile(path.join(dataDirectory, "state.json"), "utf8"));
-  assert.equal(storedState.version, 10);
+  assert.equal(storedState.version, 11);
   assert.equal(storedState.libraries.length, 1, "版本 8 的视频 libraries 必须原样保留");
   assert.equal(storedState.libraries[0].id, "legacy-library");
   assert.equal(storedState.media.length, 1, "版本 8 的视频记录必须在音乐迁移后保留");

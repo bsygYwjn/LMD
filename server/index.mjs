@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createMusicService } from "./music.mjs";
 import { createReadingService } from "./reading.mjs";
+import { createPhotoService } from "./photos.mjs";
 
 // 这台电脑既是“视频硬盘”，也是局域网服务器。这个文件负责全部本地 API。
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -110,7 +111,7 @@ function defaultAccessCategories() {
   return ["全年龄", "R-18"].map((name) => ({ id: randomUUID(), name, folderIds: [], createdAt: now, updatedAt: now }));
 }
 
-const STATE_VERSION = 10;
+const STATE_VERSION = 11;
 
 function defaultState() {
   return {
@@ -121,6 +122,8 @@ function defaultState() {
     musicTracks: [],
     readingLibraries: [],
     readingItems: [],
+    photoLibraries: [],
+    photoItems: [],
     jobs: [],
     displayGroups: [],
     accessControl: {
@@ -174,6 +177,8 @@ async function loadState() {
     musicTracks: Array.isArray(stored.musicTracks) ? stored.musicTracks : defaults.musicTracks,
     readingLibraries: Array.isArray(stored.readingLibraries) ? stored.readingLibraries : defaults.readingLibraries,
     readingItems: Array.isArray(stored.readingItems) ? stored.readingItems : defaults.readingItems,
+    photoLibraries: Array.isArray(stored.photoLibraries) ? stored.photoLibraries : defaults.photoLibraries,
+    photoItems: Array.isArray(stored.photoItems) ? stored.photoItems : defaults.photoItems,
     jobs: Array.isArray(stored.jobs) ? stored.jobs : defaults.jobs,
     displayGroups: Array.isArray(stored.displayGroups) ? stored.displayGroups : defaults.displayGroups,
     accessControl: {
@@ -202,6 +207,7 @@ async function loadState() {
 let appState = await loadState();
 let musicService = null;
 let readingService = null;
+let photoService = null;
 
 // A queued/running FFmpeg process cannot survive a server restart. Mark old
 // records clearly instead of leaving the management page stuck at “processing”.
@@ -2225,7 +2231,7 @@ async function updateCatalogScanSettings(body) {
   appState.settings.autoScanEnabled = body.enabled;
   appState.settings.autoScanIntervalSeconds = normalizedAutoScanIntervalSeconds(body.intervalSeconds);
   await saveState();
-  if (body.enabled && (appState.libraries.length || appState.musicLibraries.length || appState.readingLibraries.length)) {
+  if (body.enabled && (appState.libraries.length || appState.musicLibraries.length || appState.readingLibraries.length || appState.photoLibraries.length)) {
     queueMicrotask(() => runScheduledAutoScan(true).catch((error) => console.error(`观看端自动扫描失败：${error.message}`)));
   }
   return catalogScanStatus();
@@ -2259,8 +2265,19 @@ function contentTypeFor(filePath) {
     ".wv": "audio/wavpack",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
+    ".jpe": "image/jpeg",
+    ".jfif": "image/jpeg",
     ".png": "image/png",
+    ".apng": "image/apng",
+    ".gif": "image/gif",
     ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".bmp": "image/bmp",
+    ".dib": "image/bmp",
+    ".ico": "image/x-icon",
+    ".svg": "image/svg+xml; charset=utf-8",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
     ".ass": "text/x-ssa; charset=utf-8",
     ".ssa": "text/x-ssa; charset=utf-8",
     ".srt": "application/x-subrip; charset=utf-8",
@@ -2305,7 +2322,7 @@ function pipeFileToResponse(response, filePath, options = {}) {
   stream.pipe(response);
 }
 
-async function streamFile(request, response, filePath, trackPlayback = false) {
+async function streamFile(request, response, filePath, trackPlayback = false, responseOptions = {}) {
   let fileStat;
   try {
     fileStat = await stat(filePath);
@@ -2330,9 +2347,9 @@ async function streamFile(request, response, filePath, trackPlayback = false) {
   const commonHeaders = {
     "Content-Type": contentTypeFor(filePath),
     "Accept-Ranges": "bytes",
-    "Cache-Control": "private, max-age=0, must-revalidate",
+    "Cache-Control": responseOptions.cacheControl || "private, max-age=0, must-revalidate",
     "Last-Modified": fileStat.mtime.toUTCString(),
-    "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(path.basename(filePath))}`,
+    "Content-Disposition": `${responseOptions.disposition === "attachment" ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(responseOptions.fileName || path.basename(filePath))}`,
   };
   const rangeHeader = request.headers.range;
   if (!rangeHeader) {
@@ -3124,6 +3141,7 @@ function validAccessFolderIds(folderIds, displayIndex = null) {
     ...displayFolderSummaries(displayIndex).map((folder) => folder.id),
     ...(musicService?.allFolderIds() || []),
     ...(readingService?.allFolderIds() || []),
+    ...(photoService?.allFolderIds() || []),
   ]);
   return [...new Set(Array.isArray(folderIds) ? folderIds.map(String) : [])].filter((id) => availableIds.has(id));
 }
@@ -3142,6 +3160,7 @@ function uncategorizedAccessFolderIds(displayIndex = null) {
     ...displayFolderSummaries(displayIndex).map((folder) => folder.id),
     ...(musicService?.allFolderIds() || []),
     ...(readingService?.allFolderIds() || []),
+    ...(photoService?.allFolderIds() || []),
   ].filter((id) => !categorizedIds.has(id));
 }
 
@@ -3248,6 +3267,22 @@ readingService = createReadingService({
   pathIsSameOrDescendant,
 });
 
+photoService = createPhotoService({
+  appState,
+  cacheDirectory: CACHE_DIR,
+  saveState,
+  stableId,
+  getMediaTools: () => mediaTools,
+  runCommand,
+  streamFile,
+  sendJson,
+  readJson,
+  requireLocalManagement,
+  requireViewerAccess,
+  canAccessFolderId,
+  pathIsSameOrDescendant,
+});
+
 const server = createServer(async (request, response) => {
   response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   response.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
@@ -3276,6 +3311,7 @@ const server = createServer(async (request, response) => {
     if (!sameOriginMutation(request)) return sendJson(response, 403, { error: "已拒绝跨站操作。", code: "ORIGIN_REJECTED" });
     if (await musicService.handleRequest(request, response, url, pathname)) return;
     if (await readingService.handleRequest(request, response, url, pathname)) return;
+    if (await photoService.handleRequest(request, response, url, pathname)) return;
     if (request.method === "POST" && pathname === "/api/service/stop") {
       if (!requireLocalManagement(request, response)) return;
       sendJson(response, 202, { ok: true, message: "共享服务正在关闭，系统托盘会继续运行。" });
@@ -3405,7 +3441,7 @@ const server = createServer(async (request, response) => {
       return sendJson(response, 200, {
         libraries: appState.libraries,
         media: compact ? [] : appState.media.map((item) => publicMedia(item, true, displayIndex)),
-        displayFolders: [...displayFolderSummaries(displayIndex), ...musicService.accessFolderSummaries(), ...readingService.accessFolderSummaries()],
+        displayFolders: [...displayFolderSummaries(displayIndex), ...musicService.accessFolderSummaries(), ...readingService.accessFolderSummaries(), ...photoService.accessFolderSummaries()],
         jobs: appState.jobs,
         settings: appState.settings,
         tools: mediaTools,
@@ -3552,7 +3588,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "PATCH" && /^\/api\/access-control\/folders\/[^/]+$/.test(pathname)) {
       if (!requireLocalManagement(request, response)) return;
       const folderId = pathname.split("/").pop();
-      const accessFolders = [...displayFolderSummaries(), ...musicService.accessFolderSummaries(), ...readingService.accessFolderSummaries()];
+      const accessFolders = [...displayFolderSummaries(), ...musicService.accessFolderSummaries(), ...readingService.accessFolderSummaries(), ...photoService.accessFolderSummaries()];
       if (!accessFolders.some((folder) => folder.id === folderId)) return sendJson(response, 404, { error: "找不到这个媒体文件夹，请先重新扫描。" });
       const body = await readJson(request);
       const categoryId = body.categoryId === null || body.categoryId === "" ? null : String(body.categoryId || "");
@@ -3785,8 +3821,8 @@ const server = createServer(async (request, response) => {
     console.error(error);
     const statusCode = error.code === "INVALID_SCAN_MODE"
       ? 400
-      : ["LIBRARY_CHANGED_DURING_SCAN", "READING_LIBRARY_CHANGED_DURING_SCAN"].includes(error.code) ? 409
-        : error.code === "READING_SCAN_CANCELLED" ? 409 : 500;
+      : ["LIBRARY_CHANGED_DURING_SCAN", "READING_LIBRARY_CHANGED_DURING_SCAN", "PHOTO_LIBRARY_CHANGED_DURING_SCAN"].includes(error.code) ? 409
+        : ["READING_SCAN_CANCELLED", "PHOTO_SCAN_CANCELLED"].includes(error.code) ? 409 : 500;
     return sendJson(response, statusCode, { error: error.message || "服务器内部错误" });
   }
 });
@@ -3795,11 +3831,12 @@ let autoScanTimer = null;
 let scheduledScanRunning = false;
 
 async function runScheduledAutoScan(force = false) {
-  if (!appState.settings.autoScanEnabled || (!appState.libraries.length && !appState.musicLibraries.length && !appState.readingLibraries.length) || activeScan || musicService.isScanning() || readingService.isScanning() || pendingScanMode || scheduledScanRunning || sharingServiceIsStopping) return;
+  if (!appState.settings.autoScanEnabled || (!appState.libraries.length && !appState.musicLibraries.length && !appState.readingLibraries.length && !appState.photoLibraries.length) || activeScan || musicService.isScanning() || readingService.isScanning() || photoService.isScanning() || pendingScanMode || scheduledScanRunning || sharingServiceIsStopping) return;
   const lastStartedMilliseconds = Math.max(
     Date.parse(lastScanStartedAt || "") || 0,
     Date.parse(musicService.scanStatus().lastStartedAt || "") || 0,
     Date.parse(readingService.scanStatus().lastStartedAt || "") || 0,
+    Date.parse(photoService.scanStatus().lastStartedAt || "") || 0,
   );
   if (!force && Date.now() - lastStartedMilliseconds < normalizedAutoScanIntervalSeconds() * 1000) return;
   scheduledScanRunning = true;
@@ -3807,6 +3844,7 @@ async function runScheduledAutoScan(force = false) {
     if (appState.libraries.length) await scanLibraries();
     if (appState.musicLibraries.length) await musicService.scanLibraries();
     if (appState.readingLibraries.length) await readingService.scanLibraries();
+    if (appState.photoLibraries.length) await photoService.scanLibraries();
   } catch (error) {
     console.error(`自动扫描媒体目录失败：${error.message}`);
   } finally {
@@ -3822,16 +3860,18 @@ function startAutoScanScheduler() {
 }
 
 async function prepareStartupMedia() {
-  if (appState.settings.autoScanEnabled && (appState.libraries.length || appState.musicLibraries.length || appState.readingLibraries.length)) {
+  if (appState.settings.autoScanEnabled && (appState.libraries.length || appState.musicLibraries.length || appState.readingLibraries.length || appState.photoLibraries.length)) {
     if (appState.libraries.length) await scanLibraries();
     if (appState.musicLibraries.length) await musicService.scanLibraries();
     if (appState.readingLibraries.length) await readingService.scanLibraries();
+    if (appState.photoLibraries.length) await photoService.scanLibraries();
     return;
   }
   await queueAutomaticCompatibleCopies();
   await musicService.queueAutomaticCompatibleCopies();
   await cleanOrphanedCacheFiles().catch((error) => console.error(`启动时清理孤儿缓存失败：${error.message}`));
   await musicService.cleanOrphanedCacheFiles().catch((error) => console.error(`启动时清理音乐缓存失败：${error.message}`));
+  await photoService.cleanOrphanedCacheFiles().catch((error) => console.error(`启动时清理图片缓存失败：${error.message}`));
 }
 
 async function stopSharingService() {
@@ -3839,6 +3879,7 @@ async function stopSharingService() {
   sharingServiceIsStopping = true;
   musicService.requestStopScan();
   readingService.requestStopScan();
+  photoService.requestStopScan();
   let serverClosed = false;
   let cleanupComplete = false;
   const exitWhenReady = () => {

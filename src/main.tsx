@@ -22,6 +22,7 @@ import {
   FolderSearch,
   Gauge,
   HardDrive,
+  Images,
   KeyRound,
   Library,
   LoaderCircle,
@@ -59,6 +60,13 @@ import {
   type ReadingItem,
   type ReadingOverview,
 } from "./reading";
+import {
+  PhotoAdminPanel,
+  PhotoLibraryView,
+  type PhotoCatalog,
+  type PhotoItem,
+  type PhotoOverview,
+} from "./photos";
 import "./styles.css";
 
 type Subtitle = { id: string; name: string; format: string; language: string; url: string; size?: number; modifiedAt?: string };
@@ -100,7 +108,7 @@ type Media = {
 };
 type LibraryFolder = { id: string; name: string; path: string };
 type DisplayGroup = { id: string; folderName?: string; title: string; season: number; configured: boolean; mediaCount: number };
-type DisplayFolder = DisplayGroup & { path: string; customTitle: string; sampleAlias: string; kind?: "music" | "video" | "reading"; ebookCount?: number; spreadsheetCount?: number };
+type DisplayFolder = DisplayGroup & { path: string; customTitle: string; sampleAlias: string; kind?: "music" | "video" | "reading" | "photo"; ebookCount?: number; spreadsheetCount?: number };
 type CatalogFolder = {
   id: string;
   parentId: string | null;
@@ -393,9 +401,11 @@ function App() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [musicOverview, setMusicOverview] = useState<MusicOverview | null>(null);
   const [readingOverview, setReadingOverview] = useState<ReadingOverview | null>(null);
+  const [photoOverview, setPhotoOverview] = useState<PhotoOverview | null>(null);
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [musicCatalog, setMusicCatalog] = useState<MusicCatalog | null>(null);
   const [readingCatalog, setReadingCatalog] = useState<ReadingCatalog | null>(null);
+  const [photoCatalog, setPhotoCatalog] = useState<PhotoCatalog | null>(null);
   const [accessStatus, setAccessStatus] = useState<AccessStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -411,6 +421,7 @@ function App() {
   const adminJobsActive = Boolean(overview?.jobs.some((job) => job.status === "queued" || job.status === "running"));
   const musicAdminActive = Boolean(musicOverview?.scanning || musicOverview?.jobs.some((job) => job.status === "queued" || job.status === "running"));
   const readingAdminActive = Boolean(readingOverview?.scanning);
+  const photoAdminActive = Boolean(photoOverview?.scanning);
 
   const refresh = useCallback(async (quiet = false) => {
     const sequence = ++refreshSequence.current;
@@ -423,10 +434,11 @@ function App() {
         if (!quiet && !initialAdminOverviewLoaded.current) {
           bootstrapActivity = await api("/api/scan/status");
         }
-        const [nextOverview, nextMusicOverview, nextReadingOverview] = await Promise.all([
+        const [nextOverview, nextMusicOverview, nextReadingOverview, nextPhotoOverview] = await Promise.all([
           api<Overview>(bootstrapActivity?.scanning ? "/api/overview?compact=1" : "/api/overview"),
           optionalFeatureApi<MusicOverview>("/api/music/overview", { libraries: [], tracks: [], jobs: [], scanning: false, scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
           optionalFeatureApi<ReadingOverview>("/api/reading/overview", { libraries: [], items: [], scanning: false, scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
+          optionalFeatureApi<PhotoOverview>("/api/photos/overview", { libraries: [], items: [], scanning: false, scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
         ]);
         if (sequence !== refreshSequence.current) return;
         if (bootstrapActivity) {
@@ -439,6 +451,7 @@ function App() {
         setOverview(nextOverview);
         setMusicOverview(nextMusicOverview);
         setReadingOverview(nextReadingOverview);
+        setPhotoOverview(nextPhotoOverview);
       } else {
         const nextAccessStatus = await api<AccessStatus>("/api/auth/status");
         if (sequence !== refreshSequence.current) return;
@@ -447,17 +460,20 @@ function App() {
           setCatalog(null);
           setMusicCatalog(null);
           setReadingCatalog(null);
+          setPhotoCatalog(null);
         }
         else {
-          const [nextCatalog, nextMusicCatalog, nextReadingCatalog] = await Promise.all([
+          const [nextCatalog, nextMusicCatalog, nextReadingCatalog, nextPhotoCatalog] = await Promise.all([
             api<Catalog>("/api/catalog"),
             optionalFeatureApi<MusicCatalog>("/api/music/catalog", { tracks: [], folders: [], scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
             optionalFeatureApi<ReadingCatalog>("/api/reading/catalog", { items: [], folders: [], scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
+            optionalFeatureApi<PhotoCatalog>("/api/photos/catalog", { items: [], folders: [], scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
           ]);
           if (sequence !== refreshSequence.current) return;
           setCatalog(nextCatalog);
           setMusicCatalog(nextMusicCatalog);
           setReadingCatalog(nextReadingCatalog);
+          setPhotoCatalog(nextPhotoCatalog);
         }
       }
       setError("");
@@ -495,10 +511,10 @@ function App() {
     return () => window.clearInterval(timer);
   }, [adminJobsActive, adminScanActive, isAdminPath, refreshAdminActivity]);
   useEffect(() => {
-    if (!isAdminPath || (!musicAdminActive && !readingAdminActive)) return;
+    if (!isAdminPath || (!musicAdminActive && !readingAdminActive && !photoAdminActive)) return;
     const timer = window.setInterval(() => void refresh(true), 1200);
     return () => window.clearInterval(timer);
-  }, [isAdminPath, musicAdminActive, readingAdminActive, refresh]);
+  }, [isAdminPath, musicAdminActive, photoAdminActive, readingAdminActive, refresh]);
   useEffect(() => {
     const scanFinished = previousAdminScanActive.current && !adminScanActive;
     const jobsFinished = previousAdminJobsActive.current && !adminJobsActive;
@@ -536,6 +552,7 @@ function App() {
     setCatalog(null);
     setMusicCatalog(null);
     setReadingCatalog(null);
+    setPhotoCatalog(null);
     await refresh();
   };
 
@@ -552,6 +569,7 @@ function App() {
           overview={overview}
           musicOverview={musicOverview}
           readingOverview={readingOverview}
+          photoOverview={photoOverview}
           error={error}
           notice={notice}
           section={adminSection}
@@ -564,7 +582,7 @@ function App() {
           onToggleTheme={toggleTheme}
         />
       ) : (
-        <ClientApp catalog={catalog} musicCatalog={musicCatalog} readingCatalog={readingCatalog} error={error} onRefresh={refresh} accessStatus={accessStatus} onLogout={logout} theme={theme} onToggleTheme={toggleTheme} />
+        <ClientApp catalog={catalog} musicCatalog={musicCatalog} readingCatalog={readingCatalog} photoCatalog={photoCatalog} error={error} onRefresh={refresh} accessStatus={accessStatus} onLogout={logout} theme={theme} onToggleTheme={toggleTheme} />
       )}
       {isAdminPath && selectedMedia && <PlayerModal media={selectedMedia} onClose={() => setSelectedMedia(null)} />}
     </div>
@@ -682,11 +700,11 @@ function ViewerSession({ accessStatus, onLogout }: { accessStatus: AccessStatus 
   );
 }
 
-type ViewerSection = "video" | "music" | "reading";
+type ViewerSection = "video" | "music" | "reading" | "photos";
 
 function sectionFromLocation(): ViewerSection {
   const value = new URLSearchParams(window.location.search).get("section");
-  return value === "music" || value === "reading" ? value : "video";
+  return value === "music" || value === "reading" || value === "photos" ? value : "video";
 }
 
 function ViewerModeSwitch({ section, onSelect }: { section: ViewerSection; onSelect: (section: ViewerSection) => void }) {
@@ -695,14 +713,16 @@ function ViewerModeSwitch({ section, onSelect }: { section: ViewerSection; onSel
       <button type="button" className={section === "video" ? "active" : ""} onClick={() => onSelect("video")}><Film size={16} /><span>视频</span></button>
       <button type="button" className={section === "music" ? "active" : ""} onClick={() => onSelect("music")}><Music2 size={16} /><span>音乐</span></button>
       <button type="button" className={section === "reading" ? "active" : ""} onClick={() => onSelect("reading")}><BookOpen size={16} /><span>电子书</span></button>
+      <button type="button" className={section === "photos" ? "active" : ""} onClick={() => onSelect("photos")}><Images size={16} /><span>图片</span></button>
     </nav>
   );
 }
 
-function ClientApp({ catalog, musicCatalog, readingCatalog, error, onRefresh, accessStatus, onLogout, theme, onToggleTheme }: {
+function ClientApp({ catalog, musicCatalog, readingCatalog, photoCatalog, error, onRefresh, accessStatus, onLogout, theme, onToggleTheme }: {
   catalog: Catalog | null;
   musicCatalog: MusicCatalog | null;
   readingCatalog: ReadingCatalog | null;
+  photoCatalog: PhotoCatalog | null;
   error: string;
   onRefresh: (quiet?: boolean) => Promise<void>;
   accessStatus: AccessStatus | null;
@@ -722,6 +742,14 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, error, onRefresh, ac
     return parameters.get("section") === "reading" ? parameters.get("folder") : null;
   });
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("document"));
+  const [selectedPhotoFolderId, setSelectedPhotoFolderId] = useState<string | null>(() => {
+    const parameters = new URLSearchParams(window.location.search);
+    return parameters.get("section") === "photos" ? parameters.get("folder") : null;
+  });
+  const [selectedPhotoId, setSelectedPhotoId] = useState<string | null>(() => {
+    const parameters = new URLSearchParams(window.location.search);
+    return parameters.get("section") === "photos" ? parameters.get("photo") : null;
+  });
   const [readingFilter, setReadingFilter] = useState<ReadingFilter>(() => {
     const value = new URLSearchParams(window.location.search).get("kind");
     return value === "ebook" || value === "spreadsheet" ? value : "all";
@@ -825,6 +853,8 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, error, onRefresh, ac
       setSelectedTrackId(nextSection === "music" ? parameters.get("track") : null);
       setSelectedReadingFolderId(nextSection === "reading" ? parameters.get("folder") : null);
       setSelectedDocumentId(nextSection === "reading" ? parameters.get("document") : null);
+      setSelectedPhotoFolderId(nextSection === "photos" ? parameters.get("folder") : null);
+      setSelectedPhotoId(nextSection === "photos" ? parameters.get("photo") : null);
       const nextFilter = parameters.get("kind");
       setReadingFilter(nextFilter === "ebook" || nextFilter === "spreadsheet" ? nextFilter : "all");
       setSelectedFolderId(nextSection === "video" ? parameters.get("folder") || parameters.get("series") : null);
@@ -836,9 +866,9 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, error, onRefresh, ac
   }, []);
 
   const switchSection = (nextSection: ViewerSection) => {
-    if (nextSection === section && !selectedMediaId && !selectedTrackId && !selectedDocumentId) return;
+    if (nextSection === section && !selectedMediaId && !selectedTrackId && !selectedDocumentId && !selectedPhotoId) return;
     const nextUrl = new URL(window.location.href);
-    for (const key of ["folder", "series", "video", "track", "document", "kind"]) nextUrl.searchParams.delete(key);
+    for (const key of ["folder", "series", "video", "track", "document", "photo", "kind"]) nextUrl.searchParams.delete(key);
     if (nextSection === "video") nextUrl.searchParams.delete("section");
     else nextUrl.searchParams.set("section", nextSection);
     window.history.pushState({ section: nextSection }, "", nextUrl);
@@ -849,6 +879,8 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, error, onRefresh, ac
     setSelectedTrackId(null);
     setSelectedReadingFolderId(null);
     setSelectedDocumentId(null);
+    setSelectedPhotoFolderId(null);
+    setSelectedPhotoId(null);
     setReadingFilter("all");
     setSearch("");
     window.scrollTo({ top: 0, left: 0 });
@@ -903,6 +935,7 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, error, onRefresh, ac
     nextUrl.searchParams.delete("section");
     nextUrl.searchParams.delete("track");
     nextUrl.searchParams.delete("document");
+    nextUrl.searchParams.delete("photo");
     nextUrl.searchParams.delete("kind");
     window.history.pushState({ folder: null }, "", nextUrl);
     setSelectedFolderId(null);
@@ -912,6 +945,8 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, error, onRefresh, ac
     setSelectedTrackId(null);
     setSelectedReadingFolderId(null);
     setSelectedDocumentId(null);
+    setSelectedPhotoFolderId(null);
+    setSelectedPhotoId(null);
     setReadingFilter("all");
     setSearch("");
     window.scrollTo({ top: 0, left: 0 });
@@ -1020,19 +1055,90 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, error, onRefresh, ac
     setReadingFilter(filter);
   };
 
+  const openPhotoLibrary = () => {
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.set("section", "photos");
+    nextUrl.searchParams.delete("folder");
+    nextUrl.searchParams.delete("photo");
+    window.history.pushState({ section: "photos" }, "", nextUrl);
+    setSection("photos");
+    setSelectedPhotoFolderId(null);
+    setSelectedPhotoId(null);
+    setSearch("");
+    window.scrollTo({ top: 0, left: 0 });
+  };
+
+  const openPhotoFolder = (folderId: string) => {
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.set("section", "photos");
+    nextUrl.searchParams.set("folder", folderId);
+    nextUrl.searchParams.delete("photo");
+    window.history.pushState({ section: "photos", folder: folderId }, "", nextUrl);
+    setSection("photos");
+    setSelectedPhotoFolderId(folderId);
+    setSelectedPhotoId(null);
+    setSearch("");
+    window.scrollTo({ top: 0, left: 0 });
+  };
+
+  const openPhoto = (item: PhotoItem) => {
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.set("section", "photos");
+    nextUrl.searchParams.set("folder", item.folderId);
+    nextUrl.searchParams.set("photo", item.id);
+    window.history.pushState({ section: "photos", folder: item.folderId, photo: item.id }, "", nextUrl);
+    setSection("photos");
+    setSelectedPhotoFolderId(item.folderId);
+    setSelectedPhotoId(item.id);
+    setSearch("");
+    window.scrollTo({ top: 0, left: 0 });
+  };
+
+  const switchPhoto = (item: PhotoItem) => {
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.set("section", "photos");
+    nextUrl.searchParams.set("folder", item.folderId);
+    nextUrl.searchParams.set("photo", item.id);
+    window.history.replaceState({ section: "photos", folder: item.folderId, photo: item.id }, "", nextUrl);
+    setSelectedPhotoFolderId(item.folderId);
+    setSelectedPhotoId(item.id);
+  };
+
   const scanNow = async () => {
     setScanBusy(true);
     const musicMode = section === "music";
     const readingMode = section === "reading";
-    setScanNotice({ text: musicMode ? "正在扫描音乐目录、标签、封面与歌词…" : readingMode ? "正在扫描电子书与表格目录…" : "正在扫描视频目录并刷新文件列表…", tone: "success" });
+    const photoMode = section === "photos";
+    setScanNotice({ text: musicMode ? "正在扫描音乐目录、标签、封面与歌词…" : readingMode ? "正在扫描电子书与表格目录…" : photoMode ? "正在扫描图片尺寸并生成瀑布流缩略图…" : "正在扫描视频目录并刷新文件列表…", tone: "success" });
     try {
-      const result = await api<{ count: number }>(musicMode ? "/api/music/catalog/scan" : readingMode ? "/api/reading/catalog/scan" : "/api/catalog/scan", { method: "POST" });
+      const result = await api<{ count: number }>(musicMode ? "/api/music/catalog/scan" : readingMode ? "/api/reading/catalog/scan" : photoMode ? "/api/photos/catalog/scan" : "/api/catalog/scan", { method: "POST" });
       await onRefresh(true);
-      setScanNotice({ text: musicMode ? `扫描完成，当前共有 ${result.count} 首歌曲。` : readingMode ? `扫描完成，当前共有 ${result.count} 个阅读文件。` : `扫描完成，当前共有 ${result.count} 个视频文件。`, tone: "success" });
+      setScanNotice({ text: musicMode ? `扫描完成，当前共有 ${result.count} 首歌曲。` : readingMode ? `扫描完成，当前共有 ${result.count} 个阅读文件。` : photoMode ? `扫描完成，当前共有 ${result.count} 张图片。` : `扫描完成，当前共有 ${result.count} 个视频文件。`, tone: "success" });
     } catch (operationError) {
       setScanNotice({ text: operationError instanceof Error ? operationError.message : "扫描刷新失败", tone: "warning" });
     } finally { setScanBusy(false); }
   };
+
+  if (section === "photos" && photoCatalog) {
+    return (
+      <div className={`client-page photo-route-page${selectedPhotoId ? " client-player-page" : ""}`}>
+        <header className="client-header">
+          <Brand onHome={openLibrary} />
+          <ViewerModeSwitch section={section} onSelect={switchSection} />
+          <div className="header-actions">
+            <ViewerSession accessStatus={accessStatus} onLogout={onLogout} />
+            <ThemeToggle theme={theme} onToggle={onToggleTheme} />
+            {!selectedPhotoId && <><button className="client-scan-now" onClick={scanNow} disabled={scanBusy} title="立即扫描图片目录"><RefreshCw size={16} className={scanBusy ? "spin" : ""} /><span>刷新图片</span></button><label className="search-box"><Search size={17} /><input aria-label="搜索图片文件夹、文件名或扩展名" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索文件夹、图片、格式…" /></label></>}
+          </div>
+        </header>
+        <main className={selectedPhotoId ? "client-player-main photo-viewer-main" : "client-main photo-client-main"}>
+          {error && <StatusBanner tone="warning" icon={<AlertTriangle size={18} />}>{error}</StatusBanner>}
+          {scanNotice && !selectedPhotoId && <StatusBanner tone={scanNotice.tone} icon={scanNotice.tone === "warning" ? <AlertTriangle size={18} /> : <CheckCircle2 size={18} />}>{scanNotice.text}</StatusBanner>}
+          <PhotoLibraryView catalog={photoCatalog} folderId={selectedPhotoFolderId} photoId={selectedPhotoId} search={search} onOpenFolder={openPhotoFolder} onOpenPhoto={openPhoto} onSwitchPhoto={switchPhoto} onBackToLibrary={openPhotoLibrary} onNotice={(message) => setScanNotice({ text: message, tone: "success" })} />
+        </main>
+      </div>
+    );
+  }
 
   if (section === "music" && selectedTrackId && musicCatalog) {
     return (
@@ -1293,6 +1399,7 @@ function AdminApp(props: {
   overview: Overview | null;
   musicOverview: MusicOverview | null;
   readingOverview: ReadingOverview | null;
+  photoOverview: PhotoOverview | null;
   error: string;
   notice: string;
   section: AdminSection;
@@ -1304,7 +1411,7 @@ function AdminApp(props: {
   theme: ThemeMode;
   onToggleTheme: () => void;
 }) {
-  const { overview, musicOverview, readingOverview, error, notice, section, onSectionChange, onRefresh, onNotice, onError, onPlay, theme, onToggleTheme } = props;
+  const { overview, musicOverview, readingOverview, photoOverview, error, notice, section, onSectionChange, onRefresh, onNotice, onError, onPlay, theme, onToggleTheme } = props;
   const [rapidScanDialog, setRapidScanDialog] = useState<RapidScanDialogState | null>(null);
   const [turboActionBusy, setTurboActionBusy] = useState(false);
   const [turboStartError, setTurboStartError] = useState("");
@@ -1375,7 +1482,7 @@ function AdminApp(props: {
         <header className="admin-topbar"><div><span className="eyebrow">LMD LOCAL CONTROL</span><h1>{sectionTitle}</h1></div><ThemeToggle theme={theme} onToggle={onToggleTheme} /></header>
         {error && <StatusBanner tone="warning" icon={<AlertTriangle size={18} />}>{error}</StatusBanner>}
         {notice && <StatusBanner tone="success" icon={<CheckCircle2 size={18} />}>{notice}</StatusBanner>}
-        {section === "overview" && <OverviewPanel overview={overview} musicOverview={musicOverview} readingOverview={readingOverview} onRefresh={onRefresh} onNotice={onNotice} onLibraryAdded={promptForTurboScan} onPlay={onPlay} />}
+        {section === "overview" && <OverviewPanel overview={overview} musicOverview={musicOverview} readingOverview={readingOverview} photoOverview={photoOverview} onRefresh={onRefresh} onNotice={onNotice} onLibraryAdded={promptForTurboScan} onPlay={onPlay} />}
         {section === "access" && overview?.accessControl.enabled && <AccessControlPanel overview={overview} onRefresh={onRefresh} onNotice={onNotice} />}
         {section === "settings" && <SettingsPanel overview={overview} onRefresh={onRefresh} onNotice={onNotice} onError={onError} onOpenAccess={() => onSectionChange("access")} onStartTurboScan={() => void startTurboScan()} onStopTurboScan={() => void stopTurboScan()} turboActionBusy={turboActionBusy} />}
       </main>
@@ -1384,7 +1491,7 @@ function AdminApp(props: {
   );
 }
 
-function OverviewPanel({ overview, musicOverview, readingOverview, onRefresh, onNotice, onLibraryAdded, onPlay }: { overview: Overview | null; musicOverview: MusicOverview | null; readingOverview: ReadingOverview | null; onRefresh: (quiet?: boolean) => Promise<void>; onNotice: (value: string) => void; onLibraryAdded: (library: LibraryFolder) => void; onPlay: (media: Media) => void }) {
+function OverviewPanel({ overview, musicOverview, readingOverview, photoOverview, onRefresh, onNotice, onLibraryAdded, onPlay }: { overview: Overview | null; musicOverview: MusicOverview | null; readingOverview: ReadingOverview | null; photoOverview: PhotoOverview | null; onRefresh: (quiet?: boolean) => Promise<void>; onNotice: (value: string) => void; onLibraryAdded: (library: LibraryFolder) => void; onPlay: (media: Media) => void }) {
   const [folderPath, setFolderPath] = useState("");
   const [busy, setBusy] = useState(false);
   const [compatibilityExpanded, setCompatibilityExpanded] = useState(false);
@@ -1508,7 +1615,9 @@ function OverviewPanel({ overview, musicOverview, readingOverview, onRefresh, on
 
       <ReadingAdminPanel overview={readingOverview} onRefresh={onRefresh} onNotice={onNotice} />
 
-      <DisplayFoldersPanel folders={(overview?.displayFolders || []).filter((folder) => folder.kind !== "music" && folder.kind !== "reading")} onRefresh={onRefresh} onNotice={onNotice} />
+      <PhotoAdminPanel overview={photoOverview} onRefresh={onRefresh} onNotice={onNotice} />
+
+      <DisplayFoldersPanel folders={(overview?.displayFolders || []).filter((folder) => folder.kind !== "music" && folder.kind !== "reading" && folder.kind !== "photo")} onRefresh={onRefresh} onNotice={onNotice} />
 
       <section className={`panel media-table-panel collapsible-panel${compatibilityExpanded ? "" : " is-collapsed"}`}>
         <div className="panel-title"><div><span className="panel-icon"><Library size={20} /></span><div><h2>自动兼容处理</h2><p>扫描或启动时会自动检测 MKV、FLAC/Opus 等浏览器不易直放的组合，当前最多同时生成 {remuxConcurrency} 个 MP4 + AAC 副本；视频不重新压缩。</p></div></div><div className="panel-actions"><span className="table-count">{media.length} 个文件 · {pendingCompatibility.length} 个等待/处理中</span><button className="secondary-button" onClick={prepareCompatibleCopies} disabled={busy || !pendingCompatibility.length}><RefreshCw size={16} className={activeJobs ? "spin" : ""} />重新检查自动队列</button><button type="button" className="collapse-button" onClick={() => setCompatibilityExpanded((expanded) => !expanded)} aria-expanded={compatibilityExpanded} aria-controls="compatibility-list" aria-label={compatibilityExpanded ? "折叠自动兼容处理" : "展开自动兼容处理"} title={compatibilityExpanded ? "折叠" : "展开"}><ChevronDown size={18} /></button></div></div>
@@ -1630,7 +1739,7 @@ function AccessControlPanel({ overview, onRefresh, onNotice }: {
       <section className="panel access-mode-panel is-enabled">
         <div className="access-mode-summary">
           <span className="access-mode-icon"><ShieldCheck size={28} /></span>
-          <div><span className="eyebrow">CLASSIFIED ACCESS</span><h2>分类访问控制已开启</h2><p>未归类的视频、音乐或阅读文件夹会自动进入“未分类”，可与“全年龄”“R-18”等分类一样授权给六位访问码用户。关闭功能请前往“运行设置”。</p></div>
+          <div><span className="eyebrow">CLASSIFIED ACCESS</span><h2>分类访问控制已开启</h2><p>未归类的视频、音乐、阅读或图片文件夹会自动进入“未分类”，可与“全年龄”“R-18”等分类一样授权给六位访问码用户。关闭功能请前往“运行设置”。</p></div>
         </div>
         <div className="access-mode-actions">
           <div><strong>{accessControl?.users.filter((user) => user.enabled).length || 0}</strong><span>位已启用用户</span></div>
@@ -1700,15 +1809,15 @@ function FolderCategoriesPanel({ folders, categories, onRefresh, onNotice }: {
   const categoryForFolder = (folderId: string) => editableCategories.find((category) => category.folderIds.includes(folderId))?.id || "";
   return (
     <section className="panel access-categories-panel">
-      <div className="panel-title"><div><span className="panel-icon"><FolderOpen size={20} /></span><div><h2>文件夹分类</h2><p>每个视频、音乐或阅读文件夹归入一个分类；未手动归类的文件夹会自动进入“未分类”，并可单独授权。</p></div></div><span className="table-count">{categories.length} 个分类</span></div>
+      <div className="panel-title"><div><span className="panel-icon"><FolderOpen size={20} /></span><div><h2>文件夹分类</h2><p>每个视频、音乐、阅读或图片文件夹归入一个分类；未手动归类的文件夹会自动进入“未分类”，并可单独授权。</p></div></div><span className="table-count">{categories.length} 个分类</span></div>
       <div className="category-create-row"><input value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && name.trim()) void addCategory(); }} maxLength={40} placeholder="新分类，例如：儿童专区" /><button className="primary-button" onClick={addCategory} disabled={busy || !name.trim()}><FolderOpen size={16} />建立分类</button></div>
       <div className="category-editor-list">
         {categories.map((category) => <AccessCategoryEditor key={category.id} category={category} onRefresh={onRefresh} onNotice={onNotice} />)}
       </div>
       <div className="folder-classification-list">
         {folders.length ? folders.map((folder) => {
-          const typeLabel = folder.kind === "music" ? "音乐" : folder.kind === "reading" ? "阅读" : "视频";
-          const countLabel = folder.kind === "music" ? `${folder.mediaCount} 首歌曲` : folder.kind === "reading" ? `${folder.ebookCount || 0} 本书 · ${folder.spreadsheetCount || 0} 个表格` : `${folder.mediaCount} 个视频`;
+          const typeLabel = folder.kind === "music" ? "音乐" : folder.kind === "reading" ? "阅读" : folder.kind === "photo" ? "图片" : "视频";
+          const countLabel = folder.kind === "music" ? `${folder.mediaCount} 首歌曲` : folder.kind === "reading" ? `${folder.ebookCount || 0} 本书 · ${folder.spreadsheetCount || 0} 个表格` : folder.kind === "photo" ? `${folder.mediaCount} 张图片` : `${folder.mediaCount} 个视频`;
           return <div className="folder-classification-row" key={folder.id}><div><strong>{folder.title}</strong><span>{folder.folderName} · {countLabel} · {typeLabel}</span></div><select value={categoryForFolder(folder.id)} onChange={(event) => void assignFolder(folder, event.target.value)} disabled={busy}><option value="">未分类</option>{editableCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></div>;
         }) : <div className="access-empty-folders">请先在“总览”添加媒体目录并完成扫描。</div>}
       </div>
