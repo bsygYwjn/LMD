@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="400" viewBox="0 0 1200 400" fill="none" role="img" aria-labelledby="title description">
+  <title id="title">LMD — 你的媒体，就在身边。</title>
+  <desc id="description">局域网本地媒体中心。视频、音乐、阅读与图片，通过浏览器连接你的本地收藏。</desc>
+  <rect x="1" y="1" width="1198" height="398" rx="28" fill="#F6F8FC" stroke="#E1E7F0" stroke-width="2"/>
+  <g transform="translate(58 47) scale(1.35)" stroke="#3267E3" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 14 14 L 14 44 Q 14 50 20 50 L 48 50"/>
+    <path d="M 31 14 L 50 26 L 31 38"/>
+  </g>
+  <g font-family="Segoe UI, Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif">
+    <text x="164" y="124" fill="#172033" font-size="88" font-weight="700" letter-spacing="-3">LMD</text>
+    <text x="68" y="212" fill="#172033" font-size="46" font-weight="600">你的媒体，就在身边。</text>
+    <text x="70" y="263" fill="#526078" font-size="24" letter-spacing="3">视频 · 音乐 · 阅读 · 图片</text>
+    <circle cx="75" cy="334" r="5" fill="#3267E3"/>
+    <text x="94" y="341" fill="#526078" font-size="19">局域网本地媒体中心</text>
+    <text x="702" y="341" fill="#526078" font-size="17" text-anchor="end">文件留在本地，体验走向每一屏</text>
+  </g>
+  <path d="M764 56V344" stroke="#DEE5EF" stroke-width="2"/>
+  <g fill="#FFFFFF" stroke="#DEE5EF" stroke-width="2">
+    <rect x="804" y="48" width="154" height="144" rx="20"/>
+    <rect x="982" y="48" width="154" height="144" rx="20"/>
+    <rect x="804" y="208" width="154" height="144" rx="20"/>
+    <rect x="982" y="208" width="154" height="144" rx="20"/>
+  </g>
+  <g stroke="#3267E3" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="856" y="83" width="50" height="36" rx="8"/>
+    <path d="M877 93L890 101L877 109Z"/>
+    <path d="M1050 113V86L1074 81V108M1050 93L1074 88"/>
+    <ellipse cx="1044" cy="114" rx="6" ry="5"/>
+    <ellipse cx="1068" cy="109" rx="6" ry="5"/>
+    <path d="M881 251C872 246 863 245 855 247V278C864 276 873 278 881 283C889 278 898 276 907 278V247C899 245 890 246 881 251ZM881 251V283"/>
+    <rect x="1035" y="242" width="48" height="41" rx="8"/>
+    <circle cx="1069" cy="253" r="4"/>
+    <path d="M1036 273L1049 259L1064 275L1073 266L1082 275"/>
+  </g>
+  <g fill="#172033" font-family="Segoe UI, Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="21" font-weight="600" text-anchor="middle">
+    <text x="881" y="157">视频</text>
+    <text x="1059" y="157">音乐</text>
+    <text x="881" y="317">阅读</text>
+    <text x="1059" y="317">图片</text>
+  </g>
+</svg>

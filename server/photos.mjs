@@ -299,9 +299,22 @@ export function createPhotoService({
     return paths.map((folderPath) => photoFolderId(item.libraryId, folderPath));
   }
 
+  function accessFolderPathForItem(item) {
+    const library = libraryForItem(item);
+    const itemFolderPath = path.resolve(folderPathForItem(item));
+    const rootPath = path.resolve(library?.path || itemFolderPath);
+    if (!pathIsSameOrDescendant(itemFolderPath, rootPath)) return itemFolderPath;
+    const segments = path.relative(rootPath, itemFolderPath).split(path.sep).filter(Boolean);
+    return segments.length ? path.join(rootPath, ...segments.slice(0, 2)) : rootPath;
+  }
+
+  function accessFolderIdForItem(item) {
+    return photoFolderId(item.libraryId, accessFolderPathForItem(item));
+  }
+
   function canAccessItem(context, item) {
     if (context?.fullAccess) return true;
-    return ancestorFolderIds(item).some((folderId) => canAccessFolderId(context, folderId));
+    return canAccessFolderId(context, accessFolderIdForItem(item));
   }
 
   function accessibleItems(context) {
@@ -601,7 +614,7 @@ export function createPhotoService({
     };
   }
 
-  function accessFolderSummaries() {
+  function displayFolderSummaries() {
     return folderNodes().map((folder) => ({
       id: folder.id,
       path: folder.path,
@@ -614,6 +627,43 @@ export function createPhotoService({
       sampleAlias: "",
       kind: "photo",
     }));
+  }
+
+  function accessFolderSummaries() {
+    const folders = new Map();
+    for (const item of appState.photoItems) {
+      const library = libraryForItem(item);
+      const folderPath = accessFolderPathForItem(item);
+      const id = photoFolderId(item.libraryId, folderPath);
+      const relativePath = library?.path && pathIsSameOrDescendant(folderPath, library.path)
+        ? path.relative(path.resolve(library.path), folderPath).split(path.sep).filter(Boolean).join(" / ")
+        : path.basename(folderPath);
+      let folder = folders.get(id);
+      if (!folder) {
+        const title = relativePath || `${library?.name || path.basename(folderPath) || "图片目录"}（直属文件）`;
+        folder = {
+          id,
+          path: folderPath,
+          folderName: relativePath ? path.basename(folderPath) : title,
+          title,
+          season: 1,
+          configured: false,
+          mediaCount: 0,
+          customTitle: "",
+          sampleAlias: "",
+          kind: "photo",
+          libraryName: library?.name || "图片目录",
+          relativePath: relativePath || "直属文件",
+        };
+        folders.set(id, folder);
+      }
+      folder.mediaCount += 1;
+    }
+    return [...folders.values()].sort((left, right) => left.title.localeCompare(right.title, "zh-CN", { numeric: true, sensitivity: "base" }));
+  }
+
+  function accessFolderAliases() {
+    return appState.photoItems.flatMap((item) => ancestorFolderIds(item).map((folderId) => [folderId, accessFolderIdForItem(item)]));
   }
 
   async function handleRequest(request, response, url, pathname) {
@@ -706,7 +756,9 @@ export function createPhotoService({
     requestStopScan: () => { if (scanContext) scanContext.cancelRequested = true; },
     cleanOrphanedCacheFiles,
     folderNodes,
+    displayFolderSummaries,
     accessFolderSummaries,
+    accessFolderAliases,
     allFolderIds: () => accessFolderSummaries().map((folder) => folder.id),
   };
 }

@@ -7,14 +7,13 @@ import {
   ChevronRight,
   Columns3,
   Download,
-  FileText,
   FolderOpen,
+  HardDrive,
   List,
   LoaderCircle,
   Maximize2,
   Minimize2,
   Minus,
-  MousePointer2,
   Plus,
   RefreshCw,
   RotateCw,
@@ -40,6 +39,7 @@ export type ReadingItem = {
   modifiedAt: string;
   folderId: string;
   fileUrl: string;
+  thumbnailUrl: string | null;
 };
 
 export type ReadingFolder = {
@@ -129,7 +129,6 @@ function formatBytes(value: number) {
 }
 
 let pdfJsPromise: Promise<typeof import("pdfjs-dist")> | null = null;
-const coverUrlPromises = new Map<string, Promise<string | null>>();
 
 function loadPdfJs() {
   pdfJsPromise ||= import("pdfjs-dist").then((pdfjs) => {
@@ -139,97 +138,11 @@ function loadPdfJs() {
   return pdfJsPromise;
 }
 
-async function pdfCoverBlob(item: ReadingItem) {
-  const pdfjs = await loadPdfJs();
-  const task = pdfjs.getDocument({ url: item.fileUrl, enableXfa: false });
-  task.onPassword = () => { void task.destroy(); };
-  let document: Awaited<typeof task.promise> | null = null;
-  try {
-    document = await task.promise;
-    const page = await document.getPage(1);
-    const base = page.getViewport({ scale: 1 });
-    const scale = Math.min(1.5, 760 / Math.max(base.width, base.height));
-    const viewport = page.getViewport({ scale });
-    const canvas = window.document.createElement("canvas");
-    canvas.width = Math.max(1, Math.round(viewport.width));
-    canvas.height = Math.max(1, Math.round(viewport.height));
-    const context = canvas.getContext("2d", { alpha: false });
-    if (!context) return null;
-    await page.render({ canvas, canvasContext: context, viewport }).promise;
-    page.cleanup();
-    return await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", .86));
-  } finally {
-    await document?.cleanup();
-    await task.destroy();
-  }
-}
-
-type FoliateThumbnailBook = {
-  getCover?: () => Promise<Blob | null> | Blob | null;
-  resources?: { manifest?: Array<{ href?: string; mediaType?: string }> };
-  loadBlob?: (href: string) => Promise<Blob | ArrayBuffer | Uint8Array | null> | Blob | ArrayBuffer | Uint8Array | null;
-  destroy?: () => void;
-};
-
-async function ebookCoverBlob(item: ReadingItem) {
-  const response = await fetch(item.fileUrl, { cache: "no-store" });
-  if (!response.ok) throw new Error(`封面文件请求失败（${response.status}）`);
-  const source = await response.blob();
-  const file = new File([source], item.fileName, { type: response.headers.get("content-type") || source.type });
-  const { makeBook } = await import("foliate-js/view.js");
-  const book = await makeBook(file, { sha1: sha1ForEpub }) as FoliateThumbnailBook;
-  try {
-    const declaredCover = await book.getCover?.();
-    if (declaredCover?.size) return declaredCover;
-    const firstImage = book.resources?.manifest?.find((entry) => entry.href && entry.mediaType?.startsWith("image/") && entry.mediaType !== "image/svg+xml");
-    if (!firstImage?.href || !book.loadBlob) return null;
-    const loaded = await book.loadBlob(firstImage.href);
-    if (!loaded) return null;
-    const blobPart = loaded instanceof Uint8Array ? new Uint8Array(loaded).buffer : loaded;
-    return loaded instanceof Blob ? loaded : new Blob([blobPart], { type: firstImage.mediaType || "application/octet-stream" });
-  } finally {
-    book.destroy?.();
-  }
-}
-
-function coverUrlForItem(item: ReadingItem) {
-  const key = `${item.id}:${item.modifiedAt}:${item.size}`;
-  let promise = coverUrlPromises.get(key);
-  if (!promise) {
-    promise = (item.extension === "PDF" ? pdfCoverBlob(item) : item.extension === "TXT" ? Promise.resolve(null) : ebookCoverBlob(item))
-      .then((blob) => blob?.size ? URL.createObjectURL(blob) : null)
-      .catch((error) => {
-        console.warn(`无法为“${item.fileName}”生成阅读缩略图`, error);
-        return null;
-      });
-    coverUrlPromises.set(key, promise);
-  }
-  return promise;
-}
-
 function ReadingThumbnail({ item }: { item: ReadingItem }) {
-  const anchorRef = useRef<HTMLSpanElement>(null);
-  const [visible, setVisible] = useState(false);
-  const [source, setSource] = useState<string | null>(null);
-  useEffect(() => {
-    const anchor = anchorRef.current;
-    if (!anchor || visible) return;
-    if (!("IntersectionObserver" in window)) { setVisible(true); return; }
-    const observer = new IntersectionObserver(([entry]) => {
-      if (!entry?.isIntersecting) return;
-      setVisible(true);
-      observer.disconnect();
-    }, { rootMargin: "240px" });
-    observer.observe(anchor);
-    return () => observer.disconnect();
-  }, [visible]);
-  useEffect(() => {
-    if (!visible) return;
-    let active = true;
-    void coverUrlForItem(item).then((url) => { if (active) setSource(url); });
-    return () => { active = false; };
-  }, [item.id, item.modifiedAt, item.size, visible]);
-  return <span className="reading-thumbnail-anchor" ref={anchorRef}>{source ? <img className="reading-thumbnail" src={source} alt="" aria-hidden="true" onError={() => setSource(null)} /> : null}</span>;
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [item.thumbnailUrl]);
+  if (!item.thumbnailUrl || failed) return null;
+  return <span className="rd-thumb-anchor"><img className="rd-thumb" src={item.thumbnailUrl} alt="" aria-hidden="true" loading="lazy" decoding="async" onError={() => setFailed(true)} /></span>;
 }
 
 function formatLanguageMap(value: unknown): string {
@@ -287,10 +200,10 @@ async function sha1ForEpub(input: string) {
 function ReaderNotice({ message, downloadUrl, fileName }: { message: string; downloadUrl?: string; fileName?: string }) {
   return (
     <div className="reader-notice" role="alert">
-      <AlertTriangle size={24} />
+      <AlertTriangle size={20} />
       <strong>无法在线预览</strong>
       <span>{message}</span>
-      {downloadUrl && <a href={downloadUrl} download={fileName}><Download size={16} />下载原文件</a>}
+      {downloadUrl && <a href={downloadUrl} download={fileName}><Download size={15} />下载原文件</a>}
     </div>
   );
 }
@@ -453,25 +366,25 @@ function PdfReader({ item }: { item: ReadingItem }) {
   return (
     <div className="document-reader pdf-reader">
       <div className="reader-toolbar">
-        <button ref={tocButtonRef} type="button" onClick={() => setTocOpen((value) => !value)} disabled={!outline.length} title="PDF 目录"><List size={17} /><span>目录</span></button>
+        <button ref={tocButtonRef} type="button" className="btn btn--sm" onClick={() => setTocOpen((value) => !value)} disabled={!outline.length} title="PDF 目录"><List size={15} /><span>目录</span></button>
         <span className="reader-toolbar-separator" />
-        <button type="button" onClick={() => setPageNumber((value) => Math.max(1, value - 1))} disabled={pageNumber <= 1} title="上一页"><ChevronLeft size={18} /></button>
-        <label className="page-jump"><input aria-label="PDF 页码" type="number" min={1} max={pageCount || 1} value={pageNumber} onChange={(event) => setPageNumber(Math.max(1, Math.min(pageCount || 1, Number(event.target.value) || 1)))} /><span>/ {pageCount || "—"}</span></label>
-        <button type="button" onClick={() => setPageNumber((value) => Math.min(pageCount, value + 1))} disabled={!pageCount || pageNumber >= pageCount} title="下一页"><ChevronRight size={18} /></button>
+        <button type="button" className="icon-btn" onClick={() => setPageNumber((value) => Math.max(1, value - 1))} disabled={pageNumber <= 1} title="上一页"><ChevronLeft size={16} /></button>
+        <label className="page-jump"><input className="input" aria-label="PDF 页码" type="number" min={1} max={pageCount || 1} value={pageNumber} onChange={(event) => setPageNumber(Math.max(1, Math.min(pageCount || 1, Number(event.target.value) || 1)))} /><span>/ {pageCount || "—"}</span></label>
+        <button type="button" className="icon-btn" onClick={() => setPageNumber((value) => Math.min(pageCount, value + 1))} disabled={!pageCount || pageNumber >= pageCount} title="下一页"><ChevronRight size={16} /></button>
         <span className="reader-toolbar-separator" />
-        <button type="button" onClick={() => { setFit("custom"); setScale((value) => Math.max(.5, value - .1)); }} title="缩小"><Minus size={17} /></button>
+        <button type="button" className="icon-btn" onClick={() => { setFit("custom"); setScale((value) => Math.max(.5, value - .1)); }} title="缩小"><Minus size={16} /></button>
         <span className="reader-zoom-label">{fit === "custom" ? `${Math.round(scale * 100)}%` : fit === "width" ? "适合宽度" : "适合页面"}</span>
-        <button type="button" onClick={() => { setFit("custom"); setScale((value) => Math.min(3, value + .1)); }} title="放大"><Plus size={17} /></button>
-        <button type="button" onClick={() => setFit((value) => value === "width" ? "page" : "width")} title="切换适合宽度或页面"><Maximize2 size={17} /></button>
-        <button type="button" onClick={() => setRotation((value) => (value + 90) % 360)} title="顺时针旋转"><RotateCw size={17} /></button>
-        <a href={item.fileUrl} download={item.fileName} title="下载原 PDF"><Download size={17} /></a>
+        <button type="button" className="icon-btn" onClick={() => { setFit("custom"); setScale((value) => Math.min(3, value + .1)); }} title="放大"><Plus size={16} /></button>
+        <button type="button" className="icon-btn" onClick={() => setFit((value) => value === "width" ? "page" : "width")} title="切换适合宽度或页面"><Maximize2 size={16} /></button>
+        <button type="button" className="icon-btn" onClick={() => setRotation((value) => (value + 90) % 360)} title="顺时针旋转"><RotateCw size={16} /></button>
+        <a className="icon-btn" href={item.fileUrl} download={item.fileName} title="下载原 PDF"><Download size={16} /></a>
       </div>
       <div ref={tocDrawerRef} className={`reader-drawer${tocOpen ? " is-open" : ""}`} aria-hidden={!tocOpen}>
-        <div className="reader-drawer-heading"><strong>文档目录</strong><button type="button" onClick={() => setTocOpen(false)} title="关闭目录"><X size={17} /></button></div>
+        <div className="reader-drawer-heading"><strong>文档目录</strong><button type="button" className="icon-btn" onClick={() => setTocOpen(false)} title="关闭目录"><X size={15} /></button></div>
         <div className="reader-toc-list">{outline.map((entry) => <button type="button" key={`${entry.title}-${String(entry.dest)}`} onClick={() => void openOutline(entry)}>{entry.title || "未命名章节"}</button>)}</div>
       </div>
       <div className="pdf-stage" ref={stageRef}>{loading && <ReaderLoading label="正在按需载入 PDF…" />}<canvas ref={canvasRef} /></div>
-      {passwordNeeded && <div className="reader-password"><form onSubmit={submitPassword}><strong>此 PDF 需要密码</strong><span>密码仅在本次打开期间保存在内存中。</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoFocus /><button type="submit" disabled={!password}>解锁文档</button></form></div>}
+      {passwordNeeded && <div className="reader-password"><form onSubmit={submitPassword}><strong>此 PDF 需要密码</strong><span>密码仅在本次打开期间保存在内存中。</span><input className="input" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoFocus /><button className="btn btn--primary btn--sm" type="submit" disabled={!password}>解锁文档</button></form></div>}
     </div>
   );
 }
@@ -526,13 +439,13 @@ function TextReader({ item }: { item: ReadingItem }) {
   if (error) return <ReaderNotice message={error} downloadUrl={item.fileUrl} fileName={item.fileName} />;
   return (
     <div className={`document-reader text-reader text-paper-${paper}`}>
-      <div className="reader-toolbar"><button type="button" onClick={() => setFontSize((value) => Math.max(13, value - 1))} title="减小字号"><Minus size={17} /></button><span>{fontSize}px</span><button type="button" onClick={() => setFontSize((value) => Math.min(28, value + 1))} title="增大字号"><Plus size={17} /></button><label>行距<select value={lineHeight} onChange={(event) => setLineHeight(Number(event.target.value))}><option value={1.45}>紧凑</option><option value={1.75}>舒适</option><option value={2}>宽松</option></select></label><button type="button" onClick={() => setPaper((value) => value === "screen" ? "sepia" : "screen")}>{paper === "screen" ? "羊皮纸" : "跟随主题"}</button><a href={item.fileUrl} download={item.fileName} title="下载原文件"><Download size={17} /></a></div>
+      <div className="reader-toolbar"><button type="button" className="icon-btn" onClick={() => setFontSize((value) => Math.max(13, value - 1))} title="减小字号"><Minus size={16} /></button><span>{fontSize}px</span><button type="button" className="icon-btn" onClick={() => setFontSize((value) => Math.min(28, value + 1))} title="增大字号"><Plus size={16} /></button><label>行距<select className="select" value={lineHeight} onChange={(event) => setLineHeight(Number(event.target.value))}><option value={1.45}>紧凑</option><option value={1.75}>舒适</option><option value={2}>宽松</option></select></label><button type="button" className="btn btn--sm" onClick={() => setPaper((value) => value === "screen" ? "sepia" : "screen")}>{paper === "screen" ? "羊皮纸" : "跟随主题"}</button><a className="icon-btn" href={item.fileUrl} download={item.fileName} title="下载原文件"><Download size={16} /></a></div>
       <div className="text-scroll" ref={containerRef}>{content ? <pre style={{ fontSize, lineHeight }}>{content}</pre> : <ReaderLoading label="正在识别文本编码…" />}</div>
     </div>
   );
 }
 
-function ebookStyles(fontSize: number, lineHeight: number, paper: "screen" | "sepia", appTheme: "dark" | "light", textSelection: boolean) {
+function ebookStyles(fontSize: number, lineHeight: number, paper: "screen" | "sepia", appTheme: "dark" | "light") {
   const sepia = paper === "sepia";
   const dark = !sepia && appTheme === "dark";
   const foreground = sepia ? "#332b20" : dark ? "#e9e7e1" : "#263140";
@@ -542,7 +455,7 @@ function ebookStyles(fontSize: number, lineHeight: number, paper: "screen" | "se
     :root { color-scheme: ${dark ? "dark" : "light"}; }
     html, body { color: ${foreground} !important; background: ${background} !important; }
     body { font-size: ${fontSize}% !important; padding-inline: 3% !important; }
-    html, body, body * { -webkit-user-select: ${textSelection ? "text" : "none"} !important; user-select: ${textSelection ? "text" : "none"} !important; }
+    html, body, body * { -webkit-user-select: none !important; user-select: none !important; }
     p, li, blockquote, dd { line-height: ${lineHeight} !important; }
     img, svg { max-width: 100% !important; max-height: 100% !important; }
     a { color: ${link} !important; }
@@ -563,6 +476,7 @@ function FoliateReader({ item, theme, immersive, onToggleImmersive, onToggleImme
   const tocButtonRef = useRef<HTMLButtonElement>(null);
   const tocDrawerRef = useRef<HTMLDivElement>(null);
   const pageTurnLockedRef = useRef(false);
+  const pendingFractionRef = useRef<number | null>(null);
   const mobileTapStartRef = useRef<{ id: number; x: number; y: number } | null>(null);
   const clickBoundDocumentsRef = useRef(new WeakSet<Document>());
   const turnPageRef = useRef<(direction: "previous" | "next") => Promise<void>>(async () => {});
@@ -573,17 +487,15 @@ function FoliateReader({ item, theme, immersive, onToggleImmersive, onToggleImme
   const [toc, setToc] = useState<Array<TocEntry & { depth: number }>>([]);
   const [tocOpen, setTocOpen] = useState(false);
   const [fraction, setFraction] = useState(Math.max(0, Math.min(1, Number(saved.fraction) || 0)));
+  const [pendingFraction, setPendingFraction] = useState<number | null>(null);
   const [flow, setFlow] = useState<"paginated" | "scrolled">(saved.flow === "scrolled" ? "scrolled" : "paginated");
   const [fontSize, setFontSize] = useState(Math.max(80, Math.min(180, Number(saved.fontSize) || 100)));
   const [lineHeight, setLineHeight] = useState(Math.max(1.25, Math.min(2, Number(saved.lineHeight) || 1.55)));
-  const [paper, setPaper] = useState<"screen" | "sepia">(saved.paper === "sepia" ? "sepia" : "screen");
-  const [textSelection, setTextSelection] = useState(saved.textSelection === true);
+  const paper = "screen" as const;
   const tocOpenRef = useRef(tocOpen);
   const flowRef = useRef(flow);
-  const textSelectionRef = useRef(textSelection);
   tocOpenRef.current = tocOpen;
   flowRef.current = flow;
-  textSelectionRef.current = textSelection;
   useDismissableDrawer(tocOpen, () => setTocOpen(false), tocButtonRef, tocDrawerRef);
 
   useEffect(() => {
@@ -651,13 +563,13 @@ function FoliateReader({ item, theme, immersive, onToggleImmersive, onToggleImme
           let pointerStart: { id: number; x: number; y: number } | null = null;
           let suppressNextClick = false;
           bookDocument.addEventListener("selectstart", (selectionEvent) => {
-            if (!textSelectionRef.current) selectionEvent.preventDefault();
+            selectionEvent.preventDefault();
           });
           bookDocument.addEventListener("pointerdown", (pointerEvent) => {
             if (!pointerEvent.isPrimary || pointerEvent.button !== 0) return;
             pointerStart = { id: pointerEvent.pointerId, x: pointerEvent.clientX, y: pointerEvent.clientY };
             suppressNextClick = false;
-            if (!textSelectionRef.current) bookDocument.getSelection()?.removeAllRanges();
+            bookDocument.getSelection()?.removeAllRanges();
           });
           bookDocument.addEventListener("pointermove", (pointerEvent) => {
             if (!pointerStart || pointerStart.id !== pointerEvent.pointerId) return;
@@ -697,7 +609,7 @@ function FoliateReader({ item, theme, immersive, onToggleImmersive, onToggleImme
         if (!active) return;
         turnPageRef.current = turnPage;
         view.renderer?.setAttribute("flow", flow);
-        view.renderer?.setStyles?.(ebookStyles(fontSize, lineHeight, paper, theme, textSelection));
+        view.renderer?.setStyles?.(ebookStyles(fontSize, lineHeight, paper, theme));
         const metadata = view.book?.metadata;
         setTitle(formatLanguageMap(metadata?.title) || item.title);
         setAuthor(formatContributor(metadata?.author));
@@ -757,10 +669,10 @@ function FoliateReader({ item, theme, immersive, onToggleImmersive, onToggleImme
     const view = viewRef.current;
     if (!view?.renderer) return;
     view.renderer.setAttribute("flow", flow);
-    view.renderer.setStyles?.(ebookStyles(fontSize, lineHeight, paper, theme, textSelection));
-    if (!textSelection) view.deselect?.();
-    saveProgress(item, { flow, fontSize, lineHeight, paper, textSelection });
-  }, [flow, fontSize, item, lineHeight, paper, textSelection, theme]);
+    view.renderer.setStyles?.(ebookStyles(fontSize, lineHeight, paper, theme));
+    view.deselect?.();
+    saveProgress(item, { flow, fontSize, lineHeight, paper });
+  }, [flow, fontSize, item, lineHeight, paper, theme]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -771,6 +683,28 @@ function FoliateReader({ item, theme, immersive, onToggleImmersive, onToggleImme
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
+
+  const previewProgress = (value: number) => {
+    const nextFraction = Math.max(0, Math.min(1, value));
+    pendingFractionRef.current = nextFraction;
+    setPendingFraction(nextFraction);
+  };
+
+  const cancelProgressPreview = () => {
+    pendingFractionRef.current = null;
+    setPendingFraction(null);
+  };
+
+  const commitProgress = (targetFraction: number | null = pendingFractionRef.current) => {
+    const nextFraction = targetFraction === null ? null : Math.max(0, Math.min(1, targetFraction));
+    if (nextFraction === null) return;
+    pendingFractionRef.current = null;
+    setPendingFraction(null);
+    setFraction(nextFraction);
+    void viewRef.current?.goToFraction(nextFraction).catch((seekError) => {
+      console.error("电子书进度跳转失败", seekError);
+    });
+  };
 
   const handleMobilePagePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
     const start = mobileTapStartRef.current;
@@ -790,20 +724,18 @@ function FoliateReader({ item, theme, immersive, onToggleImmersive, onToggleImme
   return (
     <div className={`document-reader foliate-reader paper-${paper}`}>
       <div className="reader-toolbar">
-        <button ref={tocButtonRef} type="button" onClick={() => setTocOpen((value) => !value)} disabled={!toc.length}><List size={17} /><span>目录</span></button>
+        <button ref={tocButtonRef} type="button" className="btn btn--sm" onClick={() => setTocOpen((value) => !value)} disabled={!toc.length} title="书籍目录"><List size={15} /><span>目录</span></button>
         <span className="reader-book-meta"><strong>{title}</strong>{author && <small>{author}</small>}</span>
-        <label>排版<select value={flow} onChange={(event) => setFlow(event.target.value as "paginated" | "scrolled")}><option value="paginated">分页</option><option value="scrolled">滚动</option></select></label>
-        <button type="button" onClick={() => setFontSize((value) => Math.max(80, value - 10))} title="减小字号"><Minus size={17} /></button><span>{fontSize}%</span><button type="button" onClick={() => setFontSize((value) => Math.min(180, value + 10))} title="增大字号"><Plus size={17} /></button>
-        <label>行距<select value={lineHeight} onChange={(event) => setLineHeight(Number(event.target.value))}><option value={1.35}>紧凑</option><option value={1.55}>舒适</option><option value={1.8}>宽松</option></select></label>
-        <button className="reader-setting-toggle" type="button" aria-pressed={textSelection} aria-label={textSelection ? "文字选择已开启" : "文字选择已关闭"} title={textSelection ? "文字选择已开启；点击关闭" : "文字选择已关闭；点击开启"} onClick={() => setTextSelection((value) => !value)}><MousePointer2 size={16} /><span>{textSelection ? "选字开启" : "选字关闭"}</span></button>
-        <button type="button" onClick={() => setPaper((value) => value === "screen" ? "sepia" : "screen")}>{paper === "screen" ? "羊皮纸" : "跟随主题"}</button>
-        <button className="immersive-toggle" type="button" onClick={() => void onToggleImmersive()} aria-pressed={immersive} title={immersive ? "退出沉浸阅读" : "沉浸式全屏阅读"}>{immersive ? <Minimize2 size={17} /> : <Maximize2 size={17} />}<span>{immersive ? "退出沉浸" : "沉浸"}</span></button>
-        <a href={item.fileUrl} download={item.fileName} title="下载原文件"><Download size={17} /></a>
+        <select className="select" value={flow} aria-label="排版" title="排版" onChange={(event) => setFlow(event.target.value as "paginated" | "scrolled")}><option value="paginated">分页</option><option value="scrolled">滚动</option></select>
+        <button type="button" className="icon-btn" onClick={() => setFontSize((value) => Math.max(80, value - 10))} title="减小字号"><Minus size={16} /></button><span>{fontSize}%</span><button type="button" className="icon-btn" onClick={() => setFontSize((value) => Math.min(180, value + 10))} title="增大字号"><Plus size={16} /></button>
+        <label>行距<select className="select" value={lineHeight} onChange={(event) => setLineHeight(Number(event.target.value))}><option value={1.35}>紧凑</option><option value={1.55}>舒适</option><option value={1.8}>宽松</option></select></label>
+        <button className="icon-btn" type="button" onClick={() => void onToggleImmersive()} aria-pressed={immersive} aria-label={immersive ? "退出沉浸阅读" : "沉浸式全屏阅读"} title={immersive ? "退出沉浸阅读" : "沉浸式全屏阅读"}>{immersive ? <Minimize2 size={16} /> : <Maximize2 size={16} />}</button>
+        <a className="icon-btn" href={item.fileUrl} download={item.fileName} title="下载原文件"><Download size={16} /></a>
       </div>
-      <div ref={tocDrawerRef} className={`reader-drawer${tocOpen ? " is-open" : ""}`} aria-hidden={!tocOpen}><div className="reader-drawer-heading"><strong>书籍目录</strong><button type="button" onClick={() => setTocOpen(false)}><X size={17} /></button></div><div className="reader-toc-list">{toc.map((entry, index) => <button type="button" key={`${entry.href}-${index}`} style={{ paddingLeft: `${14 + entry.depth * 14}px` }} onClick={() => { if (entry.href) void viewRef.current?.goTo(entry.href); setTocOpen(false); }}>{entry.label || "未命名章节"}</button>)}</div></div>
+      <div ref={tocDrawerRef} className={`reader-drawer${tocOpen ? " is-open" : ""}`} aria-hidden={!tocOpen}><div className="reader-drawer-heading"><strong>书籍目录</strong><button type="button" className="icon-btn" onClick={() => setTocOpen(false)}><X size={15} /></button></div><div className="reader-toc-list">{toc.map((entry, index) => <button type="button" key={`${entry.href}-${index}`} style={{ paddingLeft: `${14 + entry.depth * 14}px` }} onClick={() => { if (entry.href) void viewRef.current?.goTo(entry.href); setTocOpen(false); }}>{entry.label || "未命名章节"}</button>)}</div></div>
       <div className="foliate-stage">
         <div ref={hostRef} className="foliate-host" />
-        {!loading && flow === "paginated" && !textSelection && <div
+        {!loading && flow === "paginated" && <div
           className={`mobile-page-turn-layer${immersive ? " is-immersive" : ""}`}
           aria-hidden="true"
           onPointerDown={(event) => {
@@ -822,7 +754,41 @@ function FoliateReader({ item, theme, immersive, onToggleImmersive, onToggleImme
         />}
         {loading && <ReaderLoading label="正在读取书籍结构与目录…" />}
       </div>
-      <div className="reading-progress"><span style={{ width: `${fraction * 100}%` }} /><small>{Math.round(fraction * 100)}%</small></div>
+      <div className="reading-progress">
+        <input
+          type="range"
+          min={0}
+          max={1000}
+          step={1}
+          value={Math.round((pendingFraction ?? fraction) * 1000)}
+          disabled={loading}
+          aria-label="阅读进度"
+          aria-valuetext={`${Math.round((pendingFraction ?? fraction) * 100)}%`}
+          title="拖动后松开跳转到对应阅读位置"
+          style={{ "--reading-progress": `${(pendingFraction ?? fraction) * 100}%` } as React.CSSProperties}
+          onChange={(event) => previewProgress(Number(event.currentTarget.value) / 1000)}
+          onPointerUp={(event) => {
+            const bounds = event.currentTarget.getBoundingClientRect();
+            commitProgress(bounds.width ? (event.clientX - bounds.left) / bounds.width : pendingFractionRef.current);
+          }}
+          onPointerCancel={cancelProgressPreview}
+          onKeyDown={(event) => {
+            const current = pendingFractionRef.current ?? fraction;
+            const next = event.key === "Home" ? 0
+              : event.key === "End" ? 1
+                : event.key === "PageDown" ? current + .1
+                  : event.key === "PageUp" ? current - .1
+                    : event.key === "ArrowRight" || event.key === "ArrowUp" ? current + .01
+                      : event.key === "ArrowLeft" || event.key === "ArrowDown" ? current - .01
+                        : null;
+            if (next === null) return;
+            event.preventDefault();
+            commitProgress(next);
+          }}
+          onBlur={() => commitProgress()}
+        />
+        <small>{Math.round((pendingFraction ?? fraction) * 100)}%</small>
+      </div>
     </div>
   );
 }
@@ -931,7 +897,7 @@ function SpreadsheetReader({ item }: { item: ReadingItem }) {
   if (error) return <ReaderNotice message={error} downloadUrl={item.fileUrl} fileName={item.fileName} />;
   return (
     <div className="document-reader spreadsheet-reader">
-      <div className="reader-toolbar sheet-toolbar"><div className="sheet-tabs" role="tablist">{sheetNames.map((name) => <button type="button" role="tab" aria-selected={selectedSheet === name} className={selectedSheet === name ? "active" : ""} key={name} onClick={() => chooseSheet(name)}>{name}</button>)}</div><span className="sheet-capability" title="宏、公式重算、图表和复杂视觉样式不在快速预览范围内"><Table2 size={15} />只读数据预览</span><a href={item.fileUrl} download={item.fileName} title="下载原表格"><Download size={17} /></a></div>
+      <div className="reader-toolbar sheet-toolbar"><div className="sheet-tabs" role="tablist">{sheetNames.map((name) => <button type="button" role="tab" aria-selected={selectedSheet === name} className={selectedSheet === name ? "active" : ""} key={name} onClick={() => chooseSheet(name)}>{name}</button>)}</div><span className="sheet-capability" title="宏、公式重算、图表和复杂视觉样式不在快速预览范围内"><Table2 size={15} />只读数据预览</span><a className="icon-btn" href={item.fileUrl} download={item.fileName} title="下载原表格"><Download size={16} /></a></div>
       {sheet?.truncated && <div className="sheet-warning"><AlertTriangle size={15} />工作表范围过大，已安全限制预览行列或非空单元格数量；原文件未被修改。</div>}
       {loading ? <ReaderLoading label={sheetNames.length ? "正在解析所选工作表…" : "正在读取工作表名称…"} /> : sheet && <SpreadsheetGrid sheet={sheet} />}
     </div>
@@ -1019,7 +985,7 @@ function ReadingDocument({ item, theme }: { item: ReadingItem; theme: "dark" | "
         if (target.closest(".reader-toolbar, .reader-drawer")) revealImmersiveControls();
       }}
     >
-      <header className="reading-document-heading"><div><strong>{item.title}</strong><span>{item.extension} · {formatBytes(item.size)} · 只读</span></div></header>
+      <div className="reader-head"><div className="reader-head-title"><strong>{item.title}</strong><span>{item.extension} · {formatBytes(item.size)} · 只读</span></div></div>
       {item.kind === "spreadsheet" ? <SpreadsheetReader item={item} /> : isPdf ? <PdfReader item={item} /> : isText ? <TextReader item={item} /> : <FoliateReader item={item} theme={theme} immersive={immersive} onToggleImmersive={toggleImmersive} onToggleImmersiveControls={toggleImmersiveControls} onRevealImmersiveControls={revealImmersiveControls} />}
     </section>
   );
@@ -1039,7 +1005,9 @@ export function ReadingLibraryView({ catalog, folderId, documentId, filter, sear
 }) {
   const folderById = useMemo(() => new Map(catalog.folders.map((folder) => [folder.id, folder])), [catalog.folders]);
   const itemById = useMemo(() => new Map(catalog.items.map((item) => [item.id, item])), [catalog.items]);
-  const currentFolder = folderById.get(folderId || "") || null;
+  const rootFolders = catalog.folders.filter((folder) => folder.parentId === null);
+  const singleRootFolder = rootFolders.length === 1 ? rootFolders[0] : null;
+  const currentFolder = folderById.get(folderId || "") || singleRootFolder;
   const document = catalog.items.find((item) => item.id === documentId) || null;
   const normalizedSearch = search.trim().toLocaleLowerCase("zh-CN");
   const matchesKind = (item: ReadingItem) => filter === "all" || item.kind === filter;
@@ -1056,26 +1024,65 @@ export function ReadingLibraryView({ catalog, folderId, documentId, filter, sear
   let trailCursor = currentFolder;
   const visited = new Set<string>();
   while (trailCursor && !visited.has(trailCursor.id)) { trail.unshift(trailCursor); visited.add(trailCursor.id); trailCursor = trailCursor.parentId ? folderById.get(trailCursor.parentId) || null : null; }
+  const visibleTrail = singleRootFolder ? trail.filter((folder) => folder.id !== singleRootFolder.id) : trail;
 
   if (document) return <ReadingDocument item={document} theme={theme} />;
+  const scopedItems = currentFolder ? directItems : items;
+  const ebookCount = scopedItems.filter((item) => item.kind === "ebook").length;
+  const spreadsheetCount = scopedItems.length - ebookCount;
+  const atLibraryRoot = !folderId || folderId === singleRootFolder?.id;
   return (
-    <>
-      <section className="reading-hero">
-        <div><span className="section-kicker">READING LIBRARY</span>{currentFolder ? <nav className="folder-breadcrumb" aria-label="当前阅读文件夹路径"><button type="button" onClick={onBackToLibrary}>全部阅读</button>{trail.map((folder) => <React.Fragment key={folder.id}><span>/</span><button type="button" onClick={() => onOpenFolder(folder.id)} aria-current={folder.id === currentFolder.id ? "page" : undefined}>{folder.title}</button></React.Fragment>)}</nav> : null}<h1>{currentFolder?.title || "阅读库"}</h1><p>在局域网内打开电子书与工作表。源文件始终保持原样，进度与偏好只保存在当前浏览器。</p></div>
-        <div className="reading-kind-filter" aria-label="内容类型筛选">{(["all", "ebook", "spreadsheet"] as ReadingFilter[]).map((value) => <button type="button" key={value} className={filter === value ? "active" : ""} onClick={() => onFilterChange(value)}>{value === "all" ? "全部" : value === "ebook" ? "电子书" : "表格"}</button>)}</div>
-      </section>
-      <section className="media-section reading-section">
-        <div className="section-heading"><div><span className="section-kicker">{currentFolder ? "FOLDER" : "LIBRARY"}</span><h2>{normalizedSearch ? "搜索结果" : currentFolder ? "文件夹内容" : "全部阅读目录"}</h2></div><span className="media-count">{folders.length} 个文件夹 · {directItems.length} 个文件</span></div>
-        <div className="reading-grid">
-          {folders.map((folder) => {
-            const coverItem = folder.coverMediaId ? itemById.get(folder.coverMediaId) : null;
-            return <article className="reading-card folder" key={folder.id}><button type="button" className="reading-card-hit" onClick={() => onOpenFolder(folder.id)} aria-label={`打开阅读文件夹 ${folder.title}`} /><div className="reading-cover"><FolderOpen size={34} />{coverItem ? <ReadingThumbnail item={coverItem} /> : null}<span>文件夹</span></div><div><h3>{folder.title}</h3><p>{folder.ebookCount} 本电子书 · {folder.spreadsheetCount} 个表格</p></div></article>;
-          })}
-          {directItems.map((item) => <article className={`reading-card ${item.kind}`} key={item.id}><button type="button" className="reading-card-hit" onClick={() => onOpenDocument(item)} aria-label={`打开 ${item.title}`} /><div className="reading-cover"><span className="reading-format">{item.extension}</span>{item.kind === "ebook" ? <><BookOpen size={38} /><ReadingThumbnail item={item} /></> : <Table2 size={38} />}</div><div><h3>{item.title}</h3><p>{item.kind === "ebook" ? "电子书" : "只读表格"} · {formatBytes(item.size)}</p></div></article>)}
+    <div className="rd-view">
+      <div className="lib-toolbar">
+        <nav className="crumbs" aria-label="当前阅读文件夹路径">
+          {!atLibraryRoot && currentFolder ? (
+            <>
+              <button type="button" onClick={onBackToLibrary}>全部阅读</button>
+              {visibleTrail.map((folder) => (
+                <React.Fragment key={folder.id}>
+                  <span className="crumbs-sep">/</span>
+                  <button type="button" onClick={() => onOpenFolder(folder.id)} aria-current={folder.id === currentFolder.id ? "page" : undefined}>{folder.title}</button>
+                </React.Fragment>
+              ))}
+            </>
+          ) : (
+            <span>全部阅读</span>
+          )}
+        </nav>
+        <span className="lib-stats">{folders.length} 个文件夹 · {ebookCount} 本书 · {spreadsheetCount} 个表格</span>
+        <div className="lib-toolbar-actions">
+          <div className="segmented" aria-label="阅读类型筛选">
+            {(["all", "ebook", "spreadsheet"] as ReadingFilter[]).map((value) => <button type="button" key={value} className={filter === value ? "is-active" : ""} onClick={() => onFilterChange(value)}>{value === "all" ? "全部" : value === "ebook" ? "电子书" : "表格"}</button>)}
+          </div>
         </div>
-        {!folders.length && !directItems.length && <div className="client-empty"><BookOpen size={30} /><strong>{normalizedSearch ? "没有匹配的阅读内容" : "这个阅读目录暂时为空"}</strong><span>{normalizedSearch ? "请尝试其他文件名或格式。" : "请在本机管理端添加阅读目录并扫描。"}</span></div>}
-      </section>
-    </>
+      </div>
+      {folders.length > 0 && <div className="rd-folder-grid">
+        {folders.map((folder) => {
+          const coverItem = folder.coverMediaId ? itemById.get(folder.coverMediaId) || null : null;
+          return (
+            <div className="rd-card rd-card--folder" key={folder.id}>
+              <button type="button" className="rd-hit" onClick={() => onOpenFolder(folder.id)} aria-label={`打开文件夹 ${folder.title}`} />
+              <div className="rd-cover"><FolderOpen size={20} />{coverItem ? <ReadingThumbnail item={coverItem} /> : null}<span className="rd-badge">{folder.ebookCount} 书 · {folder.spreadsheetCount} 表</span></div>
+              <h3 className="rd-title">{folder.title}</h3>
+              <p className="rd-meta">{folder.childCount ? `${folder.childCount} 个子文件夹 · ` : ""}{folder.ebookCount} 本电子书 · {folder.spreadsheetCount} 个表格</p>
+            </div>
+          );
+        })}
+      </div>}
+      {directItems.length > 0 && <div className="rd-grid">
+        {directItems.map((item) => (
+          <div className="rd-card" key={item.id}>
+            <button type="button" className="rd-hit" onClick={() => onOpenDocument(item)} aria-label={item.title} />
+            <div className="rd-cover">{item.kind === "ebook" ? <BookOpen size={20} /> : <Table2 size={20} />}{item.kind === "ebook" ? <ReadingThumbnail item={item} /> : null}<span className="rd-badge">{item.extension}</span></div>
+            <h3 className="rd-title">{item.title}</h3>
+            <p className="rd-meta">{item.kind === "ebook" ? "电子书" : "只读表格"} · {formatBytes(item.size)}</p>
+          </div>
+        ))}
+      </div>}
+      {!folders.length && !directItems.length && (
+        <div className="empty-state"><BookOpen size={24} /><strong>{normalizedSearch ? "没有匹配的阅读内容" : "这个阅读目录暂时为空"}</strong><span>{normalizedSearch ? "请尝试其他文件名或格式。" : "请在本机管理端添加阅读目录并扫描。"}</span></div>
+      )}
+    </div>
   );
 }
 
@@ -1119,10 +1126,33 @@ export function ReadingAdminPanel({ overview, onRefresh, onNotice }: { overview:
     finally { setBusy(false); }
   };
   return (
-    <section className="panel library-panel reading-admin-panel">
-      <div className="panel-title"><div><span className="panel-icon"><BookOpen size={20} /></span><div><h2>阅读目录</h2><p>一套目录统一管理 PDF、EPUB 等电子书和 Excel 表格；仅建立索引，不转换、不修改原文件。</p></div></div><div className="panel-actions"><span className="table-count">{overview?.items.filter((item) => item.kind === "ebook").length || 0} 本书 · {overview?.items.filter((item) => item.kind === "spreadsheet").length || 0} 个表格</span><button className="secondary-button" onClick={() => void scan()} disabled={busy || overview?.scanning || !overview?.libraries.length}><RefreshCw size={16} className={busy || overview?.scanning ? "spin" : ""} />扫描阅读</button></div></div>
-      <div className="folder-form"><button className="secondary-button folder-picker-button" onClick={() => void chooseFolder()} disabled={busy}><FolderOpen size={17} />选择并添加阅读文件夹</button><input aria-label="阅读目录路径" value={folderPath} onChange={(event) => setFolderPath(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && folderPath.trim() && !busy) void register(folderPath.trim()); }} placeholder="也可以手动输入路径，按 Enter 添加" /></div>
-      <div className="folder-list">{overview?.libraries.length ? overview.libraries.map((library) => <div className="folder-item" key={library.id}><FileText size={18} /><div><strong>{library.name}</strong><span>{library.path}</span></div><button type="button" className="folder-remove-button" onClick={() => void remove(library)} disabled={busy} title={`移除阅读目录 ${library.name}`}><Trash2 size={16} /></button></div>) : <div className="empty-row"><BookOpen size={22} /><span>还没有阅读目录。添加后即可浏览电子书和表格。</span></div>}</div>
+    <section className="adm-section">
+      <div className="adm-section-head">
+        <div>
+          <h2>阅读目录</h2>
+          <p>一套目录统一管理 PDF、EPUB 等电子书和 Excel 表格；仅建立索引，不转换、不修改原文件。</p>
+        </div>
+        <div className="adm-actions">
+          <span className="tag">{overview?.items.filter((item) => item.kind === "ebook").length || 0} 本书 · {overview?.items.filter((item) => item.kind === "spreadsheet").length || 0} 个表格</span>
+          <button className="btn btn--sm" onClick={() => void scan()} disabled={busy || overview?.scanning || !overview?.libraries.length}><RefreshCw size={15} className={busy || overview?.scanning ? "spin" : ""} />扫描阅读</button>
+        </div>
+      </div>
+      <div className="adm-add">
+        <button className="btn" onClick={() => void chooseFolder()} disabled={busy}><FolderOpen size={15} />选择并添加阅读文件夹</button>
+        <input className="input" aria-label="阅读目录路径" value={folderPath} onChange={(event) => setFolderPath(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && folderPath.trim() && !busy) void register(folderPath.trim()); }} placeholder="也可以手动输入路径，按 Enter 添加" />
+      </div>
+      <div className="adm-rows">
+        {overview?.libraries.length ? overview.libraries.map((library) => (
+          <div className="adm-row" key={library.id}>
+            <HardDrive size={15} />
+            <div className="adm-row-main"><strong>{library.name}</strong><span>{library.path}</span></div>
+            <span className="adm-row-meta">{overview?.items.filter((item) => item.libraryId === library.id).length || 0} 个文件</span>
+            <button type="button" className="icon-btn icon-btn--danger" onClick={() => void remove(library)} disabled={busy} title={`移除阅读目录 ${library.name}`}><Trash2 size={15} /></button>
+          </div>
+        )) : (
+          <div className="empty-state"><BookOpen size={24} /><strong>还没有阅读目录</strong><span>添加后即可浏览电子书和表格。</span></div>
+        )}
+      </div>
     </section>
   );
 }

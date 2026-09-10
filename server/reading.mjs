@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readdir, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { prepareReadingCover } from "./reading-cover.mjs";
 
 const READING_FORMATS = new Map([
   [".pdf", "ebook"],
@@ -67,6 +68,7 @@ async function walkReadingFiles(rootDirectory, depth = 0, output = [], status = 
 
 export function createReadingService({
   appState,
+  cacheDirectory,
   saveState,
   stableId,
   streamFile,
@@ -109,9 +111,22 @@ export function createReadingService({
     return paths.map((folderPath) => readingFolderId(item.libraryId, folderPath));
   }
 
+  function accessFolderPathForItem(item) {
+    const library = libraryForItem(item);
+    const itemFolderPath = path.resolve(folderPathForItem(item));
+    const rootPath = path.resolve(library?.path || itemFolderPath);
+    if (!pathIsSameOrDescendant(itemFolderPath, rootPath)) return itemFolderPath;
+    const segments = path.relative(rootPath, itemFolderPath).split(path.sep).filter(Boolean);
+    return segments.length ? path.join(rootPath, ...segments.slice(0, 2)) : rootPath;
+  }
+
+  function accessFolderIdForItem(item) {
+    return readingFolderId(item.libraryId, accessFolderPathForItem(item));
+  }
+
   function canAccessItem(context, item) {
     if (context?.fullAccess) return true;
-    return ancestorFolderIds(item).some((folderId) => canAccessFolderId(context, folderId));
+    return canAccessFolderId(context, accessFolderIdForItem(item));
   }
 
   function accessibleItems(context) {
@@ -152,12 +167,12 @@ export function createReadingService({
     };
   }
 
-  async function scanItem(filePath, library) {
+  async function scanItem(filePath, library, previous = null) {
     const fileStat = await stat(filePath);
     const identityPath = await realpath(filePath).catch(() => path.resolve(filePath));
     const extensionWithDot = path.extname(filePath).toLowerCase();
     const kind = READING_FORMATS.get(extensionWithDot);
-    return {
+    const item = {
       id: stableId(`reading-item:${identityPath.toLowerCase()}`),
       libraryId: library.id,
       path: path.resolve(filePath),
@@ -168,6 +183,8 @@ export function createReadingService({
       size: fileStat.size,
       modifiedAt: fileStat.mtime.toISOString(),
     };
+    const cover = await prepareReadingCover({ item, previous, cacheDirectory, stableId });
+    return { ...item, ...cover };
   }
 
   function mostSpecificLibrary(filePath, libraries) {
@@ -215,10 +232,11 @@ export function createReadingService({
       if (revision !== libraryRevision) throw Object.assign(new Error("阅读目录在扫描期间发生变化，请重新扫描。"), { code: "READING_LIBRARY_CHANGED_DURING_SCAN" });
       scanContext.phase = "processing";
       const files = [...filesByIdentity.values()];
+      const previousItems = new Map(appState.readingItems.map((item) => [path.resolve(item.path).toLowerCase(), item]));
       scanContext.totalFiles = files.length;
       const scanned = await mapWithConcurrency(files, scanContext.maxParallelFiles, async ({ filePath, library }) => {
         if (scanContext.cancelRequested) throw Object.assign(new Error("阅读库扫描已停止"), { code: "READING_SCAN_CANCELLED" });
-        return scanItem(filePath, library);
+        return scanItem(filePath, library, previousItems.get(path.resolve(filePath).toLowerCase()) || null);
       }, () => {
         scanContext.processedFiles += 1;
         scanContext.progressPercent = scanContext.totalFiles ? Math.min(95, Math.round(scanContext.processedFiles / scanContext.totalFiles * 95)) : 95;
@@ -310,10 +328,11 @@ export function createReadingService({
       modifiedAt: item.modifiedAt,
       folderId: readingFolderId(item.libraryId, folderPathForItem(item)),
       fileUrl: `/api/reading/items/${item.id}/file`,
+      thumbnailUrl: item.coverPath ? `/api/reading/items/${item.id}/cover?v=${encodeURIComponent(item.coverSignature || "1")}` : null,
     };
   }
 
-  function accessFolderSummaries() {
+  function displayFolderSummaries() {
     return folderNodes().map((folder) => ({
       id: folder.id,
       path: folder.path,
@@ -328,6 +347,47 @@ export function createReadingService({
       sampleAlias: "",
       kind: "reading",
     }));
+  }
+
+  function accessFolderSummaries() {
+    const folders = new Map();
+    for (const item of appState.readingItems) {
+      const library = libraryForItem(item);
+      const folderPath = accessFolderPathForItem(item);
+      const id = readingFolderId(item.libraryId, folderPath);
+      const relativePath = library?.path && pathIsSameOrDescendant(folderPath, library.path)
+        ? path.relative(path.resolve(library.path), folderPath).split(path.sep).filter(Boolean).join(" / ")
+        : path.basename(folderPath);
+      let folder = folders.get(id);
+      if (!folder) {
+        const title = relativePath || `${library?.name || path.basename(folderPath) || "阅读目录"}（直属文件）`;
+        folder = {
+          id,
+          path: folderPath,
+          folderName: relativePath ? path.basename(folderPath) : title,
+          title,
+          season: 1,
+          configured: false,
+          mediaCount: 0,
+          ebookCount: 0,
+          spreadsheetCount: 0,
+          customTitle: "",
+          sampleAlias: "",
+          kind: "reading",
+          libraryName: library?.name || "阅读目录",
+          relativePath: relativePath || "直属文件",
+        };
+        folders.set(id, folder);
+      }
+      folder.mediaCount += 1;
+      if (item.kind === "spreadsheet") folder.spreadsheetCount += 1;
+      else folder.ebookCount += 1;
+    }
+    return [...folders.values()].sort((left, right) => left.title.localeCompare(right.title, "zh-CN", { numeric: true, sensitivity: "base" }));
+  }
+
+  function accessFolderAliases() {
+    return appState.readingItems.flatMap((item) => ancestorFolderIds(item).map((folderId) => [folderId, accessFolderIdForItem(item)]));
   }
 
   async function handleRequest(request, response, url, pathname) {
@@ -391,6 +451,17 @@ export function createReadingService({
       await streamFile(request, response, item.path);
       return true;
     }
+    if ((request.method === "GET" || request.method === "HEAD") && /^\/api\/reading\/items\/[^/]+\/cover$/.test(pathname)) {
+      const itemId = pathname.split("/")[4];
+      const item = authorizedItem(request, response, itemId);
+      if (!item) return true;
+      if (!item.coverPath) return sendJson(response, 404, { error: "这本书没有可用的封面缩略图。" }), true;
+      await streamFile(request, response, item.coverPath, false, {
+        cacheControl: "private, max-age=31536000, immutable",
+        fileName: `${item.title}-cover${path.extname(item.coverPath)}`,
+      });
+      return true;
+    }
     sendJson(response, 404, { error: "没有找到这个阅读地址。" });
     return true;
   }
@@ -402,7 +473,9 @@ export function createReadingService({
     isScanning: () => Boolean(activeScan),
     requestStopScan: () => { if (scanContext) scanContext.cancelRequested = true; },
     folderNodes,
+    displayFolderSummaries,
     accessFolderSummaries,
+    accessFolderAliases,
     allFolderIds: () => accessFolderSummaries().map((folder) => folder.id),
   };
 }

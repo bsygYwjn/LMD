@@ -35,7 +35,7 @@ if ($package.version -ne $expectedPackageVersion) {
 }
 
 $requiredDirectories = @('assets', 'dist', 'patches', 'runtime', 'server', 'tools')
-$requiredFiles = @('启动LMD.vbs', 'LMD使用说明.md', 'README.md', 'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tray-qr.mjs', 'tray.ps1')
+$requiredFiles = @('启动LMD.vbs', 'LMD使用说明.md', 'README.md', 'LICENSE', 'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tray-qr.mjs', 'tray.ps1')
 foreach ($relativePath in @($requiredDirectories + $requiredFiles)) {
   if (-not (Test-Path -LiteralPath (Join-Path $projectRootFull $relativePath))) {
     throw "发布所需文件不存在：$relativePath"

@@ -49,10 +49,19 @@ const temporaryRoot = await mkdtemp(path.join(tmpdir(), "lmd-access-test-"));
 const testDataDirectory = path.join(temporaryRoot, "data");
 const firstLibrary = path.join(temporaryRoot, "AccessA");
 const secondLibrary = path.join(temporaryRoot, "AccessB");
+const animeLibrary = path.join(temporaryRoot, "アニメ");
+const bakemonogatariFolder = path.join(animeLibrary, "Monogatari Series", "01. Bakemonogatari");
+const bakemonogatariPvFolder = path.join(bakemonogatariFolder, "PV");
+const kizumonogatariFolder = path.join(animeLibrary, "Monogatari Series", "02. Kizumonogatari");
 await mkdir(firstLibrary, { recursive: true });
 await mkdir(secondLibrary, { recursive: true });
+await mkdir(bakemonogatariPvFolder, { recursive: true });
+await mkdir(kizumonogatariFolder, { recursive: true });
 await writeFile(path.join(firstLibrary, "first.mp4"), Buffer.from("first-video-test-content"));
 await writeFile(path.join(secondLibrary, "second.mp4"), Buffer.from("second-video-test-content"));
+await writeFile(path.join(bakemonogatariFolder, "episode.mp4"), Buffer.from("bakemonogatari-episode"));
+await writeFile(path.join(bakemonogatariPvFolder, "trailer.mp4"), Buffer.from("bakemonogatari-trailer"));
+await writeFile(path.join(kizumonogatariFolder, "movie.mp4"), Buffer.from("kizumonogatari-movie"));
 
 const port = await freePort();
 const localBaseUrl = `http://127.0.0.1:${port}`;
@@ -187,6 +196,32 @@ try {
   assert.equal(allowedStream.status, 206, "已授权视频应支持 Range 直传");
   const deniedStream = await fetch(`${lanBaseUrl}/api/media/${secondMedia.id}/stream`, { headers: { Cookie: cookie } });
   assert.equal(deniedStream.status, 404, "未授权视频直链也必须被后端拒绝");
+
+  request = await jsonRequest(localBaseUrl, "/api/libraries", { method: "POST", body: JSON.stringify({ folderPath: animeLibrary }) });
+  assert.equal(request.response.status, 201);
+  const animeLibraryId = request.result.library.id;
+  request = await jsonRequest(localBaseUrl, "/api/scan", { method: "POST" });
+  assert.equal(request.response.status, 200);
+  request = await jsonRequest(localBaseUrl, "/api/overview");
+  const nestedOverview = request.result;
+  const bakemonogatariAccessFolder = nestedOverview.accessFolders.find((folder) => folder.kind === "video" && folder.relativePath === "Monogatari Series / 01. Bakemonogatari");
+  const kizumonogatariAccessFolder = nestedOverview.accessFolders.find((folder) => folder.kind === "video" && folder.relativePath === "Monogatari Series / 02. Kizumonogatari");
+  assert.ok(bakemonogatariAccessFolder && kizumonogatariAccessFolder, "访问控制应列出大目录下最多两层的作品文件夹");
+  assert.equal(bakemonogatariAccessFolder.mediaCount, 2, "作品文件夹应汇总更深层目录中的视频");
+  assert.equal(nestedOverview.accessFolders.some((folder) => folder.relativePath?.endsWith(" / PV")), false, "更深层的 PV 文件夹不应成为独立权限项");
+
+  request = await jsonRequest(localBaseUrl, `/api/access-control/folders/${bakemonogatariAccessFolder.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ categoryId: allAgesCategory.id }),
+  });
+  assert.equal(request.response.status, 200);
+  request = await jsonRequest(lanBaseUrl, "/api/catalog", { headers: { Cookie: cookie } });
+  const visibleNames = new Set(request.result.media.map((media) => media.fileName));
+  assert.equal(visibleNames.has("episode.mp4"), true, "授权作品文件夹后应允许其直属视频");
+  assert.equal(visibleNames.has("trailer.mp4"), true, "授权作品文件夹后应允许更深层 PV 视频");
+  assert.equal(visibleNames.has("movie.mp4"), false, "相邻作品文件夹不得因父目录相同而越权可见");
+  request = await jsonRequest(localBaseUrl, `/api/libraries/${animeLibraryId}`, { method: "DELETE" });
+  assert.equal(request.response.status, 200);
 
   request = await jsonRequest(lanBaseUrl, "/api/auth/logout", { method: "POST", headers: { Cookie: cookie } });
   assert.equal(request.response.status, 200);

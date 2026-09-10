@@ -262,8 +262,8 @@ try {
   }
 
   const overview = (await jsonRequest(localBaseUrl, "/api/overview")).result;
-  const authorizedFolder = overview.displayFolders.find((folder) => folder.kind === "music" && folder.path === firstLibrary);
-  assert.ok(authorizedFolder, "访问控制总览应包含音乐库根目录");
+  const authorizedFolder = overview.accessFolders.find((folder) => folder.kind === "music" && folder.path.startsWith(firstLibrary));
+  assert.ok(authorizedFolder, "访问控制总览应包含音乐库下的权限文件夹");
   const category = (await jsonRequest(localBaseUrl, "/api/access-control/categories", {
     method: "POST",
     body: JSON.stringify({ name: "音乐授权" }),

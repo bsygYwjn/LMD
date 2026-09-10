@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { deflateRawSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as XLSX from "xlsx";
+import { prepareReadingCover } from "./reading-cover.mjs";
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(SERVER_DIR, "..");
@@ -90,6 +93,67 @@ function buildStoredZip(entries) {
   return Buffer.concat([...localParts, centralDirectory, end]);
 }
 
+async function testCoverResourceLimits() {
+  const directory = await mkdtemp(path.join(tmpdir(), "lmd-reading-cover-limits-"));
+  const originalWarn = console.warn;
+  try {
+    const image = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZoqsAAAAASUVORK5CYII=", "base64");
+    const makeDeflatedCover = (data, declaredSize = data.length) => {
+      const compressed = deflateRawSync(data);
+      const zip = buildStoredZip([{ name: "cover.png", data: compressed }]);
+      const centralOffset = zip.readUInt32LE(zip.length - 6);
+      zip.writeUInt16LE(8, 8);
+      zip.writeUInt32LE(crc32(data), 14);
+      zip.writeUInt32LE(declaredSize, 22);
+      zip.writeUInt16LE(8, centralOffset + 10);
+      zip.writeUInt32LE(crc32(data), centralOffset + 16);
+      zip.writeUInt32LE(declaredSize, centralOffset + 24);
+      return zip;
+    };
+    const extract = async (fileName) => {
+      const filePath = path.join(directory, fileName);
+      const fileStat = await stat(filePath);
+      return prepareReadingCover({
+        item: { id: fileName, fileName, path: filePath, extension: path.extname(fileName).slice(1).toUpperCase(), modifiedAt: fileStat.mtime.toISOString(), size: fileStat.size },
+        cacheDirectory: path.join(directory, "cache"),
+        stableId: (value) => createHash("sha256").update(value).digest("hex"),
+      });
+    };
+    await writeFile(path.join(directory, "normal.cbz"), makeDeflatedCover(image));
+    const normal = await extract("normal.cbz");
+    assert.ok(normal.coverPath, "正常 DEFLATE 封面应能提取");
+    assert.deepEqual(await readFile(normal.coverPath), image);
+
+    const oversizedImage = Buffer.alloc(24 * 1024 * 1024 + 1);
+    image.copy(oversizedImage);
+    await writeFile(path.join(directory, "forged.cbz"), makeDeflatedCover(oversizedImage, image.length));
+    const warnings = [];
+    console.warn = (message) => warnings.push(String(message));
+    const forged = await extract("forged.cbz");
+    console.warn = originalWarn;
+    assert.equal(forged.coverPath, null, "虚报解压体积的 ZIP 不应生成封面");
+    assert.ok(warnings.some((message) => /larger than|output length|output size/i.test(message)), "应在解压过程中触发输出上限，而不是完整解压后再检查");
+
+    const fb2 = `<FictionBook><description><title-info><coverpage><image href="#cover"/></coverpage></title-info></description><binary id="cover">${image.toString("base64")}</binary></FictionBook>`;
+    await writeFile(path.join(directory, "normal.fb2"), fb2);
+    assert.ok((await extract("normal.fb2")).coverPath, "正常 FB2 封面应能提取");
+    const oversizedFile = await open(path.join(directory, "large.fb2"), "w");
+    try {
+      await oversizedFile.write(fb2);
+      await oversizedFile.truncate(32 * 1024 * 1024 + 1);
+    } finally {
+      await oversizedFile.close();
+    }
+    assert.equal((await extract("large.fb2")).coverPath, null, "超限 FB2 应跳过封面解析");
+    console.log("阅读封面资源限制测试通过：正常压缩封面、虚报 ZIP 解压大小与 FB2 文件大小限制均正常。");
+  } finally {
+    console.warn = originalWarn;
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+await testCoverResourceLimits();
+
 function buildPdf() {
   const objects = [
     "<< /Type /Catalog /Pages 2 0 R >>",
@@ -127,7 +191,8 @@ const epubParagraphs = Array.from({ length: 180 }, (_, index) => `<p>第 ${index
 await writeFile(path.join(booksFolder, "样例.epub"), buildStoredZip([
   { name: "mimetype", data: "application/epub+zip" },
   { name: "META-INF/container.xml", data: "<?xml version=\"1.0\"?><container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\"><rootfiles><rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>" },
-  { name: "OEBPS/content.opf", data: "<?xml version=\"1.0\"?><package version=\"3.0\" unique-identifier=\"id\" xmlns=\"http://www.idpf.org/2007/opf\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:identifier id=\"id\">lmd-epub</dc:identifier><dc:title>LMD EPUB Reader</dc:title><dc:language>zh-CN</dc:language><dc:creator>Codex</dc:creator></metadata><manifest><item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/><item id=\"chapter\" href=\"chapter.xhtml\" media-type=\"application/xhtml+xml\"/></manifest><spine><itemref idref=\"chapter\"/></spine></package>" },
+  { name: "OEBPS/content.opf", data: "<?xml version=\"1.0\"?><package version=\"3.0\" unique-identifier=\"id\" xmlns=\"http://www.idpf.org/2007/opf\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:identifier id=\"id\">lmd-epub</dc:identifier><dc:title>LMD EPUB Reader</dc:title><dc:language>zh-CN</dc:language><dc:creator>Codex</dc:creator></metadata><manifest><item id=\"cover\" href=\"images/cover.png\" media-type=\"image/png\" properties=\"cover-image\"/><item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/><item id=\"chapter\" href=\"chapter.xhtml\" media-type=\"application/xhtml+xml\"/></manifest><spine><itemref idref=\"chapter\"/></spine></package>" },
+  { name: "OEBPS/images/cover.png", data: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZoqsAAAAASUVORK5CYII=", "base64") },
   { name: "OEBPS/nav.xhtml", data: "<html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\"><body><nav epub:type=\"toc\"><ol><li><a href=\"chapter.xhtml\">第一章</a></li></ol></nav></body></html>" },
   { name: "OEBPS/chapter.xhtml", data: `<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>第一章</h1>${epubParagraphs}</body></html>` },
 ]));
@@ -202,8 +267,16 @@ try {
   }
 
   const pdf = request.result.items.find((item) => item.extension === "PDF");
+  const epub = request.result.items.find((item) => item.extension === "EPUB");
   const xlsx = request.result.items.find((item) => item.extension === "XLSX");
   const hidden = request.result.items.find((item) => item.extension === "AZW3");
+  assert.equal(pdf.thumbnailUrl, null, "目录页不应为了 PDF 封面下载并解析原文件");
+  assert.match(epub.thumbnailUrl || "", /^\/api\/reading\/items\/[^/]+\/cover\?v=/, "EPUB 应返回服务端缓存封面地址");
+  let coverResponse = await fetch(`${lanBaseUrl}${epub.thumbnailUrl}`);
+  assert.equal(coverResponse.status, 200);
+  assert.equal(coverResponse.headers.get("content-type"), "image/png");
+  assert.match(coverResponse.headers.get("cache-control") || "", /immutable/);
+  assert.ok((await coverResponse.arrayBuffer()).byteLength > 0);
   let fileResponse = await fetch(`${lanBaseUrl}${pdf.fileUrl}`, { method: "HEAD" });
   assert.equal(fileResponse.status, 200);
   assert.equal(fileResponse.headers.get("content-type"), "application/pdf");
@@ -232,9 +305,9 @@ try {
   assert.equal(storedState.readingItems.length, formats.length);
 
   const overview = (await jsonRequest(localBaseUrl, "/api/overview?compact=1")).result;
-  const authorizedFolder = overview.displayFolders.find((folder) => folder.kind === "reading" && folder.path === readingRoot);
+  const authorizedFolder = overview.accessFolders.find((folder) => folder.kind === "reading" && folder.path.startsWith(readingRoot));
   const hiddenFolder = overview.displayFolders.find((folder) => folder.kind === "reading" && folder.path === nestedLibrary);
-  assert.ok(authorizedFolder && hiddenFolder, "访问控制总览应包含阅读库根目录");
+  assert.ok(authorizedFolder && hiddenFolder, "访问控制总览应包含阅读权限文件夹并保留完整显示目录");
   const category = (await jsonRequest(localBaseUrl, "/api/access-control/categories", {
     method: "POST",
     body: JSON.stringify({ name: "阅读授权" }),
