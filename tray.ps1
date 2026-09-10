@@ -343,11 +343,24 @@ $form.ShowInTaskbar = $true
 $form.BackColor = [System.Drawing.Color]::FromArgb(246, 248, 252)
 $form.Font = New-UiFont 9
 
+$brandPicture = New-Object System.Windows.Forms.PictureBox
+$brandPicture.Location = New-Object System.Drawing.Point(28, 25)
+$brandPicture.Size = New-Object System.Drawing.Size(32, 32)
+$brandPicture.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
+$brandImagePath = Join-Path $ProjectDirectory "assets\brand\lmd-icon.png"
+if (Test-Path -LiteralPath $brandImagePath) {
+  $brandSource = [System.Drawing.Image]::FromFile($brandImagePath)
+  try { $brandPicture.Image = New-Object System.Drawing.Bitmap($brandSource) }
+  finally { $brandSource.Dispose() }
+}
+$form.Controls.Add($brandPicture)
+
 $titleLabel = New-Object System.Windows.Forms.Label
-$titleLabel.Location = New-Object System.Drawing.Point(28, 24)
-$titleLabel.Size = New-Object System.Drawing.Size(400, 35)
+$titleLabel.Location = New-Object System.Drawing.Point(70, 24)
+$titleLabel.Size = New-Object System.Drawing.Size(362, 35)
 $titleLabel.Text = "LMD 局域网媒体与阅读共享"
-$titleLabel.Font = New-UiFont 18 ([System.Drawing.FontStyle]::Bold)
+$titleLabel.Font = New-UiFont 16 ([System.Drawing.FontStyle]::Bold)
+$titleLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
 $titleLabel.ForeColor = [System.Drawing.Color]::FromArgb(20, 35, 60)
 $form.Controls.Add($titleLabel)
 
@@ -565,6 +578,7 @@ try {
   $notifyIcon.Dispose()
   $runningTrayIcon.Dispose()
   $stoppedTrayIcon.Dispose()
+  if ($brandPicture.Image) { $brandPicture.Image.Dispose() }
   $contextMenu.Dispose()
   $form.Dispose()
   try { Remove-Item -LiteralPath $activationFlagPath -Force -ErrorAction SilentlyContinue } catch { }

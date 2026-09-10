@@ -177,9 +177,9 @@ try {
   assert.equal(storedState.photoItems.length, formats.length);
 
   const overview = (await jsonRequest(localBaseUrl, "/api/overview?compact=1")).result;
-  const authorizedFolder = overview.displayFolders.find((folder) => folder.kind === "photo" && folder.path === photoRoot);
+  const authorizedFolder = overview.accessFolders.find((folder) => folder.kind === "photo" && folder.path === galleryFolder);
   const hiddenFolder = overview.displayFolders.find((folder) => folder.kind === "photo" && folder.path === nestedLibrary);
-  assert.ok(authorizedFolder && hiddenFolder, "访问控制总览应包含图片库根目录");
+  assert.ok(authorizedFolder && hiddenFolder, "访问控制总览应包含图片权限文件夹并保留完整显示目录");
   const category = (await jsonRequest(localBaseUrl, "/api/access-control/categories", {
     method: "POST",
     body: JSON.stringify({ name: "图片授权" }),

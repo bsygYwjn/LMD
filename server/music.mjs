@@ -260,9 +260,22 @@ export function createMusicService({
     return paths.map((folderPath) => musicFolderId(track.libraryId, folderPath));
   }
 
+  function accessFolderPathForTrack(track) {
+    const library = libraryForTrack(track);
+    const trackFolderPath = path.resolve(folderPathForTrack(track));
+    const rootPath = path.resolve(library?.path || trackFolderPath);
+    if (!pathIsSameOrDescendant(trackFolderPath, rootPath)) return trackFolderPath;
+    const segments = path.relative(rootPath, trackFolderPath).split(path.sep).filter(Boolean);
+    return segments.length ? path.join(rootPath, ...segments.slice(0, 2)) : rootPath;
+  }
+
+  function accessFolderIdForTrack(track) {
+    return musicFolderId(track.libraryId, accessFolderPathForTrack(track));
+  }
+
   function canAccessTrack(context, track) {
     if (context?.fullAccess) return true;
-    return ancestorFolderIds(track).some((folderId) => canAccessFolderId(context, folderId));
+    return canAccessFolderId(context, accessFolderIdForTrack(track));
   }
 
   function accessibleTracks(context) {
@@ -802,7 +815,7 @@ export function createMusicService({
     }
   }
 
-  function accessFolderSummaries() {
+  function displayFolderSummaries() {
     return folderNodes().map((folder) => ({
       id: folder.id,
       path: folder.path,
@@ -815,6 +828,43 @@ export function createMusicService({
       sampleAlias: "",
       kind: "music",
     }));
+  }
+
+  function accessFolderSummaries() {
+    const folders = new Map();
+    for (const track of appState.musicTracks) {
+      const library = libraryForTrack(track);
+      const folderPath = accessFolderPathForTrack(track);
+      const id = musicFolderId(track.libraryId, folderPath);
+      const relativePath = library?.path && pathIsSameOrDescendant(folderPath, library.path)
+        ? path.relative(path.resolve(library.path), folderPath).split(path.sep).filter(Boolean).join(" / ")
+        : path.basename(folderPath);
+      let folder = folders.get(id);
+      if (!folder) {
+        const title = relativePath || `${library?.name || path.basename(folderPath) || "音乐目录"}（直属文件）`;
+        folder = {
+          id,
+          path: folderPath,
+          folderName: relativePath ? path.basename(folderPath) : title,
+          title,
+          season: 1,
+          configured: false,
+          mediaCount: 0,
+          customTitle: "",
+          sampleAlias: "",
+          kind: "music",
+          libraryName: library?.name || "音乐目录",
+          relativePath: relativePath || "直属文件",
+        };
+        folders.set(id, folder);
+      }
+      folder.mediaCount += 1;
+    }
+    return [...folders.values()].sort((left, right) => left.title.localeCompare(right.title, "zh-CN", { numeric: true, sensitivity: "base" }));
+  }
+
+  function accessFolderAliases() {
+    return appState.musicTracks.flatMap((track) => ancestorFolderIds(track).map((folderId) => [folderId, accessFolderIdForTrack(track)]));
   }
 
   function compatibleFiles() {
@@ -930,7 +980,9 @@ export function createMusicService({
     queueAutomaticCompatibleCopies,
     cleanOrphanedCacheFiles,
     folderNodes,
+    displayFolderSummaries,
     accessFolderSummaries,
+    accessFolderAliases,
     allFolderIds: () => accessFolderSummaries().map((folder) => folder.id),
     compatibleFiles,
     replaceCompatiblePath,

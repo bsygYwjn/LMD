@@ -11,6 +11,7 @@ import { promisify } from "node:util";
 import { createMusicService } from "./music.mjs";
 import { createReadingService } from "./reading.mjs";
 import { createPhotoService } from "./photos.mjs";
+import { detectedEpisodeNumber, quickSelectionsForFolder } from "./video-selection.mjs";
 
 // 这台电脑既是“视频硬盘”，也是局域网服务器。这个文件负责全部本地 API。
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -406,6 +407,7 @@ function accessContextForRequest(request) {
     user,
     categoryIds: new Set(Array.isArray(user.categoryIds) ? user.categoryIds : []),
     legacyFolderIds: new Set(Array.isArray(user.folderIds) ? user.folderIds : []),
+    allowedFolderIds: accessFolderIdsForUser(user),
   };
 }
 
@@ -422,14 +424,11 @@ function requireViewerAccess(request, response) {
 
 function canAccessFolderId(context, folderId) {
   if (context?.fullAccess) return true;
-  if (context?.legacyFolderIds?.has(folderId)) return true;
-  const category = appState.accessControl.categories.find((item) => item.folderIds.includes(folderId));
-  if (category) return Boolean(context?.categoryIds?.has(category.id));
-  return Boolean(context?.categoryIds?.has(UNCATEGORIZED_ACCESS_CATEGORY_ID));
+  return Boolean(context?.allowedFolderIds?.has(folderId));
 }
 
 function canAccessMedia(context, media) {
-  return canAccessFolderId(context, stableId(folderPathForMedia(media)));
+  return canAccessFolderId(context, videoAccessFolderId(media));
 }
 
 function accessibleMedia(context) {
@@ -2996,9 +2995,18 @@ function createDisplayIndex(mediaItems = appState.media) {
   }
   for (const bucket of folders.values()) {
     bucket.items.sort((left, right) => left.fileName.localeCompare(right.fileName, "zh-CN", { numeric: true, sensitivity: "base" }));
+    Object.assign(bucket, folderSelectionMetadata(bucket.folderPath, bucket.items));
   }
   const groups = new Map(appState.displayGroups.map((group) => [path.resolve(group.path).toLowerCase(), group]));
   return { folders, groups };
+}
+
+function folderSelectionMetadata(folderPath, folderItems) {
+  const episodeNumberByMediaId = new Map();
+  for (const item of folderItems) episodeNumberByMediaId.set(item.id, detectedEpisodeNumber(item.fileName));
+  const resolvedSelections = quickSelectionsForFolder(folderPath, folderItems.map((item) => item.fileName));
+  const quickSelectionByMediaId = new Map(folderItems.map((item, index) => [item.id, resolvedSelections[index] || null]));
+  return { episodeNumberByMediaId, quickSelectionByMediaId };
 }
 
 function displayGroupForFolder(folderPath, displayIndex = null) {
@@ -3019,20 +3027,6 @@ function inferSeasonNumber(folderPath, mediaItems) {
   return chinese ? Number(chinese[1]) : 1;
 }
 
-function detectedEpisodeNumber(fileName) {
-  const baseName = path.basename(fileName, path.extname(fileName));
-  const seasonEpisode = baseName.match(/(?:^|[^a-z0-9])s\d{1,2}e(\d{1,4})(?:[^a-z0-9]|$)/i);
-  if (seasonEpisode) return Number(seasonEpisode[1]);
-  const episodeLabel = baseName.match(/(?:^|[\s._\-[\(])(?:ep?|episode)[\s._-]?(\d{1,4})(?=$|[\s._\-\]\)])/i);
-  if (episodeLabel) return Number(episodeLabel[1]);
-  const chinese = baseName.match(/第\s*(\d{1,4})\s*[话話集]/);
-  if (chinese) return Number(chinese[1]);
-  const bracketed = [...baseName.matchAll(/[\[(](\d{1,3})(?:v\d+)?[\])]/gi)].map((match) => Number(match[1])).find((value) => value < 200);
-  if (bracketed) return bracketed;
-  const separated = baseName.match(/(?:^|[\s._-])(\d{1,3})(?:v\d+)?(?=$|[\s._-])/i);
-  return separated ? Number(separated[1]) : null;
-}
-
 function sortedFolderMedia(folderPath, displayIndex = null) {
   const normalized = path.resolve(folderPath).toLowerCase();
   if (displayIndex) return displayIndex.folders.get(normalized)?.items || [];
@@ -3046,14 +3040,19 @@ function mediaDisplayInfo(media, displayIndex = null) {
   const group = displayGroupForFolder(folderPath, displayIndex);
   const folderItems = sortedFolderMedia(folderPath, displayIndex);
   const season = Number(group?.season) || inferSeasonNumber(folderPath, folderItems);
-  const detectedEpisode = detectedEpisodeNumber(media.fileName);
-  const episode = detectedEpisode || folderItems.findIndex((item) => item.id === media.id) + 1;
+  const normalizedFolderPath = path.resolve(folderPath).toLowerCase();
+  const folderBucket = displayIndex?.folders.get(normalizedFolderPath);
+  const selectionMetadata = folderBucket || folderSelectionMetadata(folderPath, folderItems);
+  const detectedEpisode = selectionMetadata.episodeNumberByMediaId.get(media.id) ?? null;
+  const quickSelection = selectionMetadata.quickSelectionByMediaId.get(media.id) || null;
+  const episode = detectedEpisode ?? folderItems.findIndex((item) => item.id === media.id) + 1;
   const seriesTitle = group?.title?.trim() || path.basename(folderPath);
   return {
     groupId: stableId(folderPath),
     seriesTitle,
     season,
     episode,
+    quickSelection,
     alias: `${seriesTitle} - S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`,
     configured: Boolean(group?.title?.trim()),
   };
@@ -3079,6 +3078,66 @@ function displayFolderSummaries(displayIndex = null) {
       sampleAlias: firstDisplay?.alias || "",
     };
   }).sort((left, right) => left.title.localeCompare(right.title, "zh-CN", { numeric: true, sensitivity: "base" }));
+}
+
+const ACCESS_FOLDER_MAX_RELATIVE_DEPTH = 2;
+
+function boundedAccessFolderPath(rootPath, mediaFolderPath) {
+  const root = path.resolve(rootPath || mediaFolderPath);
+  const folder = path.resolve(mediaFolderPath);
+  if (!pathIsSameOrDescendant(folder, root)) return folder;
+  const segments = path.relative(root, folder).split(path.sep).filter(Boolean);
+  return segments.length ? path.join(root, ...segments.slice(0, ACCESS_FOLDER_MAX_RELATIVE_DEPTH)) : root;
+}
+
+function videoLibraryForMedia(media) {
+  return appState.libraries.find((library) => library.id === media.libraryId) || null;
+}
+
+function videoAccessFolderPath(media) {
+  const mediaFolderPath = folderPathForMedia(media);
+  return boundedAccessFolderPath(videoLibraryForMedia(media)?.path || mediaFolderPath, mediaFolderPath);
+}
+
+function videoAccessFolderId(media) {
+  return stableId(videoAccessFolderPath(media));
+}
+
+function videoAccessFolderSummaries() {
+  const folders = new Map();
+  for (const media of appState.media) {
+    const library = videoLibraryForMedia(media);
+    const folderPath = videoAccessFolderPath(media);
+    const id = stableId(folderPath);
+    const relativePath = library?.path && pathIsSameOrDescendant(folderPath, library.path)
+      ? path.relative(path.resolve(library.path), folderPath).split(path.sep).filter(Boolean).join(" / ")
+      : path.basename(folderPath);
+    let folder = folders.get(id);
+    if (!folder) {
+      const title = relativePath || `${library?.name || path.basename(folderPath) || "视频目录"}（直属文件）`;
+      folder = {
+        id,
+        path: folderPath,
+        folderName: relativePath ? path.basename(folderPath) : title,
+        title,
+        customTitle: "",
+        sampleAlias: "",
+        season: 1,
+        configured: false,
+        mediaCount: 0,
+        kind: "video",
+        libraryName: library?.name || "视频目录",
+        relativePath: relativePath || "直属文件",
+      };
+      folders.set(id, folder);
+    }
+    folder.mediaCount += 1;
+  }
+  return [...folders.values()].sort((left, right) => left.title.localeCompare(right.title, "zh-CN", { numeric: true, sensitivity: "base" }));
+}
+
+function videoAccessFolderAliases() {
+  return appState.media.map((media) => [stableId(folderPathForMedia(media)), videoAccessFolderId(media)]);
 }
 
 function catalogFolderNodes(mediaItems, displayIndex = null) {
@@ -3136,14 +3195,64 @@ function catalogFolderNodes(mediaItems, displayIndex = null) {
   });
 }
 
-function validAccessFolderIds(folderIds, displayIndex = null) {
-  const availableIds = new Set([
-    ...displayFolderSummaries(displayIndex).map((folder) => folder.id),
-    ...(musicService?.allFolderIds() || []),
-    ...(readingService?.allFolderIds() || []),
-    ...(photoService?.allFolderIds() || []),
-  ]);
-  return [...new Set(Array.isArray(folderIds) ? folderIds.map(String) : [])].filter((id) => availableIds.has(id));
+function accessFolderInventory() {
+  const folders = [
+    ...videoAccessFolderSummaries(),
+    ...(musicService?.accessFolderSummaries() || []),
+    ...(readingService?.accessFolderSummaries() || []),
+    ...(photoService?.accessFolderSummaries() || []),
+  ];
+  const availableIds = new Set(folders.map((folder) => folder.id));
+  const aliases = new Map([...availableIds].map((id) => [id, new Set([id])]));
+  const registerAliases = (pairs) => {
+    for (const [sourceId, targetId] of pairs || []) {
+      if (!availableIds.has(targetId)) continue;
+      if (!aliases.has(sourceId)) aliases.set(sourceId, new Set());
+      aliases.get(sourceId).add(targetId);
+    }
+  };
+  registerAliases(videoAccessFolderAliases());
+  registerAliases(musicService?.accessFolderAliases());
+  registerAliases(readingService?.accessFolderAliases());
+  registerAliases(photoService?.accessFolderAliases());
+  return { folders, availableIds, aliases };
+}
+
+function resolveAccessFolderIds(folderIds, inventory = accessFolderInventory()) {
+  const resolved = new Set();
+  for (const rawId of Array.isArray(folderIds) ? folderIds.map(String) : []) {
+    for (const folderId of inventory.aliases.get(rawId) || []) resolved.add(folderId);
+  }
+  return [...resolved].filter((id) => inventory.availableIds.has(id));
+}
+
+function accessCategoryFolderAssignments() {
+  const inventory = accessFolderInventory();
+  const claimed = new Set();
+  const categories = appState.accessControl.categories.map((category) => {
+    const folderIds = resolveAccessFolderIds(category.folderIds, inventory).filter((id) => !claimed.has(id));
+    for (const id of folderIds) claimed.add(id);
+    return { category, folderIds };
+  });
+  return { inventory, categories, claimed };
+}
+
+function accessFolderIdsForUser(user) {
+  const categoryIds = new Set(Array.isArray(user?.categoryIds) ? user.categoryIds.map(String) : []);
+  const { inventory, categories, claimed } = accessCategoryFolderAssignments();
+  const allowed = new Set(resolveAccessFolderIds(user?.folderIds, inventory));
+  for (const { category, folderIds } of categories) {
+    if (categoryIds.has(category.id)) for (const folderId of folderIds) allowed.add(folderId);
+  }
+  if (categoryIds.has(UNCATEGORIZED_ACCESS_CATEGORY_ID)) {
+    for (const folderId of inventory.availableIds) if (!claimed.has(folderId)) allowed.add(folderId);
+  }
+  return allowed;
+}
+
+function canonicalizeAccessCategoryFolders() {
+  const { categories } = accessCategoryFolderAssignments();
+  for (const { category, folderIds } of categories) category.folderIds = folderIds;
 }
 
 function validAccessCategoryIds(categoryIds) {
@@ -3154,18 +3263,14 @@ function validAccessCategoryIds(categoryIds) {
   return [...new Set(Array.isArray(categoryIds) ? categoryIds.map(String) : [])].filter((id) => availableIds.has(id));
 }
 
-function uncategorizedAccessFolderIds(displayIndex = null) {
-  const categorizedIds = new Set(appState.accessControl.categories.flatMap((category) => validAccessFolderIds(category.folderIds, displayIndex)));
-  return [
-    ...displayFolderSummaries(displayIndex).map((folder) => folder.id),
-    ...(musicService?.allFolderIds() || []),
-    ...(readingService?.allFolderIds() || []),
-    ...(photoService?.allFolderIds() || []),
-  ].filter((id) => !categorizedIds.has(id));
+function uncategorizedAccessFolderIds() {
+  const { inventory, claimed } = accessCategoryFolderAssignments();
+  return [...inventory.availableIds].filter((id) => !claimed.has(id));
 }
 
-function accessControlOverview(displayIndex = null) {
+function accessControlOverview() {
   const now = Date.now();
+  const { categories } = accessCategoryFolderAssignments();
   return {
     enabled: appState.accessControl.enabled,
     users: appState.accessControl.users.map(publicAccessUser),
@@ -3173,15 +3278,15 @@ function accessControlOverview(displayIndex = null) {
       {
         id: UNCATEGORIZED_ACCESS_CATEGORY_ID,
         name: UNCATEGORIZED_ACCESS_CATEGORY_NAME,
-        folderIds: uncategorizedAccessFolderIds(displayIndex),
+        folderIds: uncategorizedAccessFolderIds(),
         createdAt: "",
         updatedAt: "",
         system: true,
       },
-      ...appState.accessControl.categories.map((category) => ({
+      ...categories.map(({ category, folderIds }) => ({
         id: category.id,
         name: category.name,
-        folderIds: validAccessFolderIds(category.folderIds, displayIndex),
+        folderIds,
         createdAt: category.createdAt,
         updatedAt: category.updatedAt,
         system: false,
@@ -3256,6 +3361,7 @@ musicService = createMusicService({
 
 readingService = createReadingService({
   appState,
+  cacheDirectory: CACHE_DIR,
   saveState,
   stableId,
   streamFile,
@@ -3441,7 +3547,8 @@ const server = createServer(async (request, response) => {
       return sendJson(response, 200, {
         libraries: appState.libraries,
         media: compact ? [] : appState.media.map((item) => publicMedia(item, true, displayIndex)),
-        displayFolders: [...displayFolderSummaries(displayIndex), ...musicService.accessFolderSummaries(), ...readingService.accessFolderSummaries(), ...photoService.accessFolderSummaries()],
+        displayFolders: [...displayFolderSummaries(displayIndex), ...musicService.displayFolderSummaries(), ...readingService.displayFolderSummaries(), ...photoService.displayFolderSummaries()],
+        accessFolders: accessFolderInventory().folders,
         jobs: appState.jobs,
         settings: appState.settings,
         tools: mediaTools,
@@ -3450,7 +3557,7 @@ const server = createServer(async (request, response) => {
         activeVideoTransfers: activeVideoTransfers.size,
         lanAddresses: getLanAddresses(),
         autostart: await getAutostartStatus(),
-        accessControl: accessControlOverview(displayIndex),
+        accessControl: accessControlOverview(),
         remuxAcceleration: remuxAccelerationStatus(),
       });
     }
@@ -3588,11 +3695,12 @@ const server = createServer(async (request, response) => {
     if (request.method === "PATCH" && /^\/api\/access-control\/folders\/[^/]+$/.test(pathname)) {
       if (!requireLocalManagement(request, response)) return;
       const folderId = pathname.split("/").pop();
-      const accessFolders = [...displayFolderSummaries(), ...musicService.accessFolderSummaries(), ...readingService.accessFolderSummaries(), ...photoService.accessFolderSummaries()];
+      const accessFolders = accessFolderInventory().folders;
       if (!accessFolders.some((folder) => folder.id === folderId)) return sendJson(response, 404, { error: "找不到这个媒体文件夹，请先重新扫描。" });
       const body = await readJson(request);
       const categoryId = body.categoryId === null || body.categoryId === "" ? null : String(body.categoryId || "");
       if (categoryId && !appState.accessControl.categories.some((category) => category.id === categoryId)) return sendJson(response, 400, { error: "选择的文件夹分类不存在。" });
+      canonicalizeAccessCategoryFolders();
       for (const category of appState.accessControl.categories) {
         category.folderIds = (category.folderIds || []).filter((id) => id !== folderId);
         if (category.id === categoryId) category.folderIds.push(folderId);

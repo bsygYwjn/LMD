@@ -1,14 +1,31 @@
-param(
-  [string]$RunningSource,
-  [string]$StoppedSource
-)
+param()
 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
+$ErrorActionPreference = 'Stop'
 $projectDirectory = Split-Path -Parent $PSScriptRoot
-if (-not $RunningSource) { $RunningSource = Join-Path $projectDirectory "assets\icon-source\tray-running-selected.png" }
-if (-not $StoppedSource) { $StoppedSource = Join-Path $projectDirectory "assets\icon-source\tray-stopped-selected.png" }
+$brandDirectory = Join-Path $projectDirectory 'assets\brand'
+$publicBrandDirectory = Join-Path $projectDirectory 'public\brand'
+$sourcePath = Join-Path $brandDirectory 'lmd-mark.svg'
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[System.IO.Directory]::CreateDirectory($publicBrandDirectory) | Out-Null
+
+# The editable SVG is the single geometry source for web, Windows and documentation.
+$source = [System.IO.File]::ReadAllText($sourcePath)
+[xml]$document = $source
+$group = $document.SelectSingleNode('//*[local-name()="g"]')
+$paths = @($group.SelectNodes('*[local-name()="path"]') | ForEach-Object { $_.GetAttribute('d') })
+if ($document.DocumentElement.GetAttribute('viewBox') -ne '0 0 64 64' -or $paths.Count -ne 2) {
+  throw 'Expected the LMD 64-unit master SVG with two paths.'
+}
+$brandColor = $group.GetAttribute('stroke')
+$strokeWidth = [single]::Parse($group.GetAttribute('stroke-width'), [Globalization.CultureInfo]::InvariantCulture)
+$iconSvg = $source.Replace('<title>LMD</title>', '<title>LMD</title><rect width="64" height="64" rx="14" fill="' + $brandColor + '"/>').Replace('stroke="' + $brandColor + '"', 'stroke="#FFFFFF"')
+[System.IO.File]::WriteAllText((Join-Path $brandDirectory 'lmd-icon.svg'), $iconSvg, $utf8)
+[System.IO.File]::WriteAllText((Join-Path $brandDirectory 'lmd-mono.svg'), $source.Replace($brandColor, '#172033'), $utf8)
+[System.IO.File]::WriteAllText((Join-Path $brandDirectory 'lmd-inverse.svg'), $source.Replace($brandColor, '#FFFFFF'), $utf8)
+foreach ($name in @('lmd-mark.svg', 'lmd-icon.svg', 'lmd-mono.svg', 'lmd-inverse.svg')) {
+  Copy-Item -LiteralPath (Join-Path $brandDirectory $name) -Destination (Join-Path $publicBrandDirectory $name) -Force
+}
 
 Add-Type -AssemblyName System.Drawing
 Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @"
@@ -16,187 +33,100 @@ using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Globalization;
 using System.IO;
-using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 
-public static class LvdTrayIconRenderer
-{
-    private static double Luma(byte red, byte green, byte blue)
-    {
-        return red * 0.2126 + green * 0.7152 + blue * 0.0722;
-    }
+public static class LmdBrandRenderer {
+    private static float Number(string token) { return float.Parse(token, CultureInfo.InvariantCulture); }
 
-    public static Bitmap ExtractForeground(string sourcePath)
-    {
-        using (var loaded = new Bitmap(sourcePath))
-        using (var source = new Bitmap(loaded.Width, loaded.Height, PixelFormat.Format32bppArgb))
-        {
-            using (var graphics = Graphics.FromImage(source))
-            {
-                graphics.DrawImageUnscaled(loaded, 0, 0);
-            }
-
-            var rectangle = new Rectangle(0, 0, source.Width, source.Height);
-            var sourceData = source.LockBits(rectangle, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-            var sourceBytes = new byte[Math.Abs(sourceData.Stride) * source.Height];
-            Marshal.Copy(sourceData.Scan0, sourceBytes, 0, sourceBytes.Length);
-            source.UnlockBits(sourceData);
-
-            int sampleSize = Math.Max(4, Math.Min(source.Width, source.Height) / 64);
-            long backgroundRed = 0, backgroundGreen = 0, backgroundBlue = 0, backgroundSamples = 0;
-            long foregroundRed = 0, foregroundGreen = 0, foregroundBlue = 0, foregroundSamples = 0;
-
-            for (int y = 0; y < source.Height; y++)
-            {
-                for (int x = 0; x < source.Width; x++)
-                {
-                    int index = y * sourceData.Stride + x * 4;
-                    byte blue = sourceBytes[index];
-                    byte green = sourceBytes[index + 1];
-                    byte red = sourceBytes[index + 2];
-
-                    bool corner = (x < sampleSize || x >= source.Width - sampleSize) &&
-                                  (y < sampleSize || y >= source.Height - sampleSize);
-                    if (corner)
-                    {
-                        backgroundRed += red;
-                        backgroundGreen += green;
-                        backgroundBlue += blue;
-                        backgroundSamples++;
-                    }
-
-                    if (Luma(red, green, blue) < 85)
-                    {
-                        foregroundRed += red;
-                        foregroundGreen += green;
-                        foregroundBlue += blue;
-                        foregroundSamples++;
-                    }
-                }
-            }
-
-            if (backgroundSamples == 0 || foregroundSamples == 0)
-                throw new InvalidOperationException("Unable to detect icon foreground and background colors.");
-
-            double bgR = (double)backgroundRed / backgroundSamples;
-            double bgG = (double)backgroundGreen / backgroundSamples;
-            double bgB = (double)backgroundBlue / backgroundSamples;
-            double fgR = (double)foregroundRed / foregroundSamples;
-            double fgG = (double)foregroundGreen / foregroundSamples;
-            double fgB = (double)foregroundBlue / foregroundSamples;
-            double vectorR = fgR - bgR;
-            double vectorG = fgG - bgG;
-            double vectorB = fgB - bgB;
-            double vectorLength = vectorR * vectorR + vectorG * vectorG + vectorB * vectorB;
-
-            var alpha = new byte[source.Width * source.Height];
-            int minX = source.Width, minY = source.Height, maxX = -1, maxY = -1;
-            for (int y = 0; y < source.Height; y++)
-            {
-                for (int x = 0; x < source.Width; x++)
-                {
-                    int sourceIndex = y * sourceData.Stride + x * 4;
-                    double redDelta = sourceBytes[sourceIndex + 2] - bgR;
-                    double greenDelta = sourceBytes[sourceIndex + 1] - bgG;
-                    double blueDelta = sourceBytes[sourceIndex] - bgB;
-                    double opacity = (redDelta * vectorR + greenDelta * vectorG + blueDelta * vectorB) / vectorLength;
-                    opacity = Math.Max(0, Math.Min(1, opacity));
-                    if (opacity < 0.025) opacity = 0;
-                    else if (opacity > 0.975) opacity = 1;
-
-                    byte alphaValue = (byte)Math.Round(opacity * 255);
-                    alpha[y * source.Width + x] = alphaValue;
-                    if (alphaValue > 10)
-                    {
-                        minX = Math.Min(minX, x);
-                        minY = Math.Min(minY, y);
-                        maxX = Math.Max(maxX, x);
-                        maxY = Math.Max(maxY, y);
-                    }
-                }
-            }
-
-            if (maxX < minX || maxY < minY)
-                throw new InvalidOperationException("No visible icon foreground was detected.");
-
-            int contentWidth = maxX - minX + 1;
-            int contentHeight = maxY - minY + 1;
-            int padding = Math.Max(8, (int)Math.Ceiling(Math.Max(contentWidth, contentHeight) * 0.055));
-            int canvasSize = Math.Max(contentWidth, contentHeight) + padding * 2;
-            int offsetX = (canvasSize - contentWidth) / 2;
-            int offsetY = (canvasSize - contentHeight) / 2;
-            var result = new Bitmap(canvasSize, canvasSize, PixelFormat.Format32bppArgb);
-            var resultRectangle = new Rectangle(0, 0, canvasSize, canvasSize);
-            var resultData = result.LockBits(resultRectangle, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-            var resultBytes = new byte[Math.Abs(resultData.Stride) * canvasSize];
-
-            byte iconRed = (byte)Math.Round(fgR);
-            byte iconGreen = (byte)Math.Round(fgG);
-            byte iconBlue = (byte)Math.Round(fgB);
-            for (int y = minY; y <= maxY; y++)
-            {
-                for (int x = minX; x <= maxX; x++)
-                {
-                    byte alphaValue = alpha[y * source.Width + x];
-                    if (alphaValue == 0) continue;
-                    int targetX = offsetX + x - minX;
-                    int targetY = offsetY + y - minY;
-                    int targetIndex = targetY * resultData.Stride + targetX * 4;
-                    resultBytes[targetIndex] = iconBlue;
-                    resultBytes[targetIndex + 1] = iconGreen;
-                    resultBytes[targetIndex + 2] = iconRed;
-                    resultBytes[targetIndex + 3] = alphaValue;
-                }
-            }
-
-            Marshal.Copy(resultBytes, 0, resultData.Scan0, resultBytes.Length);
-            result.UnlockBits(resultData);
-            return result;
+    // Deliberately small SVG subset: fail on unsupported edits instead of drawing a different logo.
+    private static GraphicsPath ReadPath(string data) {
+        var tokens = Regex.Matches(data, @"[A-Za-z]|-?\d+(?:\.\d+)?");
+        var path = new GraphicsPath();
+        var current = new PointF();
+        int index = 0;
+        while (index < tokens.Count) {
+            string command = tokens[index++].Value;
+            if (command == "M" || command == "L") {
+                var next = new PointF(Number(tokens[index++].Value), Number(tokens[index++].Value));
+                if (command == "M") path.StartFigure();
+                else path.AddLine(current, next);
+                current = next;
+            } else if (command == "Q") {
+                var control = new PointF(Number(tokens[index++].Value), Number(tokens[index++].Value));
+                var next = new PointF(Number(tokens[index++].Value), Number(tokens[index++].Value));
+                path.AddBezier(current,
+                    new PointF(current.X + (control.X - current.X) * 2 / 3, current.Y + (control.Y - current.Y) * 2 / 3),
+                    new PointF(next.X + (control.X - next.X) * 2 / 3, next.Y + (control.Y - next.Y) * 2 / 3), next);
+                current = next;
+            } else { path.Dispose(); throw new InvalidOperationException("Unsupported SVG command: " + command); }
         }
+        return path;
     }
 
-    public static byte[] RenderPng(Bitmap source, int size)
-    {
-        using (var output = new Bitmap(size, size, PixelFormat.Format32bppArgb))
-        using (var graphics = Graphics.FromImage(output))
-        using (var stream = new MemoryStream())
-        {
+    public static byte[] Render(string[] paths, float width, string foreground, string background, int size) {
+        // Supersampling preserves the open spaces and rounded ends at 16 / 20 / 24 px.
+        int renderSize = size * 4;
+        using (var high = new Bitmap(renderSize, renderSize, PixelFormat.Format32bppArgb))
+        using (var graphics = Graphics.FromImage(high)) {
             graphics.Clear(Color.Transparent);
-            graphics.CompositingMode = CompositingMode.SourceCopy;
-            graphics.CompositingQuality = CompositingQuality.HighQuality;
-            graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-            graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            graphics.SmoothingMode = SmoothingMode.HighQuality;
-            graphics.DrawImage(source, new Rectangle(0, 0, size, size));
-            output.Save(stream, ImageFormat.Png);
-            return stream.ToArray();
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            graphics.ScaleTransform(renderSize / 64f, renderSize / 64f);
+            if (!String.IsNullOrEmpty(background)) {
+                using (var tile = new GraphicsPath())
+                using (var brush = new SolidBrush(ColorTranslator.FromHtml(background))) {
+                    tile.AddArc(0, 0, 28, 28, 180, 90);
+                    tile.AddArc(36, 0, 28, 28, 270, 90);
+                    tile.AddArc(36, 36, 28, 28, 0, 90);
+                    tile.AddArc(0, 36, 28, 28, 90, 90);
+                    tile.CloseFigure();
+                    graphics.FillPath(brush, tile);
+                }
+            }
+            using (var pen = new Pen(ColorTranslator.FromHtml(foreground), width)) {
+                pen.StartCap = pen.EndCap = LineCap.Round;
+                pen.LineJoin = LineJoin.Round;
+                foreach (var data in paths) {
+                    using (var path = ReadPath(data)) graphics.DrawPath(pen, path);
+                }
+            }
+            using (var output = new Bitmap(size, size, PixelFormat.Format32bppArgb))
+            using (var scaled = Graphics.FromImage(output))
+            using (var attributes = new ImageAttributes())
+            using (var stream = new MemoryStream()) {
+                scaled.CompositingMode = CompositingMode.SourceCopy;
+                scaled.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                scaled.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                attributes.SetWrapMode(WrapMode.TileFlipXY);
+                scaled.DrawImage(high, new Rectangle(0, 0, size, size), 0, 0, renderSize, renderSize, GraphicsUnit.Pixel, attributes);
+                output.Save(stream, ImageFormat.Png);
+                return stream.ToArray();
+            }
         }
     }
 }
 "@
 
-function Write-MultiSizeIcon {
-  param(
-    [Parameter(Mandatory)] [System.Drawing.Bitmap]$Bitmap,
-    [Parameter(Mandatory)] [string]$Destination
-  )
+function Write-BrandPng([string]$Destination, [int]$Size, [string]$Foreground = '#FFFFFF', [string]$Background = $brandColor) {
+  [System.IO.File]::WriteAllBytes($Destination, [LmdBrandRenderer]::Render($paths, $strokeWidth, $Foreground, $Background, $Size))
+}
 
+function Write-BrandIcon([string]$Destination, [string]$Background = $brandColor) {
   $sizes = @(16, 20, 24, 32, 40, 48, 64, 128, 256)
   $images = New-Object 'System.Collections.Generic.List[byte[]]'
-  foreach ($size in $sizes) { $images.Add([LvdTrayIconRenderer]::RenderPng($Bitmap, $size)) }
+  foreach ($size in $sizes) { $images.Add([LmdBrandRenderer]::Render($paths, $strokeWidth, '#FFFFFF', $Background, $size)) }
   $stream = New-Object System.IO.MemoryStream
   $writer = New-Object System.IO.BinaryWriter($stream)
   try {
     $writer.Write([uint16]0)
     $writer.Write([uint16]1)
     $writer.Write([uint16]$sizes.Count)
-    $offset = 6 + (16 * $sizes.Count)
-
+    $offset = 6 + 16 * $sizes.Count
     for ($index = 0; $index -lt $sizes.Count; $index++) {
-      $size = $sizes[$index]
-      $iconDimension = if ($size -eq 256) { 0 } else { $size }
-      $writer.Write([byte]$iconDimension)
-      $writer.Write([byte]$iconDimension)
+      $dimension = if ($sizes[$index] -eq 256) { 0 } else { $sizes[$index] }
+      $writer.Write([byte]$dimension)
+      $writer.Write([byte]$dimension)
       $writer.Write([byte]0)
       $writer.Write([byte]0)
       $writer.Write([uint16]1)
@@ -205,35 +135,20 @@ function Write-MultiSizeIcon {
       $writer.Write([uint32]$offset)
       $offset += $images[$index].Length
     }
-
     foreach ($image in $images) { $writer.Write($image) }
     [System.IO.File]::WriteAllBytes($Destination, $stream.ToArray())
-  } finally {
-    $writer.Dispose()
-    $stream.Dispose()
-  }
+  } finally { $writer.Dispose(); $stream.Dispose() }
 }
 
-function Build-TrayIcon {
-  param(
-    [Parameter(Mandatory)] [string]$Source,
-    [Parameter(Mandatory)] [string]$Name
-  )
-
-  if (-not (Test-Path -LiteralPath $Source)) { throw "Icon source not found: $Source" }
-  $assetsDirectory = Join-Path $projectDirectory "assets"
-  [System.IO.Directory]::CreateDirectory($assetsDirectory) | Out-Null
-  $bitmap = [LvdTrayIconRenderer]::ExtractForeground($Source)
-  try {
-    $pngPath = Join-Path $assetsDirectory "$Name.png"
-    $icoPath = Join-Path $assetsDirectory "$Name.ico"
-    $bitmap.Save($pngPath, [System.Drawing.Imaging.ImageFormat]::Png)
-    Write-MultiSizeIcon -Bitmap $bitmap -Destination $icoPath
-    [pscustomobject]@{ Name = $Name; Png = $pngPath; Icon = $icoPath }
-  } finally {
-    $bitmap.Dispose()
-  }
-}
-
-Build-TrayIcon -Source $RunningSource -Name "tray-running"
-Build-TrayIcon -Source $StoppedSource -Name "tray-stopped"
+Write-BrandPng (Join-Path $brandDirectory 'lmd-icon.png') 512
+Write-BrandPng (Join-Path $brandDirectory 'lmd-mark.png') 512 $brandColor ''
+Write-BrandPng (Join-Path $projectDirectory 'assets\tray-running.png') 256
+Write-BrandPng (Join-Path $projectDirectory 'assets\tray-stopped.png') 256 '#FFFFFF' '#687386'
+Write-BrandIcon (Join-Path $projectDirectory 'assets\tray-running.ico')
+Write-BrandIcon (Join-Path $projectDirectory 'assets\tray-stopped.ico') '#687386'
+Copy-Item -LiteralPath (Join-Path $projectDirectory 'assets\tray-running.ico') -Destination (Join-Path $brandDirectory 'lmd.ico') -Force
+Copy-Item -LiteralPath (Join-Path $brandDirectory 'lmd.ico') -Destination (Join-Path $projectDirectory 'public\favicon.ico') -Force
+Write-BrandPng (Join-Path $publicBrandDirectory 'apple-touch-icon.png') 180
+Write-BrandPng (Join-Path $publicBrandDirectory 'icon-192.png') 192
+Write-BrandPng (Join-Path $publicBrandDirectory 'icon-512.png') 512
+Write-Host 'LMD brand assets generated from assets/brand/lmd-mark.svg.'
