@@ -1,4 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
+import { updateMediaSession, releaseMediaSession } from "./media-session";
 import {
   Disc3,
   FileMusic,
@@ -257,17 +259,15 @@ export function MusicPlayerProvider({ catalog, children }: { catalog: MusicCatal
 
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
-    navigator.mediaSession.setActionHandler("play", () => void audioRef.current?.play());
-    navigator.mediaSession.setActionHandler("pause", () => audioRef.current?.pause());
-    navigator.mediaSession.setActionHandler("previoustrack", previous);
-    navigator.mediaSession.setActionHandler("nexttrack", next);
-    navigator.mediaSession.setActionHandler("seekto", (details) => { if (typeof details.seekTime === "number") seek(details.seekTime); });
-    navigator.mediaSession.setActionHandler("seekbackward", (details) => seek((audioRef.current?.currentTime || 0) - (details.seekOffset || 10)));
-    navigator.mediaSession.setActionHandler("seekforward", (details) => seek((audioRef.current?.currentTime || 0) + (details.seekOffset || 10)));
+    updateMediaSession("music", { priority: 10, handlers: {
+      play: () => void audioRef.current?.play(), pause: () => audioRef.current?.pause(),
+      previoustrack: previous, nexttrack: next,
+      seekto: details => { if (typeof details.seekTime === "number") seek(details.seekTime); },
+      seekbackward: details => seek((audioRef.current?.currentTime || 0) - (details.seekOffset || 10)),
+      seekforward: details => seek((audioRef.current?.currentTime || 0) + (details.seekOffset || 10)),
+    } });
     return () => {
-      for (const action of ["play", "pause", "previoustrack", "nexttrack", "seekto", "seekbackward", "seekforward"] as MediaSessionAction[]) {
-        try { navigator.mediaSession.setActionHandler(action, null); } catch { /* 部分浏览器不实现全部操作。 */ }
-      }
+      releaseMediaSession("music");
     };
   }, [next, previous, seek]);
 
@@ -277,17 +277,17 @@ export function MusicPlayerProvider({ catalog, children }: { catalog: MusicCatal
       .map((size) => currentTrack.coverUrls?.[size as 256 | 1024])
       .filter(Boolean)
       .map((src, index) => ({ src: absoluteUrl(src!), sizes: index ? "1024x1024" : "256x256", type: "image/jpeg" }));
-    navigator.mediaSession.metadata = new MediaMetadata({
+    updateMediaSession("music", { metadata: new MediaMetadata({
       title: currentTrack.title,
       artist: artistLabel(currentTrack),
       album: currentTrack.album || "本地音乐",
       artwork,
-    });
+    }) });
   }, [currentTrack]);
 
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
-    navigator.mediaSession.playbackState = playing ? "playing" : currentTrack ? "paused" : "none";
+    updateMediaSession("music", { playbackState: playing ? "playing" : currentTrack ? "paused" : "none" });
   }, [currentTrack, playing]);
 
   const updatePosition = () => {
@@ -297,7 +297,7 @@ export function MusicPlayerProvider({ catalog, children }: { catalog: MusicCatal
     setCurrentTime(audio.currentTime || 0);
     setDuration(nextDuration);
     if ("mediaSession" in navigator && nextDuration > 0 && audio.currentTime >= 0 && audio.currentTime <= nextDuration) {
-      try { navigator.mediaSession.setPositionState({ duration: nextDuration, playbackRate: audio.playbackRate, position: audio.currentTime }); } catch { /* Safari 可能暂未支持。 */ }
+      updateMediaSession("music", { position: { duration: nextDuration, playbackRate: audio.playbackRate, position: audio.currentTime } });
     }
   };
 

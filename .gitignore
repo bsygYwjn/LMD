@@ -49,3 +49,7 @@ id_ed25519*
 *.bak
 Thumbs.db
 .DS_Store
+
+# Acceptance harness scratch output (tools/player-acceptance)
+tools/player-acceptance/chrome-profile/
+tools/player-acceptance/shots/
