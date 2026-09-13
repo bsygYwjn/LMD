@@ -1,12 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import JASSUB from "jassub";
-// `worker&url` tells Vite to package this file as a real Web Worker.
-// A plain `?url` only returns the source file address and JASSUB cannot finish
-// its background subtitle renderer initialization in every browser.
-import workerUrl from "jassub/dist/worker/worker.js?worker&url";
-import wasmUrl from "jassub/dist/wasm/jassub-worker.wasm?url";
-import modernWasmUrl from "jassub/dist/wasm/jassub-worker-modern.wasm?url";
+import { VideoPlayer as PlayerModal } from "./player/Player";
+import { PlayerTestPanel, playerTestRequested } from "./player/player-test";
 import {
   AlertTriangle,
   BookOpen,
@@ -127,6 +122,12 @@ type MediaToolsInstallStatus = {
   startedAt?: string | null;
   finishedAt?: string | null;
 };
+type PlaybackSettings = { cacheMaxBytes: number; cacheTtlSeconds: number; aheadSeconds: number; backBufferSeconds: number;
+  heartbeatSeconds: number; leaseSeconds: number; releaseGraceSeconds: number; noOutputSeconds: number; cleanupSeconds: number;
+  maxBufferBytes: number; encoder: "auto" | "libx264" | "h264_nvenc" | "h264_qsv" | "h264_amf" };
+type PlaybackStatus = { sessions: number; pipelines: number; cacheBytes: number; cacheMaxBytes: number; sessionsCreated: number;
+  pipelinesCreated: number; cacheHits: number; fallbacks: number; seeks: number; bytesGenerated: number };
+type DanmakuSettings = { appId: string; configured: boolean; environmentManaged: boolean };
 type AccessUser = {
   id: string;
   categoryIds: string[];
@@ -275,116 +276,6 @@ function formatDuration(seconds = 0) {
 function codecName(value?: string | null) {
   const known: Record<string, string> = { hevc: "HEVC", h264: "H.264", av1: "AV1", vp9: "VP9", aac: "AAC", dts: "DTS", opus: "Opus" };
   return value ? known[value.toLowerCase()] || value.toUpperCase() : "待识别";
-}
-
-const SUBTITLE_OFFSET_OPTIONS = [-10, -5, -3, -2, -1, -0.5, 0, 0.5, 1, 2, 3, 5, 10];
-
-function subtitleOffsetLabel(offsetSeconds: number) {
-  if (offsetSeconds < 0) return `提前 ${Math.abs(offsetSeconds).toFixed(1)} 秒`;
-  if (offsetSeconds > 0) return `延后 ${offsetSeconds.toFixed(1)} 秒`;
-  return "不偏移";
-}
-
-function parseSubtitleTimestamp(value: string) {
-  const parts = value.split(":");
-  const seconds = Number(parts.pop() || 0);
-  const minutes = Number(parts.pop() || 0);
-  const hours = Number(parts.pop() || 0);
-  return hours * 3600 + minutes * 60 + seconds;
-}
-
-function formatAssTimestamp(seconds: number) {
-  const totalCentiseconds = Math.max(0, Math.round(seconds * 100));
-  const hours = Math.floor(totalCentiseconds / 360000);
-  const minutes = Math.floor((totalCentiseconds % 360000) / 6000);
-  const wholeSeconds = Math.floor((totalCentiseconds % 6000) / 100);
-  const centiseconds = totalCentiseconds % 100;
-  return `${hours}:${String(minutes).padStart(2, "0")}:${String(wholeSeconds).padStart(2, "0")}.${String(centiseconds).padStart(2, "0")}`;
-}
-
-function shiftAssSubtitles(content: string, offsetSeconds: number) {
-  if (!offsetSeconds) return content;
-  return content.replace(
-    /^(\s*Dialogue\s*:[^,\r\n]*,)(\d+:\d{2}:\d{2}(?:\.\d+)?),(\d+:\d{2}:\d{2}(?:\.\d+)?)(,[^\r\n]*)$/gim,
-    (_line, prefix: string, start: string, end: string, suffix: string) => `${prefix}${formatAssTimestamp(parseSubtitleTimestamp(start) + offsetSeconds)},${formatAssTimestamp(parseSubtitleTimestamp(end) + offsetSeconds)}${suffix}`,
-  );
-}
-
-function formatWebVttTimestamp(seconds: number) {
-  const totalMilliseconds = Math.max(0, Math.round(seconds * 1000));
-  const hours = Math.floor(totalMilliseconds / 3600000);
-  const minutes = Math.floor((totalMilliseconds % 3600000) / 60000);
-  const wholeSeconds = Math.floor((totalMilliseconds % 60000) / 1000);
-  const milliseconds = totalMilliseconds % 1000;
-  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(wholeSeconds).padStart(2, "0")}.${String(milliseconds).padStart(3, "0")}`;
-}
-
-function shiftWebVttSubtitles(content: string, offsetSeconds: number) {
-  if (!offsetSeconds) return content;
-  return content.replace(
-    /^((?:\d{2,}:)?\d{2}:\d{2}\.\d{3})(\s+-->\s+)((?:\d{2,}:)?\d{2}:\d{2}\.\d{3})([^\r\n]*)$/gm,
-    (_line, start: string, separator: string, end: string, settings: string) => `${formatWebVttTimestamp(parseSubtitleTimestamp(start) + offsetSeconds)}${separator}${formatWebVttTimestamp(parseSubtitleTimestamp(end) + offsetSeconds)}${settings}`,
-  );
-}
-
-function assToWebVtt(content: string) {
-  const defaultFields = ["layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"];
-  let fields = defaultFields;
-  let inEvents = false;
-  const cues: string[] = [];
-
-  for (const rawLine of content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n")) {
-    const line = rawLine.trim();
-    const section = line.match(/^\[([^\]]+)]$/);
-    if (section) {
-      inEvents = section[1].trim().toLowerCase() === "events";
-      continue;
-    }
-    if (!inEvents) continue;
-    const format = line.match(/^Format\s*:\s*(.+)$/i);
-    if (format) {
-      fields = format[1].split(",").map((field) => field.trim().toLowerCase());
-      continue;
-    }
-    const dialogue = line.match(/^Dialogue\s*:\s*(.*)$/i);
-    if (!dialogue || fields.length < 3) continue;
-
-    const values: string[] = [];
-    let remainder = dialogue[1];
-    for (let index = 0; index < fields.length - 1; index += 1) {
-      const separator = remainder.indexOf(",");
-      if (separator < 0) {
-        values.length = 0;
-        break;
-      }
-      values.push(remainder.slice(0, separator));
-      remainder = remainder.slice(separator + 1);
-    }
-    if (!values.length) continue;
-    values.push(remainder);
-    const event = Object.fromEntries(fields.map((field, index) => [field, values[index] || ""]));
-    const start = parseSubtitleTimestamp(event.start);
-    const end = parseSubtitleTimestamp(event.end);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
-    // ASS vector drawings are not dialogue and would appear as paths in a
-    // native text track. Skip those cues while retaining positioned/sign text.
-    if (/\{[^}]*\\p[1-9]\d*[^}]*}/i.test(event.text)) continue;
-    const text = event.text
-      .replace(/\{[^}]*}/g, "")
-      .replace(/\\N/gi, "\n")
-      .replace(/\\h/gi, " ")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .split("\n")
-      .map((part) => part.trim())
-      .filter(Boolean)
-      .join("\n");
-    if (!text) continue;
-    cues.push(`${formatWebVttTimestamp(start)} --> ${formatWebVttTimestamp(end)}\n${text}`);
-  }
-
-  return `WEBVTT\n\n${cues.join("\n\n")}${cues.length ? "\n" : ""}`;
 }
 
 function App() {
@@ -795,6 +686,12 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, error, onRefresh, ac
   const visibleMedia = directMedia.filter((item) => !normalizedSearch || matchesSearch(item));
   const selectedMedia = allMedia.find((item) => item.id === selectedMediaId) || null;
   const selectedMediaFolder = selectedMedia ? mediaFolderId(selectedMedia) : "";
+  // Acceptance harness: ?playerTest=1 opens the first catalog item so the
+  // runner can drive the real player and report results to the service.
+  const playerTest = playerTestRequested();
+  useEffect(() => {
+    if (playerTest && !selectedMediaId && allMedia.length) setSelectedMediaId(allMedia[0].id);
+  }, [playerTest, selectedMediaId, allMedia.length]);
   const selectedFolderMedia = useMemo(() => allMedia
     .filter((item) => selectedMediaFolder && mediaFolderId(item) === selectedMediaFolder)
     .sort((left, right) => (left.display?.episode || 0) - (right.display?.episode || 0)
@@ -1101,6 +998,7 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, error, onRefresh, ac
             onPrevious={previousMedia ? () => switchPlayerMedia(previousMedia) : undefined}
             onNext={nextMedia ? () => switchPlayerMedia(nextMedia) : undefined}
           />
+          {playerTest && <PlayerTestPanel media={selectedMedia} />}
         </main>
       </div>
     );
@@ -1308,6 +1206,33 @@ function AdminApp(props: {
   const [rapidScanDialog, setRapidScanDialog] = useState<RapidScanDialogState | null>(null);
   const [turboActionBusy, setTurboActionBusy] = useState(false);
   const [turboStartError, setTurboStartError] = useState("");
+  // Playback cache/lease limits and danmaku credentials both live in the video
+  // playback core, so the settings page loads them lazily and never caches the
+  // secret itself in the page payload.
+  const [playbackSettings, setPlaybackSettings] = useState<PlaybackSettings | null>(null);
+  const [playbackStatus, setPlaybackStatus] = useState<PlaybackStatus | null>(null);
+  const [danmakuSettings, setDanmakuSettings] = useState<DanmakuSettings | null>(null);
+  useEffect(() => {
+    if (section !== "settings") return;
+    let stopped = false;
+    void Promise.all([
+      api<{ settings: PlaybackSettings; status: PlaybackStatus }>("/api/settings/video-playback").catch(() => null),
+      api<DanmakuSettings>("/api/settings/danmaku").catch(() => null),
+    ]).then(([playback, danmaku]) => {
+      if (stopped) return;
+      if (playback) { setPlaybackSettings(playback.settings); setPlaybackStatus(playback.status); }
+      if (danmaku) setDanmakuSettings(danmaku);
+    });
+    return () => { stopped = true; };
+  }, [section]);
+  const savePlaybackSettings = async (patch: Partial<PlaybackSettings>) => {
+    const result = await api<{ settings: PlaybackSettings; status: PlaybackStatus }>("/api/settings/video-playback", { method: "PATCH", body: JSON.stringify(patch) });
+    setPlaybackSettings(result.settings); setPlaybackStatus(result.status);
+  };
+  const saveDanmakuSettings = async (body: { appId?: string; appSecret?: string; clear?: boolean }) => {
+    const result = await api<DanmakuSettings>("/api/settings/danmaku", { method: "PATCH", body: JSON.stringify(body) });
+    setDanmakuSettings(result);
+  };
   const sectionTitle = section === "overview" ? "总览" : section === "access" ? "访问控制" : "运行设置";
 
   const promptForTurboScan = (library: LibraryFolder) => {
@@ -1377,7 +1302,8 @@ function AdminApp(props: {
         {notice && <StatusBanner tone="success" icon={<CheckCircle2 size={18} />}>{notice}</StatusBanner>}
         {section === "overview" && <OverviewPanel overview={overview} musicOverview={musicOverview} readingOverview={readingOverview} onRefresh={onRefresh} onNotice={onNotice} onLibraryAdded={promptForTurboScan} onPlay={onPlay} />}
         {section === "access" && overview?.accessControl.enabled && <AccessControlPanel overview={overview} onRefresh={onRefresh} onNotice={onNotice} />}
-        {section === "settings" && <SettingsPanel overview={overview} onRefresh={onRefresh} onNotice={onNotice} onError={onError} onOpenAccess={() => onSectionChange("access")} onStartTurboScan={() => void startTurboScan()} onStopTurboScan={() => void stopTurboScan()} turboActionBusy={turboActionBusy} />}
+        {section === "settings" && <SettingsPanel overview={overview} onRefresh={onRefresh} onNotice={onNotice} onError={onError} onOpenAccess={() => onSectionChange("access")} onStartTurboScan={() => void startTurboScan()} onStopTurboScan={() => void stopTurboScan()} turboActionBusy={turboActionBusy}
+          playbackSettings={playbackSettings} playbackStatus={playbackStatus} onPlaybackSettings={savePlaybackSettings} danmakuSettings={danmakuSettings} onDanmakuSettings={saveDanmakuSettings} />}
       </main>
       {rapidScanDialog && <RapidScanDialog state={rapidScanDialog} scan={overview?.scan || null} starting={turboActionBusy} startError={turboStartError} onStart={() => void startTurboScan()} onClose={() => { setRapidScanDialog(null); setTurboStartError(""); }} />}
     </div>
@@ -1817,7 +1743,7 @@ function AccessUserCard({ user, userNumber, categories, onRefresh, onNotice }: {
   );
 }
 
-function SettingsPanel({ overview, onRefresh, onNotice, onError, onOpenAccess, onStartTurboScan, onStopTurboScan, turboActionBusy }: {
+function SettingsPanel({ overview, onRefresh, onNotice, onError, onOpenAccess, onStartTurboScan, onStopTurboScan, turboActionBusy, playbackSettings, playbackStatus, onPlaybackSettings, danmakuSettings, onDanmakuSettings }: {
   overview: Overview | null;
   onRefresh: (quiet?: boolean) => Promise<void>;
   onNotice: (value: string) => void;
@@ -1826,6 +1752,11 @@ function SettingsPanel({ overview, onRefresh, onNotice, onError, onOpenAccess, o
   onStartTurboScan: () => void;
   onStopTurboScan: () => void;
   turboActionBusy: boolean;
+  playbackSettings: PlaybackSettings | null;
+  playbackStatus: PlaybackStatus | null;
+  onPlaybackSettings: (patch: Partial<PlaybackSettings>) => Promise<void>;
+  danmakuSettings: DanmakuSettings | null;
+  onDanmakuSettings: (body: { appId?: string; appSecret?: string; clear?: boolean }) => Promise<void>;
 }) {
   const [accelerationBusy, setAccelerationBusy] = useState(false);
   const [directoryBusy, setDirectoryBusy] = useState(false);
@@ -1993,175 +1924,95 @@ function SettingsPanel({ overview, onRefresh, onNotice, onError, onOpenAccess, o
       <section className={`panel setting-card remux-acceleration-card${acceleration?.enabled ? " is-enabled" : ""}${turboScanActive ? " has-turbo-scan" : ""}`}><div className={`setting-icon ${acceleration?.enabled || turboScanActive ? "ready" : "standby"}`}><Gauge /></div><div><span className="eyebrow">REMUX ACCELERATION</span><h2>并行加速重封装{acceleration?.enabled ? "已开启" : "已关闭"}</h2><p>{acceleration?.enabled ? `最多同时处理 ${acceleration.maxParallelJobs} 部，当前运行 ${acceleration.activeJobs} 部、排队 ${acceleration.queuedJobs} 部。剩余 ${formatRemainingTime(acceleration.remainingSeconds)}，将在 ${accelerationEndsAt} 自动关闭；关闭时不会中断正在运行的任务。` : `开启后最多同时处理 ${acceleration?.acceleratedParallelJobs || 3} 部视频，12 小时后自动恢复单任务模式；加速期间会增加磁盘并发读写。`}</p><div className="setting-card-actions"><button className={acceleration?.enabled ? "secondary-button" : "primary-button"} onClick={toggleRemuxAcceleration} disabled={!overview || accelerationBusy || (!overview.tools.available && !acceleration?.enabled)} aria-pressed={Boolean(acceleration?.enabled)} aria-busy={accelerationBusy}>{accelerationBusy ? <LoaderCircle size={16} className="spin" /> : <Gauge size={16} />}{accelerationBusy ? (acceleration?.enabled ? "正在关闭加速" : "正在开启加速") : acceleration?.enabled ? "立即关闭加速" : "开启 12 小时加速"}</button><button className={`${turboScanActive ? "danger-button" : "secondary-button"} turbo-scan-button${turboScanActive ? " active" : ""}`} onClick={turboScanActive ? onStopTurboScan : onStartTurboScan} disabled={!overview?.libraries.length || turboActionBusy} aria-busy={turboActionBusy} aria-pressed={turboScanActive}>{turboActionBusy ? <LoaderCircle size={16} className="spin" /> : turboScanActive ? <X size={16} /> : <FolderSearch size={16} />}{turboActionBusy ? (turboScanActive ? "正在停止最高性能扫描" : "正在启动最高性能扫描") : turboScanActive ? "停止最高性能扫描" : "开启最高性能扫描"}</button></div>{scanStatus && turboScanActive && <div className="setting-scan-progress"><ScanProgress scan={scanStatus} compact /></div>}</div></section>
       <section className="panel setting-card"><div className={`setting-icon ${overview?.autostart.enabled ? "ready" : "standby"}`}><Power /></div><div><span className="eyebrow">WINDOWS STARTUP</span><h2>开机自启{overview?.autostart.enabled ? "已开启" : "已关闭"}</h2><p>开启后，每次登录 Windows 都会在后台启动 LMD；不会自动打开管理网页或信息窗口。</p><button className={overview?.autostart.enabled ? "secondary-button" : "primary-button"} onClick={toggleAutostart}>{overview?.autostart.enabled ? "关闭开机自启" : "开启开机自启"}</button></div></section>
       <section className="panel setting-card"><div className={`setting-icon ${overview?.accessControl.enabled ? "ready" : "standby"}`}>{overview?.accessControl.enabled ? <ShieldCheck /> : <LockKeyhole />}</div><div><span className="eyebrow">VIEWER ACCESS</span><h2>访问控制{overview?.accessControl.enabled ? "已开启" : "已关闭"}</h2><p>{overview?.accessControl.enabled ? "局域网访客必须输入六位数字访问码；“访问控制”菜单已显示，可设置文件夹分类和用户权限。" : "当前保持原来的简洁访问方式；开启后才会显示“访问控制”选项。"}</p><button className={overview?.accessControl.enabled ? "secondary-button" : "primary-button"} onClick={toggleAccessControl}>{overview?.accessControl.enabled ? "关闭并返回简洁版" : "开启访问控制"}</button></div></section>
+      <PlaybackSettingsCard settings={playbackSettings} status={playbackStatus} onSave={async (patch) => {
+        try { await onPlaybackSettings(patch); onNotice("播放设置已保存，新的播放会话立即生效。"); }
+        catch (operationError) { onError(operationError instanceof Error ? operationError.message : "无法保存播放设置"); }
+      }} />
+      <DanmakuSettingsCard settings={danmakuSettings} onSave={async (body) => {
+        try { await onDanmakuSettings(body); onNotice(body.clear ? "已清除本机弹弹play凭证。" : "弹幕凭证已保存到本机后端。"); }
+        catch (operationError) { onError(operationError instanceof Error ? operationError.message : "无法保存弹幕凭证"); }
+      }} />
       <section className="panel setting-card"><div className="setting-icon ready"><Bot /></div><div><span className="eyebrow">PROJECT DEVELOPERS</span><h2>不是一个云玩家呢 · Codex</h2><p>共同参与 LMD 的设计、开发与维护。</p></div></section>
     </div>
   );
 }
 
-function StatusBanner({ children, icon, tone }: { children: React.ReactNode; icon: React.ReactNode; tone: "warning" | "success" }) {
-  return <div className={`status-banner ${tone}`} role={tone === "warning" ? "alert" : "status"} aria-live={tone === "warning" ? "assertive" : "polite"}>{icon}<span>{children}</span></div>;
+/** Playback cache, buffer and lease limits; values mirror the server defaults. */
+function PlaybackSettingsCard({ settings, status, onSave }: { settings: PlaybackSettings | null; status: PlaybackStatus | null; onSave: (patch: Partial<PlaybackSettings>) => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const [form, setForm] = useState({ cacheGib: 10, ttlHours: 6, ahead: 30, back: 30, heartbeat: 10, lease: 45, noOutput: 30 });
+  useEffect(() => {
+    if (!settings) return;
+    setForm({ cacheGib: Math.round(settings.cacheMaxBytes / 1024 ** 3 * 10) / 10, ttlHours: Math.round(settings.cacheTtlSeconds / 360) / 10,
+      ahead: settings.aheadSeconds, back: settings.backBufferSeconds, heartbeat: settings.heartbeatSeconds,
+      lease: settings.leaseSeconds, noOutput: settings.noOutputSeconds });
+  }, [settings]);
+  const number = (label: string, key: keyof typeof form, min: number, max: number, step: number) =>
+    <label>{label}<input type="number" min={min} max={max} step={step} value={form[key]}
+      onChange={(event) => setForm(current => ({ ...current, [key]: Number(event.target.value) }))} /></label>;
+  const submit = async () => {
+    setBusy(true);
+    try {
+      await onSave({ cacheMaxBytes: Math.round(form.cacheGib * 1024 ** 3), cacheTtlSeconds: Math.round(form.ttlHours * 3600),
+        aheadSeconds: form.ahead, backBufferSeconds: form.back, heartbeatSeconds: form.heartbeat,
+        leaseSeconds: form.lease, noOutputSeconds: form.noOutput });
+    } finally { setBusy(false); }
+  };
+  const usage = status ? `${formatBytes(status.cacheBytes)} / ${formatBytes(status.cacheMaxBytes)}` : "正在读取…";
+  return <section className="panel setting-card playback-settings-card">
+    <div className="setting-icon ready"><Gauge /></div>
+    <div>
+      <span className="eyebrow">PLAYBACK CORE</span>
+      <h2>视频播放缓存与会话</h2>
+      <p>兼容播放按需生成临时分片，容量与租约在这里统一限制；这些值不会写入原视频，也不影响音乐模块。当前占用 {usage}，活跃会话 {status?.sessions ?? 0} 个、处理进程 {status?.pipelines ?? 0} 个。</p>
+      <div className="setting-fields">
+        {number("缓存上限（GiB）", "cacheGib", 0.06, 1024, 0.5)}
+        {number("缓存保留（小时）", "ttlHours", 0.02, 168, 0.5)}
+        {number("前向准备窗口（秒）", "ahead", 6, 120, 1)}
+        {number("后向缓冲（秒）", "back", 0, 120, 1)}
+        {number("心跳间隔（秒）", "heartbeat", 3, 30, 1)}
+        {number("无心跳租约（秒）", "lease", 15, 180, 1)}
+        {number("FFmpeg 无输出超时（秒）", "noOutput", 5, 120, 1)}
+      </div>
+      <div className="setting-card-actions">
+        <button className="primary-button" onClick={() => void submit()} disabled={busy || !settings}>{busy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}保存播放设置</button>
+      </div>
+      <small className="setting-hint">租约必须至少是心跳间隔的两倍；缓存上限过低会让播放提前等待生成。</small>
+    </div>
+  </section>;
 }
 
-function PlayerModal({ media, onClose, pageMode = false, previousMedia = null, nextMedia = null, onPrevious, onNext }: {
-  media: Media;
-  onClose?: () => void;
-  pageMode?: boolean;
-  previousMedia?: Media | null;
-  nextMedia?: Media | null;
-  onPrevious?: () => void;
-  onNext?: () => void;
-}) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const rendererRef = useRef<JASSUB | null>(null);
-  // Start with subtitles disabled so video decoding is tested independently.
-  // The viewer can then enable SRT or ASS/SSA after the picture starts.
-  const [subtitleId, setSubtitleId] = useState("off");
-  const [subtitleOffset, setSubtitleOffset] = useState(0);
-  const [subtitleRenderMode, setSubtitleRenderMode] = useState<"stable" | "styled">("stable");
-  const [nativeTrackUrl, setNativeTrackUrl] = useState("");
-  const [playbackError, setPlaybackError] = useState("");
-  const selectedSubtitle = media.subtitles.find((item) => item.id === subtitleId);
-  const selectedSubtitleIsAss = Boolean(selectedSubtitle && ["ASS", "SSA"].includes(selectedSubtitle.format));
-  // 字幕渲染只依赖“字幕内容”本身：媒体 id、所选字幕、偏移、字幕文件版本与字体
-  // 版本。这样兼容副本状态变迁（remuxUrl / compatibleCopyStatus 变化）不会销毁
-  // 重建 JASSUB 渲染器，而字幕文件更新后仍会自动重新加载。
-  const subtitleContentKey = `${media.id}\0${subtitleId}\0${subtitleOffset}\0${subtitleRenderMode}\0${selectedSubtitle?.modifiedAt || ""}\0${selectedSubtitle?.size || ""}\0${media.fonts.map((font) => `${font.id}:${font.modifiedAt || ""}:${font.size || ""}`).join("|")}`;
-  const needsCompatibleCopy = Boolean(media.compatibility?.needsCompatibleCopy && !media.remuxUrl);
-  const compatibilityIssues = media.compatibility?.issues.join("、") || `${media.extension} / ${codecName(media.videoCodec)} / ${codecName(media.audioCodec)}`;
-  const displayName = mediaDisplayName(media);
-  const autoPreparingCopy = ["waiting", "queued", "running"].includes(media.compatibleCopyStatus || "");
-  const hasSubtitles = media.subtitles.length > 0;
-
-  useEffect(() => {
-    setSubtitleId("off");
-    setSubtitleOffset(0);
-    setSubtitleRenderMode("stable");
-    setNativeTrackUrl("");
-    setPlaybackError("");
-  }, [media.id]);
-
-  useEffect(() => {
-    const subtitle = media.subtitles.find((item) => item.id === subtitleId);
-    const video = videoRef.current;
-    if (!video || !subtitle || !["ASS", "SSA"].includes(subtitle.format) || subtitleRenderMode !== "styled") {
-      rendererRef.current?.destroy();
-      rendererRef.current = null;
-      Array.from(video?.textTracks || []).forEach((track) => { track.mode = "disabled"; });
-      return;
-    }
-    const controller = new AbortController();
-    let active = true;
-    let renderer: JASSUB | null = null;
-    Array.from(video.textTracks).forEach((track) => { track.mode = "disabled"; });
-    void (async () => {
-      try {
-        const response = await fetch(subtitle.url, { signal: controller.signal, cache: "no-store" });
-        if (!response.ok) throw new Error(`字幕请求失败（${response.status}）`);
-        const content = shiftAssSubtitles(await response.text(), subtitleOffset);
-        if (!active) return;
-        const availableFonts = Object.fromEntries(media.fonts.flatMap((font) =>
-          (font.aliases || [])
-            .map((alias) => alias.trim().toLowerCase())
-            .filter(Boolean)
-            .map((alias) => [alias, font.url]),
-        ));
-        const eagerFonts = media.fonts
-          .filter((font) => !font.aliases?.length)
-          .map((font) => font.url);
-        renderer = new JASSUB({
-          video,
-          subContent: content,
-          workerUrl,
-          wasmUrl,
-          modernWasmUrl,
-          fonts: eagerFonts,
-          availableFonts,
-          queryFonts: "local",
-        });
-        rendererRef.current = renderer;
-        await renderer.ready;
-        if (active) await renderer.resize(true);
-      } catch { }
-    })();
-    return () => {
-      active = false;
-      controller.abort();
-      renderer?.destroy();
-      if (rendererRef.current === renderer) rendererRef.current = null;
-    };
-  }, [subtitleContentKey]);
-
-  useEffect(() => {
-    const subtitle = media.subtitles.find((item) => item.id === subtitleId);
-    const useNativeTrack = subtitle?.format === "SRT"
-      || (Boolean(subtitle && ["ASS", "SSA"].includes(subtitle.format)) && subtitleRenderMode === "stable");
-    if (!subtitle || !useNativeTrack) {
-      setNativeTrackUrl("");
-      return;
-    }
-    const controller = new AbortController();
-    let active = true;
-    let objectUrl = "";
-    setNativeTrackUrl("");
-    void (async () => {
-      try {
-        const response = await fetch(subtitle.format === "SRT" ? `${subtitle.url}?format=vtt` : subtitle.url, { signal: controller.signal, cache: "no-store" });
-        if (!response.ok) throw new Error(`字幕请求失败（${response.status}）`);
-        const source = await response.text();
-        const content = shiftWebVttSubtitles(subtitle.format === "SRT" ? source : assToWebVtt(source), subtitleOffset);
-        if (!active) return;
-        objectUrl = URL.createObjectURL(new Blob([content], { type: "text/vtt" }));
-        setNativeTrackUrl(objectUrl);
-      } catch { }
-    })();
-    return () => {
-      active = false;
-      controller.abort();
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [subtitleContentKey]);
-
-  const reportPlaybackError = () => {
-    if (needsCompatibleCopy) {
-      setPlaybackError(autoPreparingCopy
-        ? `浏览器无法直接解码 ${compatibilityIssues}；LMD 正在后台自动生成兼容副本，完成后播放器会自动切换。`
-        : `浏览器无法直接解码 ${compatibilityIssues}，自动兼容处理未完成，请在服务器电脑管理端查看处理队列。`);
-    } else if (media.remuxUrl && media.compatibility?.deviceCodecDependent) {
-      setPlaybackError(`兼容副本已经是 MP4 + AAC，但此设备的浏览器仍不支持 ${codecName(media.videoCodec)} 视频解码。`);
-    } else {
-      setPlaybackError("浏览器无法播放这个视频源，请检查文件是否完整以及当前设备是否支持该视频编码。");
-    }
+/** Danmaku provider credentials. The secret never leaves the backend. */
+function DanmakuSettingsCard({ settings, onSave }: { settings: DanmakuSettings | null; onSave: (body: { appId?: string; appSecret?: string; clear?: boolean }) => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const [appId, setAppId] = useState(""); const [appSecret, setAppSecret] = useState("");
+  useEffect(() => { setAppId(settings?.appId || ""); }, [settings?.appId]);
+  const submit = async (body: { appId?: string; appSecret?: string; clear?: boolean }) => {
+    setBusy(true);
+    try { await onSave(body); if (body.clear) { setAppId(""); setAppSecret(""); } else setAppSecret(""); }
+    finally { setBusy(false); }
   };
-
-  const player = (
-      <div className={`player-modal${pageMode ? " player-page-panel" : ""}`}>
-        <div className="player-topbar"><div><strong>{displayName}</strong><span>{media.demo ? "播放器界面示例" : `${media.extension} · ${codecName(media.videoCodec)} · ${media.bitDepth || 8}-bit`}</span></div>{!pageMode && onClose && <div><button className="close-button" onClick={onClose} aria-label="关闭播放器"><X size={20} /></button></div>}</div>
-        <div className={`video-stage ${media.demo ? "demo-stage" : ""}`} style={{ "--poster-hue": media.posterHue } as React.CSSProperties}>
-          {media.demo ? <div className="demo-player-copy"><div className="play-orb large"><Play size={28} fill="currentColor" /></div><h2>这里将播放你的原始视频</h2><p>播放器使用 Range 直传，并在画面上方渲染 ASS/SSA 特效字幕。</p></div> : <video key={media.id} ref={videoRef} src={media.remuxUrl || media.streamUrl} controls autoPlay playsInline preload="metadata" onEnded={nextMedia && onNext ? onNext : undefined} onError={reportPlaybackError} onLoadedMetadata={() => setPlaybackError("")}>{selectedSubtitle && nativeTrackUrl && <track key={`${selectedSubtitle.id}-${subtitleOffset}-${subtitleRenderMode}`} kind="subtitles" src={nativeTrackUrl} srcLang="zh" label={selectedSubtitle.language} default onLoad={(event) => { event.currentTarget.track.mode = "showing"; }} />}</video>}
-        </div>
-        {pageMode && <div className="player-episode-nav" aria-label="剧集导航">
-          <button className="previous-episode-button" onClick={onPrevious} disabled={!previousMedia || !onPrevious} aria-label={previousMedia ? `播放上一集：${mediaDisplayName(previousMedia)}` : "已是第一集"} title={previousMedia ? `上一集：${mediaDisplayName(previousMedia)}` : "已是第一集"}><SkipBack size={18} /><span>{previousMedia ? "上一集" : "已是第一集"}</span></button>
-          <button className="next-episode-button" onClick={onNext} disabled={!nextMedia || !onNext} aria-label={nextMedia ? `播放下一集：${mediaDisplayName(nextMedia)}` : "已是最后一集"} title={nextMedia ? `下一集：${mediaDisplayName(nextMedia)}` : "已是最后一集"}><span>{nextMedia ? "下一集" : "已是最后一集"}</span><SkipForward size={18} /></button>
-        </div>}
-        {!media.demo && (playbackError || needsCompatibleCopy) && <div className={`playback-status ${playbackError ? "error" : "warning"}`}><AlertTriangle size={17} /><span>{playbackError || (autoPreparingCopy ? `检测到 ${compatibilityIssues}，LMD 已自动加入兼容处理队列；完成后本页会自动改用 MP4 + AAC 副本。` : `当前原片包含 ${compatibilityIssues}，请在服务器电脑管理端检查自动兼容处理状态。`)}</span></div>}
-        <div className="player-toolbar">
-          <div className="player-subtitle-controls">
-            <div className="track-select"><Captions size={17} /><label htmlFor="subtitle-track">字幕</label><select id="subtitle-track" value={subtitleId} onChange={(event) => setSubtitleId(event.target.value)} disabled={!hasSubtitles}>{hasSubtitles ? <><option value="off">关闭字幕</option>{media.subtitles.map((subtitle) => <option value={subtitle.id} key={subtitle.id}>{subtitle.language} · {subtitle.format} · {subtitle.name}</option>)}</> : <option value="off">无字幕</option>}</select></div>
-            {selectedSubtitleIsAss && <div className="subtitle-offset subtitle-render-mode"><label htmlFor="subtitle-render-mode">显示模式</label><select id="subtitle-render-mode" value={subtitleRenderMode} onChange={(event) => setSubtitleRenderMode(event.target.value as "stable" | "styled")}><option value="stable">稳定模式（推荐）</option><option value="styled">ASS 特效模式</option></select></div>}
-            <div className="subtitle-offset"><label htmlFor="subtitle-offset">时间偏移</label><select id="subtitle-offset" value={subtitleOffset} onChange={(event) => setSubtitleOffset(Number(event.target.value))} disabled={!selectedSubtitle}><option value={0}>不偏移</option>{SUBTITLE_OFFSET_OPTIONS.filter((value) => value !== 0).map((value) => <option value={value} key={value}>{subtitleOffsetLabel(value)}</option>)}</select></div>
-          </div>
-          <div className="player-technical"><span>{media.width || 1920}×{media.height || 1080}</span><span>{media.remuxUrl ? "AAC" : codecName(media.audioCodec)}</span>{media.remuxUrl && <span>MP4 兼容副本</span>}{media.hdr && <span className="hdr-chip">{media.hdr}</span>}</div>
-        </div>
+  const managed = settings?.environmentManaged;
+  return <section className={`panel setting-card danmaku-settings-card${settings?.configured ? " is-enabled" : ""}`}>
+    <div className={`setting-icon ${settings?.configured ? "ready" : "standby"}`}><Bot /></div>
+    <div>
+      <span className="eyebrow">ONLINE DANMAKU</span>
+      <h2>弹弹play 凭证{settings?.configured ? "已配置" : "未配置"}</h2>
+      <p>{managed ? "凭证由服务器环境变量提供，网页端不会覆盖它。" : "AppId 与 AppSecret 只保存在本机后端文件里，不会进入前端包、观看端响应或发布包。没有凭证时仍可导入本地弹幕，视频播放不受影响。启用联网匹配前会提示会发送文件名、大小、时长和局部文件哈希（在服务器计算）。"}</p>
+      <div className="setting-fields">
+        <label>AppId<input value={appId} onChange={(event) => setAppId(event.target.value)} placeholder="弹弹play 开放平台 AppId" disabled={managed || busy} /></label>
+        <label>AppSecret<input type="password" value={appSecret} onChange={(event) => setAppSecret(event.target.value)} placeholder={settings?.configured ? "已保存，留空表示不修改" : "弹弹play AppSecret"} disabled={managed || busy} /></label>
       </div>
-  );
-
-  if (pageMode) return player;
-
-  return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label={`播放 ${displayName}`}>
-      {player}
+      <div className="setting-card-actions">
+        <button className="primary-button" onClick={() => void submit({ appId, ...(appSecret ? { appSecret } : {}) })} disabled={managed || busy || !appId.trim()}>{busy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}保存凭证</button>
+        <button className="secondary-button" onClick={() => void submit({ appId, clear: true })} disabled={managed || busy || !settings?.configured}><X size={16} />清除凭证</button>
+      </div>
     </div>
-  );
+  </section>;
+}
+
+function StatusBanner({ children, icon, tone }: { children: React.ReactNode; icon: React.ReactNode; tone: "warning" | "success" }) {
+  return <div className={`status-banner ${tone}`} role={tone === "warning" ? "alert" : "status"} aria-live={tone === "warning" ? "assertive" : "polite"}>{icon}<span>{children}</span></div>;
 }
 
 createRoot(document.getElementById("root")!).render(<React.StrictMode><App /></React.StrictMode>);
