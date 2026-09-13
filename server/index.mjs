@@ -10,6 +10,11 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createMusicService } from "./music.mjs";
 import { createReadingService } from "./reading.mjs";
+import { createPlaybackService } from "./playback.mjs";
+import { createDanmakuService } from "./danmaku.mjs";
+import { createPlayerTestService } from "./player-test.mjs";
+import { createBitmapSubtitleService } from "./bitmap-subtitles.mjs";
+import { METADATA_VERSION, normalizeProbe } from "./playback-planner.mjs";
 
 // 这台电脑既是“视频硬盘”，也是局域网服务器。这个文件负责全部本地 API。
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -75,6 +80,11 @@ const EMBEDDED_SUBTITLE_CODECS = new Map([
   ["ass", { extension: ".ass", format: "ASS" }],
   ["ssa", { extension: ".ssa", format: "SSA" }],
   ["subrip", { extension: ".srt", format: "SRT" }],
+  // Bitmap tracks are extracted as-is so the bitmap renderer can decode them.
+  ["hdmv_pgs_subtitle", { extension: ".sup", format: "PGS" }],
+  ["pgssub", { extension: ".sup", format: "PGS" }],
+  ["dvd_subtitle", { extension: ".sub", format: "VOBSUB" }],
+  ["dvb_subtitle", { extension: ".sub", format: "DVB" }],
 ]);
 const MP4_FAMILY_EXTENSIONS = new Set(["MP4", "M4V", "MOV"]);
 const WEBM_VIDEO_CODECS = new Set(["vp8", "vp9", "av1"]);
@@ -1442,13 +1452,13 @@ async function probeVideo(filePath, executeCommand = runCommand) {
   try {
     const args = [
       "-v", "error",
-      "-show_entries", "format=duration,format_name:stream=index,codec_type,codec_name,profile,width,height,pix_fmt,color_space,color_transfer,color_primaries,extradata_size:stream_tags=language,title,filename,mimetype",
+      "-show_entries", "format=duration,format_name,start_time,bit_rate:stream=index,codec_type,codec_name,profile,level,width,height,pix_fmt,bits_per_raw_sample,avg_frame_rate,r_frame_rate,bit_rate,start_time,time_base,channels,channel_layout,sample_rate,color_space,color_transfer,color_primaries,extradata_size:stream_disposition:stream_tags=language,title,filename,mimetype",
       "-of", "json",
       filePath,
     ];
     const result = await executeCommand(mediaTools.ffprobe, args, 20000);
     const data = JSON.parse(result.stdout);
-    const video = data.streams?.find((stream) => stream.codec_type === "video");
+    const video = data.streams?.find((stream) => stream.codec_type === "video" && !stream.disposition?.attached_pic);
     const audio = data.streams?.find((stream) => stream.codec_type === "audio");
     const embeddedSubtitleStreams = (data.streams || []).filter((stream) => stream.codec_type === "subtitle" && EMBEDDED_SUBTITLE_CODECS.has(stream.codec_name)).map((stream) => ({
       index: stream.index,
@@ -1465,8 +1475,14 @@ async function probeVideo(filePath, executeCommand = runCommand) {
       size: Number(stream.extradata_size) || null,
     })).filter((stream) => FONT_EXTENSIONS.has(path.extname(stream.fileName).toLowerCase()));
     const transfer = video?.color_transfer || "";
+    const headerFile = await open(filePath, "r");
+    let webm = false;
+    try { const header = Buffer.alloc(4096); const { bytesRead } = await headerFile.read(header, 0, header.length, 0); webm = header.subarray(0, bytesRead).includes(Buffer.from("webm")); }
+    finally { await headerFile.close(); }
+    const fileStat = await stat(filePath);
     return {
-      durationSeconds: Math.round(Number(data.format?.duration || 0)),
+      playbackMetadata: normalizeProbe(data, { webm, sourceSignature: `${fileStat.size}:${fileStat.mtime.toISOString()}` }),
+      durationSeconds: Number(data.format?.duration || 0),
       container: data.format?.format_name?.split(",")[0] || path.extname(filePath).slice(1),
       width: video?.width || null,
       height: video?.height || null,
@@ -2034,6 +2050,19 @@ async function scanLibraries({ mode: requestedMode = "standard" } = {}) {
         const unchanged = existing && existing.size === fileStat.size && existing.modifiedAt === modifiedAt;
         let scannedMedia;
         if (unchanged) {
+          // Refresh metadata independently of file identity. Existing assets and
+          // legacy compatible copies remain valid during this lazy migration.
+          if (mediaTools.available && existing.playbackMetadata?.version !== METADATA_VERSION) {
+            const updatedProbe = await probeVideo(filePath, runScanMediaCommand);
+            if (updatedProbe.playbackMetadata) Object.assign(existing, updatedProbe);
+          }
+          // The record still describes this file on disk; refresh the identity
+          // fields from the current stat so the catalog can never advertise a
+          // stale size/mtime whose signature contradicts the file. Without this,
+          // in-place probe refreshes leave playback sessions failing the
+          // source-signature check for a file that never actually changed.
+          existing.size = fileStat.size;
+          existing.modifiedAt = modifiedAt;
           const sidecarsPromise = findSidecarFiles(filePath, sidecarDirectoryCache);
           const thumbnailPromise = ensureVideoThumbnail(filePath, id, existing.durationSeconds, existing.thumbnailPath, sourceSignature, fileStat.mtimeMs, true, runScanMediaCommand);
           const sidecars = await sidecarsPromise;
@@ -2140,11 +2169,16 @@ async function scanLibraries({ mode: requestedMode = "standard" } = {}) {
       throw error;
     }
     const scannedLibraryIds = new Set(scanLibrariesSnapshot.map((library) => library.id));
-    const liveMediaById = new Map(appState.media.map((media) => [media.id, media]));
+    // The freshly published object wins over any older copy held by the live
+    // index or the scan checkpoint: it carries this scan's identity fields and
+    // receives every in-place refresh (playback probe, thumbnail) as well. Any
+    // other copy can describe older bytes and would make stored signatures
+    // contradict the file on disk.
+    const publishedForId = (id) => publishedMediaById.get(id) || liveMediaById.get(id) || null;
     const unrelatedMedia = appState.media.filter((media) => !scannedLibraryIds.has(media.libraryId));
     const finalMedia = [
       ...unrelatedMedia,
-      ...scanned.map((media) => liveMediaById.get(media.id) || media),
+      ...scanned.map((media) => publishedForId(media.id) || media),
     ];
     const finalMediaIds = new Set(finalMedia.map((media) => media.id));
     const prunedMedia = appState.media.filter((media) => scannedLibraryIds.has(media.libraryId) && !finalMediaIds.has(media.id));
@@ -2241,6 +2275,7 @@ function contentTypeFor(filePath) {
     ".json": "application/json; charset=utf-8",
     ".wasm": "application/wasm",
     ".mp4": "video/mp4",
+    ".m4s": "video/mp4",
     ".m4v": "video/mp4",
     ".mov": "video/quicktime",
     ".mkv": "video/x-matroska",
@@ -2859,48 +2894,14 @@ async function recoverCompatibleCopy(media) {
 
 let activeCompatibleCopyCheck = null;
 
+// 视频播放改为按需生成：扫描与启动不再排队生成长期保存的完整兼容副本。
+// 这个入口保留给原有调用点，避免扫描流程出现两套分支；手动重封装
+// （/api/media/prepare-compatible 与单文件重封装接口）仍然照常工作。
+// 音乐模块有自己的 queueAutomaticCompatibleCopies，不受影响。
 async function queueAutomaticCompatibleCopies() {
-  if (activeCompatibleCopyCheck) return activeCompatibleCopyCheck;
-  const preparationLibraryRevision = libraryRevision;
-  activeCompatibleCopyCheck = (async () => {
-    if (!appState.settings.autoPrepareCompatibleCopies || !mediaTools.available) return { queued: 0, recovered: 0 };
-    let queued = 0;
-    let recovered = 0;
-    let stateChanged = false;
-    for (const media of [...appState.media]) {
-      if (sharingServiceIsStopping) break;
-      if (libraryRevision !== preparationLibraryRevision) return { queued, recovered, cancelled: true };
-      if (!mediaCompatibility(media).needsCompatibleCopy) continue;
-      const recovery = await recoverCompatibleCopy(media);
-      if (libraryRevision !== preparationLibraryRevision) return { queued, recovered, cancelled: true };
-      if (recovery.changed) stateChanged = true;
-      if (recovery.recovered) recovered += 1;
-      if (recovery.ready) continue;
-      const currentSignature = mediaSourceSignature(media);
-      const sameSourceAlreadyFailed = appState.jobs.some((job) =>
-        job.mediaId === media.id
-        && job.status === "failed"
-        && job.sourceSignature === currentSignature);
-      // 对同一源文件已经完整执行并校验失败时，不再由每轮自动扫描无限重试。
-      // 管理端的手动重封装入口仍直接调用 startRemuxJob，可在更新 FFmpeg 或
-      // 调整源文件后主动再试；源签名变化也会自然解除这里的熔断。
-      if (sameSourceAlreadyFailed) continue;
-      const alreadyActive = remuxTasksByMediaId.has(media.id);
-      startRemuxJob(media, true, false);
-      if (!alreadyActive) queued += 1;
-    }
-    if (libraryRevision !== preparationLibraryRevision) return { queued, recovered, cancelled: true };
-    if (stateChanged || queued) await saveState();
-    if (recovered) console.log(`已安全恢复 ${recovered} 个现有浏览器兼容副本。`);
-    if (queued) console.log(`已自动加入 ${queued} 个浏览器兼容副本任务。`);
-    return { queued, recovered };
-  })();
-  try {
-    return await activeCompatibleCopyCheck;
-  } finally {
-    activeCompatibleCopyCheck = null;
-  }
+  return { queued: 0, recovered: 0, onDemand: true };
 }
+void activeCompatibleCopyCheck;
 
 // 清理缓存中的孤儿文件：源文件变化后，签名命名的旧缩略图/字幕/字体/兼容
 // 副本不会再被任何媒体引用，长期积累会无限占用磁盘。这里反查当前媒体库
@@ -3182,6 +3183,7 @@ function publicMedia(item, includeLocalPath = false, displayIndex = null) {
   return {
     ...item,
     path: includeLocalPath ? item.path : undefined,
+    danmakuBindings: undefined,
     remuxPath: includeLocalPath ? item.remuxPath : undefined,
     thumbnailPath: includeLocalPath ? item.thumbnailPath : undefined,
     probeError: includeLocalPath ? item.probeError : undefined,
@@ -3217,6 +3219,23 @@ async function serveStatic(response, pathname) {
   pipeFileToResponse(response, filePath);
   return true;
 }
+
+const playbackService = createPlaybackService({
+  appState, cacheDirectory: CACHE_DIR, getMediaTools: () => mediaTools, probeVideo,
+  saveState, spawnTracked, runCommand, authorizedMediaForRequest, accessContextForRequest,
+  requireLocalManagement, readJson, sendJson, streamFile,
+});
+const danmakuService = createDanmakuService({ dataDirectory: DATA_DIR, appState, saveState,
+  playbackInfo: playbackService.info, authorizedMediaForRequest, accessContextForRequest,
+  requireLocalManagement, readJson, sendJson });
+// Real-browser playback acceptance harness. It stays inert unless the operator
+// starts the service with LMD_PLAYER_TEST=1.
+const playerTestService = createPlayerTestService({ dataDirectory: DATA_DIR, appState,
+  enabled: process.env.LMD_PLAYER_TEST === "1", readJson, sendJson, requireLocalManagement });
+// Bitmap (PGS/VobSub/DVB) subtitles are decoded on demand through the media
+// tools; nothing is burned into the video.
+const bitmapSubtitleService = createBitmapSubtitleService({ cacheDirectory: CACHE_DIR,
+  getMediaTools: () => mediaTools, runCommand, requireLocalManagement });
 
 musicService = createMusicService({
   appState,
@@ -3274,6 +3293,9 @@ const server = createServer(async (request, response) => {
 
   try {
     if (!sameOriginMutation(request)) return sendJson(response, 403, { error: "已拒绝跨站操作。", code: "ORIGIN_REJECTED" });
+    if (await playerTestService.handleRequest(request, response, url, pathname)) return;
+    if (await playbackService.handleRequest(request, response, url, pathname)) return;
+    if (await danmakuService.handleRequest(request, response, url, pathname)) return;
     if (await musicService.handleRequest(request, response, url, pathname)) return;
     if (await readingService.handleRequest(request, response, url, pathname)) return;
     if (request.method === "POST" && pathname === "/api/service/stop") {
@@ -3284,7 +3306,7 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && pathname === "/api/health") {
       if (appState.accessControl.enabled && !isLanRequest(request)) return sendJson(response, 403, { error: "访问控制已开启，只允许局域网设备连接。", code: "LAN_ONLY" });
-      return sendJson(response, 200, { ok: true, name: "LMD", sharingService: "running", port: PORT, lanAddresses: getLanAddresses(), tools: mediaTools });
+      return sendJson(response, 200, { ok: true, name: "LMD", sharingService: "running", port: PORT, lanAddresses: getLanAddresses(), tools: mediaTools, playback: playbackService.status() });
     }
     if ((pathname === "/admin" || pathname.startsWith("/admin/")) && !requireLocalManagement(request, response)) return;
     if (request.method === "GET" && pathname === "/api/auth/status") {
@@ -3751,6 +3773,15 @@ const server = createServer(async (request, response) => {
       const filePath = url.searchParams.get("variant") === "remux" && media.remuxPath ? media.remuxPath : media.path;
       return streamFile(request, response, filePath, true);
     }
+    if (request.method === "GET" && /^\/api\/media\/[^/]+\/bitmap-subtitles\/[^/]+/.test(pathname)) {
+      const handled = await bitmapSubtitleService.handleRequest(request, response, url, pathname,
+        { authorizedMediaForRequest, playbackInfo: playbackService.info, sendJson, streamFile })
+        .catch((error) => {
+          if (!response.headersSent && !response.destroyed) sendJson(response, error.status || 500, { error: error.status ? error.message : "位图字幕渲染失败", code: error.code || "BITMAP_SUBTITLE_ERROR" });
+          return true;
+        });
+      if (handled) return;
+    }
     if (request.method === "GET" && /^\/api\/media\/[^/]+\/subtitles\/[^/]+$/.test(pathname)) {
       const [, , , mediaId, , subtitleId] = pathname.split("/");
       const media = authorizedMediaForRequest(request, response, mediaId);
@@ -3837,6 +3868,8 @@ async function prepareStartupMedia() {
 async function stopSharingService() {
   if (sharingServiceIsStopping) return;
   sharingServiceIsStopping = true;
+  const playbackStopping = playbackService.stop();
+  const bitmapSubtitleStopping = bitmapSubtitleService.stop();
   musicService.requestStopScan();
   readingService.requestStopScan();
   let serverClosed = false;
@@ -3885,6 +3918,8 @@ async function stopSharingService() {
   const activeTaskPromises = [...remuxTasksByMediaId.values()]
     .map((task) => task.executionPromise)
     .filter(Boolean);
+  activeTaskPromises.push(playbackStopping);
+  activeTaskPromises.push(bitmapSubtitleStopping);
   if (activeTaskPromises.length) {
     await Promise.race([
       Promise.allSettled(activeTaskPromises),

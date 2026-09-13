@@ -492,6 +492,15 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .compatible-directory-form input { min-width: 0; min-height: 42px; padding: 0 13px; border: 1px solid var(--line); border-radius: 11px; outline: 0; color: #f3f1eb; background: rgba(6,8,12,.32); font-size: 11px; }
 .compatible-directory-form input:focus { border-color: rgba(100,210,255,.38); }
 .compatible-directory-current { display: block; overflow: hidden; margin-top: 10px; color: var(--muted-2); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+/* 播放核心与弹幕凭证设置卡：数值限制集中在此，不散落为播放器常量。 */
+.playback-settings-card, .danmaku-settings-card { grid-column: 1 / -1; min-height: 0; }
+.playback-settings-card.is-enabled, .danmaku-settings-card.is-enabled { border-color: rgba(94,167,216,.28); }
+.setting-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin: 0 0 16px; }
+.setting-fields label { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 11px; }
+.setting-fields input { min-width: 0; width: 132px; min-height: 38px; padding: 0 11px; border: 1px solid var(--line); border-radius: 10px; outline: 0; color: #f3f1eb; background: rgba(6,8,12,.32); font-size: 11px; font-variant-numeric: tabular-nums; }
+.setting-fields input:focus { border-color: rgba(100,210,255,.38); }
+.setting-hint { display: block; margin-top: 10px; color: var(--muted-2); font-size: 9px; line-height: 1.7; }
+[data-theme="light"] .setting-fields input { color: #17202c; background: rgba(246,248,251,.92); }
 
 /* 访问控制 */
 .access-control-content { gap: 20px; }

@@ -12,6 +12,8 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "jsx": "react-jsx",
+    // Node 直接以类型擦除方式运行 *.test.ts，测试文件因此需要显式 .ts 后缀。
+    "allowImportingTsExtensions": true,
     "types": ["vite/client"]
   },
   "include": ["src", "vite.local.config.ts"],

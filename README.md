@@ -112,16 +112,23 @@ MicrosoftYaHei.ttf
 
 如果“带字幕的视频无法播放”，请先看文件格式：字幕只是在画面上叠加，常见的真正原因是带字幕片源同时使用了浏览器不易直放的 MKV 容器或 FLAC/Opus 音频。新版播放页会显示实际兼容性提示，并默认先关闭字幕，让视频解码与字幕加载互不干扰。
 
-LMD 会在启动或扫描后自动检查容器与音频组合。发现浏览器不易直放的 MKV、FLAC/Opus 等情况时，会自动加入兼容处理队列，无需手动点击：
+LMD 使用统一的播放核心，按“尽量不动原片”的顺序为每台设备选择处理方式：
 
-- 视频使用 FFmpeg 的 `-c:v copy` 原样复制，不重新编码，画质不变。
-- 10-bit 和 HDR 信息随原视频码流保留。
-- 不兼容音频可以转换为 AAC 256 kbps；AAC 转换不是数学意义上的无损，但视频码流保持不变。
-- 原始视频不会被覆盖；兼容副本默认写入 `data/cache`，也可以在运行设置中选择独立保存目录。
-- 默认每次只运行 1 个任务；在本机管理端“运行设置”开启并行加速后，最多同时运行 3 个任务，并在 12 小时后自动恢复单任务模式。
-- 手动关闭或定时到期不会强制中断已经运行的 FFmpeg，只会停止补充新的并行任务。并行加速会增加磁盘并发读写，副本所需空间通常接近原视频大小。
-- 观看端在后台轮询处理状态；兼容副本完成后，已打开的播放器会自动切换到 MP4 + AAC 地址。
-- 如果设备不支持原视频编码，仅重封装仍无法解决；当前版本不自动转码视频。
+**DIRECT（原文件直传）→ REMUX（换容器、音视频都复制）→ PARTIAL_TRANSCODE（只转不兼容的轨道）→ TRANSCODE（整体转换）**
+
+决策依据是 FFprobe 的真实轨道信息和浏览器上报的真实解码能力，不看扩展名：
+
+- MP4 + H.264 + AAC 等浏览器能直接播放的组合走 `DIRECT`，使用原文件 Range 传输，不启动 FFmpeg。
+- MKV + H.264 + AAC 并且设备支持这两种编码时，音视频**双 Copy**，只把容器换成 fMP4，画质和码流不变。
+- H.264 + DTS 这类只有音频不兼容的情况，只把音频转成 AAC，视频仍然 Copy，不会连带重编码。
+- 只有所选轨道确实无法解码时才编码该轨道，默认输出可靠的 H.264，必要时转 AAC。
+- HEVC、AV1、VP9 等设备能解的原始编码优先保留，不因为容器不同而降级重编码。
+- HDR 无法可靠呈现且必须转码时执行明确的 HDR→SDR 映射。
+- 兼容数据按需生成、传输、缓存和释放，默认不生成长期保存的完整兼容副本。原视频和元数据永久保留。
+
+临时分片写入 `data/cache/playback`，按缓存上限、保留时间和正在播放的租约统一管理；暂停或离开页面后处理进程会停止，不会在后台把整部影片加工完。历史兼容副本仍可读取，不会被自动删除。
+
+如果设备不支持原视频编码，又无法在合理资源下转换，播放页会明确说明失败原因，而不是静默黑屏。
 
 ## 10 路播放能力
 
@@ -132,21 +139,31 @@ LMD 会在启动或扫描后自动检查容器与音频组合。发现浏览器�
 ## 代码目录，用生活化方式理解
 
 ```text
-src/main.tsx          网页的“大脑”：管理页、观看页、视频播放器和字幕选择
+src/main.tsx          网页的“大脑”：管理页、观看页、剧集导航和运行设置
+src/player/Player.tsx 播放舞台与控制条：桌面快捷键、移动手势、锁定和全屏
+src/player/core.ts    统一播放核心：能力检测、Direct/HLS 适配、原片时钟与自动后备
+src/player/subtitles.tsx  ASS 特效（JASSUB）、文本字幕和位图字幕叠加
+src/player/danmaku.tsx    弹幕渲染、来源开关、导入与时间校准
+src/player/player-test.tsx 真实浏览器自检面板（?playerTest=1）
 src/music.tsx         音乐目录、播放队列、完整播放器、迷你播放器和滚动歌词
 src/reading.tsx       阅读目录、PDF/TXT/电子书阅读器和虚拟化表格预览
 src/reading-sheet.worker.ts  后台解析 Excel/CSV/ODS，主界面保持响应
 src/styles.css        网页的“装修”：颜色、尺寸与手机/平板响应式布局
-server/index.mjs      共享服务：本机管理限制、扫描、字幕提取和视频直传
+server/index.mjs      共享服务：本机管理限制、扫描、字幕提取和静态页面
+server/playback.mjs   播放会话、原文件 Range、按需 fMP4 分片、HLS 清单与缓存回收
+server/playback-planner.mjs  版本化媒体元数据与逐轨播放策略
+server/playback-mp4.mjs      增量读取 fMP4 box、时间信息与初始化段时长
+server/bitmap-subtitles.mjs  PGS/VobSub/DVB 位图字幕按需解码
+server/danmaku.mjs    弹弹play 匹配、聚合弹幕与本地绑定
 server/music.mjs      音乐扫描、元数据、封面、歌词、Range 直传和无损兼容副本
 server/reading.mjs    阅读目录扫描、权限过滤和电子书/表格 Range 直传
 tray.ps1              系统托盘控制器：管理页快捷方式、二维码和共享服务启停
 tray-qr.mjs           使用二维码组件生成托盘窗口中的二维码图片
 启动LMD.vbs           Windows 双击入口；隐藏启动托盘，不出现 CMD 窗口
-tools/ffmpeg/bin      读取媒体信息、提取字幕字体、重封装和转换 AAC（可在运行设置中自动安装/更新）
+tools/ffmpeg/bin      读取媒体信息、提取字幕字体、按需分片、位图字幕与转换 AAC（可在运行设置中自动安装/更新）
 runtime/node.exe      运行 LMD 服务所需的内置 Node.js
 data/state.json       视频/音乐/阅读目录、媒体记录、任务、访问控制和运行设置
-data/cache            字幕、字体、封面、歌词及音视频兼容副本缓存
+data/cache            字幕、字体、封面、歌词缓存及 data/cache/playback 按需播放分片
 dist                  构建完成的网页文件
 ```
 
@@ -162,10 +179,22 @@ dist                  构建完成的网页文件
 ## 开发命令（普通使用可以忽略）
 
 ```powershell
-npm install
-npm run build
-npm run server
-npm run test:all
+pnpm install
+pnpm run build
+pnpm run server
+pnpm run test:all
 ```
 
 网页源码修改后需要重新构建。服务监听 `0.0.0.0:8096`，观看端通过服务器的局域网 IP 加端口访问。
+
+播放核心、弹幕与位图字幕的详细说明见 [docs/播放核心开发说明.md](docs/播放核心开发说明.md)、[docs/播放核心接口说明.md](docs/播放核心接口说明.md) 与 [docs/播放核心测试报告.md](docs/播放核心测试报告.md)。
+
+### 真实浏览器自检（可选）
+
+用本机服务启动时加上 `LMD_PLAYER_TEST=1`，然后在浏览器打开 `http://127.0.0.1:8096/?playerTest=1`：
+
+```powershell
+$env:LMD_PLAYER_TEST='1'; node server/index.mjs
+```
+
+页面会自动播放目录里的第一个视频，逐项验证出画、暂停、Seek、连续 Seek、切换音轨、移动端手势与资源释放，并把结果写入 `data/playback-test/browser-report.json`。该接口默认关闭，未设置环境变量时返回 404。

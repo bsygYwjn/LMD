@@ -23,7 +23,10 @@
     "test:music": "node server/music-library.test.mjs",
     "test:reading": "node server/reading-library.test.mjs",
     "test:ffmpeg-install": "node server/ffmpeg-install.test.mjs",
-    "test:all": "node server/access-control.test.mjs && node server/remux-acceleration.test.mjs && node server/catalog-folder-tree.test.mjs && node server/catalog-id-migration.test.mjs && node server/compatible-copy-directory.test.mjs && node server/scan-final-save-rollback.test.mjs && node server/state-save-recovery.test.mjs && node server/turbo-scan.test.mjs && node server/security-hardening.test.mjs && node server/music-library.test.mjs && node server/reading-library.test.mjs && node server/ffmpeg-install.test.mjs"
+    "test:playback": "node server/playback-planner.test.mjs && node server/playback-mp4.test.mjs && node server/playback-integration.test.mjs",
+    "test:bitmap-subtitles": "node server/bitmap-subtitles.test.mjs",
+    "test:danmaku": "node server/danmaku.test.mjs && node src/player/danmaku-time.test.ts",
+    "test:all": "node server/access-control.test.mjs && node server/remux-acceleration.test.mjs && node server/catalog-folder-tree.test.mjs && node server/catalog-id-migration.test.mjs && node server/compatible-copy-directory.test.mjs && node server/scan-final-save-rollback.test.mjs && node server/state-save-recovery.test.mjs && node server/turbo-scan.test.mjs && node server/security-hardening.test.mjs && node server/music-library.test.mjs && node server/reading-library.test.mjs && node server/ffmpeg-install.test.mjs && node server/playback-planner.test.mjs && node server/playback-mp4.test.mjs && node server/playback-integration.test.mjs && node server/bitmap-subtitles.test.mjs && node server/danmaku.test.mjs && node src/player/danmaku-time.test.ts"
   },
   "dependencies": {
     "music-metadata": "11.9.0",
@@ -34,7 +37,9 @@
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
+    "danmaku": "2.0.10",
     "foliate-js": "github:johnfactotum/foliate-js#78914aef4466eb960965702401634c2cb348e9b1",
+    "hls.js": "1.7.2",
     "jassub": "2.4.1",
     "lucide-react": "^0.468.0",
     "pdfjs-dist": "6.2.108",
