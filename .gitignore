@@ -53,3 +53,7 @@ Thumbs.db
 # Acceptance harness scratch output (tools/player-acceptance)
 tools/player-acceptance/chrome-profile/
 tools/player-acceptance/shots/
+
+# Chrome profiles created by the acceptance harness
+chrome-profile/
+shots/
