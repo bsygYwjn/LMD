@@ -20,7 +20,9 @@ let serverErrors = "";
 try {
   await mkdir(path.join(temporary, "data"));
   const source = path.join(temporary, "sample.mkv"), mp4 = path.join(temporary, "sample.mp4"), dts = path.join(temporary, "dts.mkv");
-  await run(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=70", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=70", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-bf", "2", "-c:a", "aac", source]);
+  await run(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=70",
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=70", "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000:duration=70",
+    "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-bf", "2", "-c:a", "aac", source]);
   await run(ffmpeg, ["-v", "error", "-i", source, "-c", "copy", "-movflags", "+faststart", mp4]);
   await run(ffmpeg, ["-v", "error", "-i", source, "-c:v", "copy", "-c:a", "dca", "-strict", "-2", dts]);
   const media = await Promise.all([source, mp4, dts].map(async (file, i) => { const s = await stat(file); return {
@@ -47,8 +49,9 @@ try {
     }
     assert.fail(`${message}\n${manifest}\n${errors}`);
   };
-  const caps = { mse: true, h264: true, aac: true, nativeHls: true, direct: { "0:1": true }, tracks: { 0: { mse: true, file: true }, 1: { mse: true, file: true } } };
-  const metadata = await json("/api/media/media0/info"); assert.equal(metadata.container, "matroska"); assert.equal(metadata.tracks.length, 2);
+  const caps = { mse: true, h264: true, aac: true, nativeHls: true, direct: { "0:1": true }, tracks: {
+    0: { mse: true, file: true }, 1: { mse: true, file: true }, 2: { mse: true, file: true } } };
+  const metadata = await json("/api/media/media0/info"); assert.equal(metadata.container, "matroska"); assert.equal(metadata.tracks.length, 3);
   const direct = await json("/api/media/media1/playback-sessions", { capabilities: caps });
   assert.equal(direct.strategy, "DIRECT");
   let range = await fetch(`${base}${direct.url}`, { headers: { Range: "bytes=0-31" } }); assert.equal(range.status, 206); assert.equal((await range.arrayBuffer()).byteLength, 32);
@@ -76,18 +79,34 @@ try {
   const liveSegment = manifest.split("\n").find(line => /^\d+\.m4s/.test(line));
   assert.equal((await fetch(`${base}/api/playback-sessions/${first.sessionId}/${liveSegment}`)).status, 200, "滑动后新分片应可读取");
   const seek = await json(`/api/playback-sessions/${first.sessionId}`, { generation: 1, seekTime: 51 }, "PATCH");
-  assert.equal(seek.generation, 2); assert.ok(seek.sourceStart <= 51 && seek.sourceStart >= 48, JSON.stringify(seek));
+  assert.equal(seek.sessionId, first.sessionId); assert.equal(seek.generation, 2); assert.ok(seek.sourceStart <= 51 && seek.sourceStart >= 48, JSON.stringify(seek));
+  const afterSeek = (await json("/api/settings/video-playback")).status;
+  assert.equal(afterSeek.sessionsCreated, 3, "seek must reuse the existing playback session");
+  assert.equal(afterSeek.seeks, 1);
+  const staleUpdate = await fetch(`${base}/api/playback-sessions/${first.sessionId}`, { method: "PATCH", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ generation: 1, seekTime: 52 }) });
+  assert.equal(staleUpdate.status, 409); assert.equal((await staleUpdate.json()).code, "STALE_SESSION");
+  const afterStale = (await json("/api/settings/video-playback")).status;
+  assert.equal(afterStale.seeks, 1, "a repeated stale generation must be idempotently rejected");
+  assert.equal(afterStale.pipelinesCreated, afterSeek.pipelinesCreated, "a stale retry must not start another producer");
+  const switched = await json(`/api/playback-sessions/${first.sessionId}`, { generation: 2, position: 51, audioTrackId: "2" }, "PATCH");
+  assert.equal(switched.sessionId, first.sessionId); assert.equal(switched.generation, 3); assert.equal(switched.plan.audio.track.id, "2");
+  assert.ok(Math.abs(switched.requestedTime - 51) < 0.1);
+  const afterSwitch = (await json("/api/settings/video-playback")).status;
+  assert.equal(afterSwitch.sessionsCreated, 3, "audio switching must reuse the existing playback session");
+  assert.equal(afterSwitch.seeks, 1, "an audio-only switch must not be counted as a seek");
+  assert.equal(afterSwitch.audioTrackSwitches, 1);
   const stale = await fetch(`${base}${first.url}`); assert.equal(stale.status, 409);
-  manifest = await (await fetch(`${base}${seek.url}`)).text();
+  manifest = await (await fetch(`${base}${switched.url}`)).text();
   const segment = manifest.split("\n").find(line => /^\d+\.m4s/.test(line));
   const prefix = `/api/playback-sessions/${first.sessionId}/`;
-  const initBytes = Buffer.from(await (await fetch(`${base}${prefix}init.mp4?generation=2`)).arrayBuffer());
+  const initBytes = Buffer.from(await (await fetch(`${base}${prefix}init.mp4?generation=3`)).arrayBuffer());
   const segmentBytes = Buffer.from(await (await fetch(`${base}${prefix}${segment}`)).arrayBuffer());
   const fragmentFile = path.join(temporary, "fragment.mp4"); await writeFile(fragmentFile, Buffer.concat([initBytes, segmentBytes]));
   const decoded = JSON.parse(await run(ffprobe, ["-v", "error", "-show_streams", "-of", "json", fragmentFile]));
   assert.deepEqual(decoded.streams.map(item => item.codec_name), ["h264", "aac"]);
   await json(`/api/playback-sessions/${first.sessionId}`, { position: 69 }, "PATCH");
-  manifest = await waitForManifest(seek.url, value => value.includes("#EXT-X-ENDLIST"), "FFmpeg 到达 EOF 后清单没有结束标记");
+  manifest = await waitForManifest(switched.url, value => value.includes("#EXT-X-ENDLIST"), "FFmpeg 到达 EOF 后清单没有结束标记");
   assert.equal(manifestTarget(manifest), targetDuration, "EOF 前后 TARGETDURATION 必须保持固定");
   assert.equal(manifest.includes("#EXT-X-PLAYLIST-TYPE:VOD"), false, "滑动过的结束清单不能伪装成完整 VOD");
   await json(`/api/playback-sessions/${first.sessionId}`, undefined, "DELETE");
@@ -96,10 +115,18 @@ try {
   await json(`/api/playback-sessions/${partial.sessionId}`, undefined, "DELETE");
   const transcode = await json("/api/media/media0/playback-sessions", { capabilities: caps, fallbackLevel: 3, startTime: 21 });
   assert.equal(transcode.strategy, "TRANSCODE"); assert.ok(Math.abs(transcode.sourceStart - 21) < 0.1);
-  await json(`/api/playback-sessions/${transcode.sessionId}`, undefined, "DELETE"); await delay(200);
-  const status = (await json("/api/settings/video-playback")).status; assert.equal(status.sessions, 0); assert.equal(status.pipelines, 0);
+  await json(`/api/playback-sessions/${transcode.sessionId}`, undefined, "DELETE");
+  let status;
+  for (let i = 0; i < 50; i++) {
+    status = (await json("/api/settings/video-playback")).status;
+    if (status.sessions === 0 && status.pipelines === 0 && status.pipelinesReleased === status.pipelinesCreated) break;
+    await delay(100);
+  }
+  assert.equal(status.sessions, 0); assert.equal(status.pipelines, 0);
+  assert.equal(status.sessionsReleased, status.sessionsCreated, "every created session must be released");
+  assert.equal(status.pipelinesReleased, status.pipelinesCreated, "every started FFmpeg process must exit");
   assert.ok(status.cacheBytes < 30 * 1024 ** 2);
-  console.log(JSON.stringify({ result: "passed", tested: ["Range", "dual copy", "shared pipeline", "live HLS sliding", "fixed TARGETDURATION", "HLS EOF", "seek PTS", "stale generation", "DTS audio-only", "full transcode", "release"], elapsedMs: Math.round(performance.now() - start), status }));
+  console.log(JSON.stringify({ result: "passed", tested: ["Range", "dual copy", "shared pipeline", "session reuse", "seek PTS", "stale generation", "audio switching", "DTS audio-only", "full transcode", "release accounting"], elapsedMs: Math.round(performance.now() - start), status }));
   await json("/api/service/stop", {});
 } finally {
   if (server?.exitCode !== null && serverErrors) console.error(serverErrors);

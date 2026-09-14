@@ -1,4 +1,5 @@
 import Hls from "hls.js";
+import { LatestTaskQueue, type LatestTaskContext } from "./latest-task-queue.ts";
 
 export type MediaTrack = { id: string; index: number; type: string; codec: string; codecString: string; profile: string; level: number;
   width: number; height: number; frameRate: number; bitRate: number; bitDepth: number; channels: number; sampleRate: number;
@@ -18,6 +19,7 @@ type Session = { sessionId: string; generation: number; strategy: string; transp
   heartbeatSeconds: number; buffer: { aheadSeconds: number; backBufferSeconds: number; maxBufferBytes: number };
   plan: { audio: { track: MediaTrack } | null; video: { track: MediaTrack }; fallbackLevel: number } };
 type Listener = (state: PlaybackState, event: string) => void;
+type SessionUpdate = { target: number; audioTrackId: string | null; seek: boolean };
 
 export async function api<T>(url: string, body?: unknown, method = body === undefined ? "GET" : "POST", signal?: AbortSignal, onResponse?: (payload: { sessionId?: string }) => void): Promise<T> {
   const response = await fetch(url, { method, body: body === undefined ? undefined : JSON.stringify(body), headers: body === undefined ? undefined : { "Content-Type": "application/json" }, signal, cache: "no-store" });
@@ -90,14 +92,16 @@ export class PlaybackCore extends EventTarget {
   private frameCallback: number | undefined;
   private networkRetry = 0;
   private reloadAttempts = 0;
-  private pendingAudio: string | null = null;
-  private audioSwitch: Promise<void> | null = null;
+  private desiredAudioTrackId: string | null = null;
+  private pendingSeek = false;
+  private readonly sessionUpdates: LatestTaskQueue<SessionUpdate>;
   private state: PlaybackState = { mediaId: "", currentTime: 0, duration: 0, paused: true, seeking: false, buffering: false,
     volume: 1, muted: false, playbackRate: 1, tracks: [], audioTrackId: null, buffered: [], seekable: [], strategy: "", transport: "", timeOffset: 0,
     generation: 0, error: "", errorCode: "", autoplayBlocked: false, firstFrameMs: null, lastSeekMs: null };
 
   constructor(video: HTMLVideoElement) {
     super(); this.video = video; video.controls = false; video.playsInline = true;
+    this.sessionUpdates = new LatestTaskQueue((update, context) => this.applySessionUpdate(update, context));
     for (const name of ["loadedmetadata", "durationchange", "play", "playing", "pause", "seeking", "seeked", "timeupdate", "ratechange", "volumechange", "waiting", "progress", "ended", "error"]) {
       const fn = () => this.onMediaEvent(name); video.addEventListener(name, fn); this.eventHandlers.push([name, fn]);
     }
@@ -143,7 +147,7 @@ export class PlaybackCore extends EventTarget {
     this.emit(event, patch);
   }
   async load(mediaId: string, options: { startTime?: number; autoplay?: boolean } = {}) {
-    this.pendingAudio = null; this.audioSwitch = null;
+    this.sessionUpdates.cancel(); this.pendingSeek = false; this.desiredAudioTrackId = null;
     this.sequence++; this.abort.abort(); this.abort = new AbortController();
     const sequence = this.sequence; this.switching = true; this.releaseTransport();
     this.intent = options.autoplay !== false; this.fallbackLevel = 0; this.nativeFallback = false; this.ended = false; this.reloadAttempts = 0; this.startedAt = performance.now();
@@ -154,78 +158,79 @@ export class PlaybackCore extends EventTarget {
       if (sequence !== this.sequence || this.disposed) return;
       this.mediaInfo = info; this.capabilities = capabilities;
       this.emit("loadedmetadata", { duration: info.duration, tracks: info.tracks });
-      await this.openSession(options.startTime || 0, null);
+      await this.openSession(options.startTime || 0);
     } catch (error) { this.fail(error); }
   }
-  private releaseTransport(preserveSession = false) {
+  private teardownMediaTransport() {
     clearInterval(this.heartbeat); this.heartbeat = undefined;
     this.hls?.destroy(); this.hls = null;
     if (this.frameCallback !== undefined) { this.video.cancelVideoFrameCallback?.(this.frameCallback); this.frameCallback = undefined; }
     this.video.pause(); this.video.removeAttribute("src"); this.video.load();
+  }
+  private releaseSession() {
     // keepalive keeps the release alive while the page is unloading; without it
     // the browser cancels the request and the server only frees the session when
     // the lease expires.
-    if (this.session && !preserveSession) { const id = this.session.sessionId; this.session = null; void fetch(`/api/playback-sessions/${id}`, { method: "DELETE", keepalive: true }).catch(() => {}); }
+    if (this.session) { const id = this.session.sessionId; this.session = null; void fetch(`/api/playback-sessions/${id}`, { method: "DELETE", keepalive: true }).catch(() => {}); }
   }
-  private async openSession(target: number, audioTrackId: string | null = this.state.audioTrackId, reuseSession = false) {
+  private releaseTransport() { this.teardownMediaTransport(); this.releaseSession(); }
+  private async createSession(target: number, audioTrackId: string | null, signal: AbortSignal) {
+    if (!this.mediaInfo || !this.capabilities) throw new Error("播放信息尚未就绪");
+    return api<Session>(`/api/media/${this.mediaInfo.mediaId}/playback-sessions`, { capabilities: this.capabilities, startTime: target,
+      audioTrackId, fallbackLevel: this.fallbackLevel, preferNativeHls: this.nativeFallback }, "POST", signal);
+  }
+  private isCurrentSession(session: Session, sequence: number) {
+    return sequence === this.sequence && !this.disposed && this.session?.sessionId === session.sessionId && this.session.generation === session.generation;
+  }
+  private attachSession(session: Session, target: number, sequence: number) {
+    if (sequence !== this.sequence || this.disposed) return;
+    this.session = session; this.desiredAudioTrackId = session.plan.audio?.track.id || null;
+    this.emit("strategychange", { strategy: session.strategy, transport: session.transport, timeOffset: session.timeOffset, generation: session.generation,
+      audioTrackId: this.desiredAudioTrackId });
+    const start = Math.max(0, target - session.timeOffset);
+    const onReady = () => {
+      if (!this.isCurrentSession(session, sequence)) return;
+      this.video.currentTime = start; this.switching = false;
+      this.emit("loadedmetadata", { paused: !this.intent });
+      if (this.intent) void this.play(); else this.emit("pause", { paused: true, buffering: false, seeking: false });
+      if (this.video.requestVideoFrameCallback) this.frameCallback = this.video.requestVideoFrameCallback(() => {
+        if (this.isCurrentSession(session, sequence)) this.emit("firstframe", { firstFrameMs: this.state.firstFrameMs ?? Math.round(performance.now() - this.startedAt),
+          lastSeekMs: this.seekStarted ? Math.round(performance.now() - this.seekStarted) : this.state.lastSeekMs, buffering: false, seeking: false });
+        this.seekStarted = 0;
+      });
+    };
+    this.video.addEventListener("loadedmetadata", onReady, { once: true, signal: this.abort.signal });
+    if (session.transport === "mse") {
+      this.video.disableRemotePlayback = true;
+      const hls = new Hls({ enableWorker: true, lowLatencyMode: false, autoStartLoad: false, startPosition: start,
+        maxBufferLength: session.buffer.aheadSeconds, maxMaxBufferLength: session.buffer.aheadSeconds,
+        backBufferLength: session.buffer.backBufferSeconds, maxBufferSize: session.buffer.maxBufferBytes,
+        liveSyncDuration: 86400, liveMaxLatencyDuration: Infinity, maxLiveSyncPlaybackRate: 1 });
+      this.hls = hls;
+      hls.on(Hls.Events.MEDIA_ATTACHED, () => { if (this.isCurrentSession(session, sequence)) hls.loadSource(session.url); });
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { if (this.isCurrentSession(session, sequence)) hls.startLoad(start); });
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (!data.fatal || !this.isCurrentSession(session, sequence)) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          this.emit("error", { error: "网络或播放会话暂时不可用，点击重试", errorCode: "NETWORK_ERROR", buffering: false });
+          if (navigator.onLine && this.networkRetry++ < 2) void this.seek(this.currentTime).catch(error => this.fail(error));
+        } else void this.fallback();
+      });
+      hls.attachMedia(this.video);
+    } else { this.video.src = session.url; this.video.load(); }
+    this.heartbeat = setInterval(() => void this.keepAlive(), session.heartbeatSeconds * 1000);
+  }
+  private async openSession(target: number, audioTrackId = this.desiredAudioTrackId) {
     if (!this.mediaInfo || !this.capabilities || this.disposed) return;
+    this.sessionUpdates.cancel(); this.pendingSeek = false;
     this.sequence++; const sequence = this.sequence;
     this.abort.abort(); this.abort = new AbortController(); this.switching = true; this.pendingTarget = target;
-    const previous = reuseSession ? this.session : null;
-    this.releaseTransport(Boolean(previous));
+    this.releaseTransport();
     this.emit("seeking", { currentTime: target, seeking: true, buffering: true, error: "", errorCode: "", buffered: [] });
     try {
-      let session: Session;
-      if (previous) {
-        session = previous;
-        // Serialize generations; never attach an intermediate choice to the video.
-        do {
-          const selected = this.pendingAudio ?? audioTrackId;
-          this.pendingAudio = null;
-          session = await api<Session>(`/api/playback-sessions/${session.sessionId}`, {
-            generation: session.generation, seekTime: target, audioTrackId: selected,
-          }, "PATCH", this.abort.signal);
-          if (sequence !== this.sequence || this.disposed) return;
-        } while (this.pendingAudio !== null && this.pendingAudio !== session.plan.audio?.track.id);
-        this.pendingAudio = null;
-      } else session = await api<Session>(`/api/media/${this.mediaInfo.mediaId}/playback-sessions`, { capabilities: this.capabilities, startTime: target,
-        audioTrackId, fallbackLevel: this.fallbackLevel, preferNativeHls: this.nativeFallback }, "POST", this.abort.signal);
+      const session = await this.createSession(target, audioTrackId, this.abort.signal);
       if (sequence !== this.sequence || this.disposed) { void fetch(`/api/playback-sessions/${session.sessionId}`, { method: "DELETE", keepalive: true }); return; }
-      this.session = session;
-      this.emit("strategychange", { strategy: session.strategy, transport: session.transport, timeOffset: session.timeOffset, generation: session.generation,
-        audioTrackId: session.plan.audio?.track.id || null });
-      const start = Math.max(0, target - session.timeOffset);
-      const onReady = () => {
-        if (sequence !== this.sequence || this.disposed || !this.session) return;
-        this.video.currentTime = start; this.switching = false;
-        this.emit("loadedmetadata", { paused: !this.intent });
-        if (this.intent) void this.play(); else this.emit("pause", { paused: true, buffering: false, seeking: false });
-        if (this.video.requestVideoFrameCallback) this.frameCallback = this.video.requestVideoFrameCallback(() => {
-          if (sequence === this.sequence) this.emit("firstframe", { firstFrameMs: this.state.firstFrameMs ?? Math.round(performance.now() - this.startedAt),
-            lastSeekMs: this.seekStarted ? Math.round(performance.now() - this.seekStarted) : this.state.lastSeekMs, buffering: false, seeking: false });
-          this.seekStarted = 0;
-        });
-      };
-      this.video.addEventListener("loadedmetadata", onReady, { once: true, signal: this.abort.signal });
-      if (session.transport === "mse") {
-        this.video.disableRemotePlayback = true;
-        const hls = new Hls({ enableWorker: true, lowLatencyMode: false, autoStartLoad: false, startPosition: start,
-          maxBufferLength: session.buffer.aheadSeconds, maxMaxBufferLength: session.buffer.aheadSeconds,
-          backBufferLength: session.buffer.backBufferSeconds, maxBufferSize: session.buffer.maxBufferBytes,
-          liveSyncDuration: 86400, liveMaxLatencyDuration: Infinity, maxLiveSyncPlaybackRate: 1 });
-        this.hls = hls;
-        hls.on(Hls.Events.MEDIA_ATTACHED, () => { if (sequence === this.sequence) hls.loadSource(session.url); });
-        hls.on(Hls.Events.MANIFEST_PARSED, () => { if (sequence === this.sequence) hls.startLoad(start); });
-        hls.on(Hls.Events.ERROR, (_event, data) => {
-          if (!data.fatal || sequence !== this.sequence) return;
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            this.emit("error", { error: "网络或播放会话暂时不可用，点击重试", errorCode: "NETWORK_ERROR", buffering: false });
-            if (navigator.onLine && this.networkRetry++ < 2) void this.seek(this.currentTime).catch(error => this.fail(error));
-          } else void this.fallback();
-        });
-        hls.attachMedia(this.video);
-      } else { this.video.src = session.url; this.video.load(); }
-      this.heartbeat = setInterval(() => void this.keepAlive(), session.heartbeatSeconds * 1000);
+      this.attachSession(session, target, sequence);
     } catch (error) {
       if (sequence !== this.sequence || this.disposed) return;
       const code = (error as { code?: string }).code || "";
@@ -240,16 +245,106 @@ export class PlaybackCore extends EventTarget {
       else this.fail(error);
     }
   }
+  private rememberSession(sessionId: string, updated: Session) {
+    if (this.session?.sessionId === sessionId && updated.generation >= this.session.generation) this.session = updated;
+  }
+  private sessionMatchesUpdate(session: Session, update: SessionUpdate) {
+    return Math.abs(session.requestedTime - update.target) < 0.05 && (session.plan.audio?.track.id || null) === update.audioTrackId;
+  }
+  private async replaceExpiredSession(update: SessionUpdate, context: LatestTaskContext) {
+    if (!context.isLatest() || this.disposed) return null;
+    const replacement = await this.createSession(update.target, update.audioTrackId, this.abort.signal);
+    if (!context.isLatest() || this.disposed) {
+      void fetch(`/api/playback-sessions/${replacement.sessionId}`, { method: "DELETE", keepalive: true }).catch(() => {});
+      return null;
+    }
+    this.session = replacement;
+    return replacement;
+  }
+  private async updateExistingSession(base: Session, update: SessionUpdate, context: LatestTaskContext) {
+    let current = base;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const audioChanged = (current.plan.audio?.track.id || null) !== update.audioTrackId;
+      const body: { generation: number; position: number; seekTime?: number; audioTrackId?: string | null } = {
+        generation: current.generation, position: update.target,
+      };
+      if (update.seek) body.seekTime = update.target;
+      if (audioChanged) body.audioTrackId = update.audioTrackId;
+      try {
+        const updated = await api<Session>(`/api/playback-sessions/${current.sessionId}`, body, "PATCH", this.abort.signal);
+        this.rememberSession(current.sessionId, updated);
+        return updated;
+      } catch (error) {
+        const status = (error as { status?: number }).status;
+        if ((error as Error).name === "AbortError" || this.disposed) throw error;
+        if ((error as { code?: string }).code === "SOURCE_CHANGED") throw error;
+        if (status === 410) {
+          if (this.session?.sessionId === current.sessionId) this.session = null;
+          return this.replaceExpiredSession(update, context);
+        }
+        // A generation conflict or an ambiguous network failure may mean the
+        // server committed the request but its response never reached us. Read
+        // back the authoritative generation before deciding whether to retry.
+        if (status !== 409 && status !== undefined) throw error;
+        let refreshed: Session;
+        try { refreshed = await api<Session>(`/api/playback-sessions/${current.sessionId}`, undefined, "GET", this.abort.signal); }
+        catch (refreshError) {
+          if ((refreshError as { status?: number }).status === 410) {
+            if (this.session?.sessionId === current.sessionId) this.session = null;
+            return this.replaceExpiredSession(update, context);
+          }
+          throw error;
+        }
+        this.rememberSession(current.sessionId, refreshed);
+        if (this.sessionMatchesUpdate(refreshed, update)) return refreshed;
+        if (!context.isLatest()) return null;
+        current = refreshed;
+      }
+    }
+    throw Object.assign(new Error("播放会话更新冲突，请重试"), { code: "STALE_SESSION" });
+  }
+  private async applySessionUpdate(update: SessionUpdate, context: LatestTaskContext) {
+    if (!this.mediaInfo || !this.capabilities || this.disposed) return;
+    this.pendingSeek = false;
+    const sequence = this.sequence;
+    this.abort.abort(); this.abort = new AbortController();
+    this.teardownMediaTransport();
+    this.emit("seeking", { currentTime: update.target, seeking: true, buffering: true, error: "", errorCode: "", buffered: [] });
+    try {
+      const existing = this.session;
+      const updated = existing
+        ? await this.updateExistingSession(existing, update, context)
+        : await this.replaceExpiredSession(update, context);
+      if (!updated || !context.isLatest() || sequence !== this.sequence || this.disposed) return;
+      this.attachSession(updated, update.target, sequence);
+    } catch (error) {
+      if (!context.isLatest() || sequence !== this.sequence || this.disposed) return;
+      const code = (error as { code?: string }).code || "";
+      if (code === "SOURCE_CHANGED" && this.reloadAttempts < 1) {
+        this.reloadAttempts++;
+        await this.load(this.state.mediaId, { startTime: update.target, autoplay: this.intent });
+      } else if (["PIPELINE_FAILED", "NO_DECODER", "TIMELINE_UNAVAILABLE"].includes(code) && this.fallbackLevel < 3) {
+        this.recovering = false; await this.fallback();
+      } else throw error;
+    }
+  }
+  private queueSessionUpdate(target: number, audioTrackId: string | null, seek: boolean) {
+    this.pendingSeek ||= seek; this.desiredAudioTrackId = audioTrackId;
+    this.sequence++; this.switching = true; this.pendingTarget = target;
+    this.video.pause();
+    this.emit("seeking", { currentTime: target, seeking: true, buffering: true, error: "", errorCode: "" });
+    return this.sessionUpdates.enqueue({ target, audioTrackId, seek: this.pendingSeek }).catch(error => this.fail(error));
+  }
   private async keepAlive() {
     if (!this.session || this.heartbeatBusy || this.disposed || this.switching) return;
     this.heartbeatBusy = true; const session = this.session;
     try {
-      const updated = await api<Session>(`/api/playback-sessions/${session.sessionId}`, { position: this.currentTime }, "PATCH");
+      const updated = await api<Session>(`/api/playback-sessions/${session.sessionId}`, { position: this.currentTime, generation: session.generation }, "PATCH");
       if (this.session !== session || this.switching) return;
       this.session = updated;
       if (updated.error) this.fail(Object.assign(new Error(updated.error.message), { code: updated.error.code }));
     } catch (error) {
-      if (this.session !== session) return;
+      if (this.session !== session || this.switching) return;
       if ((error as { status?: number }).status === 410) await this.openSession(this.currentTime);
       else if ([401, 403, 404].includes((error as { status?: number }).status || 0)) { this.pause(); this.fail(error); }
     } finally { this.heartbeatBusy = false; }
@@ -292,25 +387,41 @@ export class PlaybackCore extends EventTarget {
       this.emit("seeking", { currentTime: target, seeking: true });
       if (this.intent) void this.play();
       void this.keepAlive();
-    } else await this.openSession(target);
+    } else await this.queueSessionUpdate(target, this.desiredAudioTrackId, true);
   }
-  async retry() { this.networkRetry = 0; await this.openSession(this.currentTime); }
+  async retry() {
+    this.networkRetry = 0; this.sessionUpdates.cancel(); this.pendingSeek = false;
+    const target = this.currentTime, existing = this.session;
+    if (!existing) { await this.openSession(target); return; }
+    this.sequence++; const sequence = this.sequence;
+    this.abort.abort(); this.abort = new AbortController(); this.switching = true; this.pendingTarget = target;
+    this.teardownMediaTransport();
+    this.emit("seeking", { currentTime: target, seeking: true, buffering: true, error: "", errorCode: "", buffered: [] });
+    try {
+      const refreshed = await api<Session>(`/api/playback-sessions/${existing.sessionId}`, { position: target }, "PATCH", this.abort.signal);
+      if (sequence !== this.sequence || this.disposed || this.session?.sessionId !== existing.sessionId) return;
+      if (refreshed.error) throw Object.assign(new Error(refreshed.error.message), { code: refreshed.error.code });
+      this.attachSession(refreshed, target, sequence);
+    } catch (error) {
+      if (sequence !== this.sequence || this.disposed) return;
+      if ((error as { status?: number }).status === 410) await this.openSession(target);
+      else this.fail(error);
+    }
+  }
   setVolume(volume: number) { this.video.volume = Math.max(0, Math.min(1, volume)); if (volume > 0) this.video.muted = false; }
   setMuted(muted: boolean) { this.video.muted = muted; }
   setPlaybackRate(rate: number) { if (Number.isFinite(rate) && rate >= 0.25 && rate <= 4) this.video.playbackRate = rate; }
   async selectAudioTrack(trackId: string) {
-    if (!this.mediaInfo?.tracks.some(track => track.type === "audio" && track.id === trackId) || this.disposed) return;
-    if (this.audioSwitch) { this.pendingAudio = trackId; return this.audioSwitch; }
-    if (!this.session || this.switching || trackId === this.state.audioTrackId) return;
-    this.pendingAudio = trackId;
-    const operation = this.openSession(this.currentTime, trackId, true);
-    this.audioSwitch = operation;
-    try { await operation; } finally { if (this.audioSwitch === operation) this.audioSwitch = null; }
+    if (this.disposed || !this.mediaInfo?.tracks.some(track => track.type === "audio" && track.id === trackId) || trackId === this.desiredAudioTrackId) return;
+    const target = this.currentTime;
+    await this.queueSessionUpdate(target, trackId, false);
   }
-  private pageHide = () => { if (this.session) void fetch(`/api/playback-sessions/${this.session.sessionId}`, { method: "DELETE", keepalive: true }).catch(() => {}); };
+  private pageHide = () => {
+    this.sessionUpdates.cancel(); this.pendingSeek = false; this.sequence++; this.abort.abort(); this.releaseTransport();
+  };
   private onOnline = () => { if (this.state.errorCode === "NETWORK_ERROR") void this.retry(); };
   async destroy() {
-    this.disposed = true; this.sequence++; this.abort.abort(); this.releaseTransport(); this.listeners.clear();
+    this.disposed = true; this.sessionUpdates.dispose(); this.pendingSeek = false; this.sequence++; this.abort.abort(); this.releaseTransport(); this.listeners.clear();
     for (const [event, handler] of this.eventHandlers) this.video.removeEventListener(event, handler);
     window.removeEventListener("pagehide", this.pageHide); window.removeEventListener("online", this.onOnline);
   }

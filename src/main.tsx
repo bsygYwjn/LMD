@@ -131,8 +131,8 @@ type MediaToolsInstallStatus = {
 type PlaybackSettings = { cacheMaxBytes: number; cacheTtlSeconds: number; aheadSeconds: number; backBufferSeconds: number;
   heartbeatSeconds: number; leaseSeconds: number; initialLeaseSeconds: number; releaseGraceSeconds: number; noOutputSeconds: number; cleanupSeconds: number;
   maxBufferBytes: number; encoder: "auto" | "libx264" | "h264_nvenc" | "h264_qsv" | "h264_amf" };
-type PlaybackStatus = { sessions: number; pipelines: number; cacheBytes: number; cacheMaxBytes: number; sessionsCreated: number;
-  pipelinesCreated: number; cacheHits: number; fallbacks: number; seeks: number; bytesGenerated: number };
+type PlaybackStatus = { sessions: number; pipelines: number; cacheBytes: number; cacheMaxBytes: number; sessionsCreated: number; sessionsReleased: number;
+  pipelinesCreated: number; pipelinesReleased: number; cacheHits: number; fallbacks: number; seeks: number; audioTrackSwitches: number; bytesGenerated: number };
 type DanmakuSettings = { appId: string; configured: boolean; environmentManaged: boolean };
 type AccessUser = {
   id: string;

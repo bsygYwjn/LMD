@@ -14,7 +14,8 @@ const core = new PlaybackCore(new Video());
 core.mediaInfo = { mediaId: 'test', tracks };
 core.capabilities = {};
 core.state = { ...core.state, duration: 70, currentTime: 20, audioTrackId: '1', timeOffset: 0 };
-core.session = { sessionId: 'same', generation: 1 };
+core.session = { sessionId: 'same', generation: 1, plan: { audio: { track: tracks[0] } } };
+core.desiredAudioTrackId = '1';
 const requests = [];
 const replies = [];
 globalThis.fetch = async (url, options) => {
@@ -26,15 +27,17 @@ globalThis.fetch = async (url, options) => {
   }) })));
 };
 const first = core.selectAudioTrack('3');
+await new Promise(resolve => setTimeout(resolve, 150));
 const second = core.selectAudioTrack('1');
 const last = core.selectAudioTrack('7');
 assert.equal(requests.length, 1);
 replies.shift()('3');
 await new Promise(resolve => setImmediate(resolve));
+await new Promise(resolve => setTimeout(resolve, 150));
 assert.equal(requests.length, 2);
 assert.deepEqual(requests.map(r => r.audioTrackId), ['3', '7']);
 assert.deepEqual(requests.map(r => r.generation), [1, 2]);
-assert.ok(requests.every(r => r.method === 'PATCH' && r.seekTime === 20 && r.url.endsWith('/same')));
+assert.ok(requests.every(r => r.method === 'PATCH' && r.position === 20 && r.url.endsWith('/same')));
 replies.shift()('7');
 await Promise.all([first, second, last]);
 assert.equal(core.getState().audioTrackId, '7');
