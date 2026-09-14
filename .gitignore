@@ -57,3 +57,5 @@ tools/player-acceptance/shots/
 # Chrome profiles created by the acceptance harness
 chrome-profile/
 shots/
+
+tests/player-controls/.cache/
