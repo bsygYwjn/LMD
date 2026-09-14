@@ -27,6 +27,22 @@ export function VideoPlayer(props: Props) {
   const [toast, setToast] = useState(""), [preview, setPreview] = useState<number | null>(null);
   const [holdRate, setHoldRate] = useState(() => stored("lmd:player:holdRate", 3)), [brightness, setBrightness] = useState(1);
   const [boosting, setBoosting] = useState(false);
+  const settingsPanel = useRef<HTMLDialogElement>(null);
+  const [mobileControls, setMobileControls] = useState(() => matchMedia("(max-width:700px),(pointer:coarse)").matches);
+  const [touchControls, setTouchControls] = useState(() => matchMedia("(pointer:coarse)").matches || navigator.maxTouchPoints > 0);
+  useEffect(() => {
+    const query = matchMedia("(max-width:700px),(pointer:coarse)"), pointerQuery = matchMedia("(pointer:coarse)");
+    const changed = () => { setMobileControls(query.matches); setTouchControls(pointerQuery.matches || navigator.maxTouchPoints > 0); };
+    query.addEventListener("change", changed); pointerQuery.addEventListener("change", changed);
+    return () => { query.removeEventListener("change", changed); pointerQuery.removeEventListener("change", changed); };
+  }, []);
+  useEffect(() => {
+    const dialog = settingsPanel.current;
+    if (!dialog || !panel || locked) return;
+    // The top layer escapes the stage's clipping without changing video geometry.
+    if (mobileControls) dialog.showModal(); else dialog.show();
+    return () => dialog.close();
+  }, [Boolean(panel), mobileControls, locked]);
   const stateRef = useRef(state), latest = useRef(props), visibleRef = useRef(visible), lockedRef = useRef(locked), panelRef = useRef(panel);
   stateRef.current = state; latest.current = props; visibleRef.current = visible; lockedRef.current = locked; panelRef.current = panel;
   const hideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined), toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -36,7 +52,7 @@ export function VideoPlayer(props: Props) {
   const tapTime = useRef(0);
   const leftSeekTarget = useRef<number | null>(null);
   const inputMode = useRef<"keyboard" | "pointer">("pointer"), panelOpener = useRef<HTMLElement | null>(null);
-  const settingsPanel = useRef<HTMLDivElement>(null), nextRequested = useRef(false);
+  const nextRequested = useRef(false);
   const danmaku = useDanmaku(media.id, `${media.size}:${media.modifiedAt || ""}`);
   const fullscreen = pageFullscreen || systemFullscreen;
   const notify = useCallback((message: string) => { setToast(message); clearTimeout(toastTimer.current); toastTimer.current = setTimeout(() => setToast(""), 1400); }, []);
@@ -44,7 +60,7 @@ export function VideoPlayer(props: Props) {
   const show = useCallback(() => { setVisible(true); clearTimeout(hideTimer.current); hideTimer.current = setTimeout(() => {
     if (!stateRef.current.paused && !panelRef.current && !draggingRange.current && !pointer.current && !(inputMode.current === "keyboard" && stage.current?.contains(document.activeElement))) setVisible(false);
   }, 2600); }, []);
-  const closePanel = useCallback(() => { setPanel(""); panelRef.current = ""; const opener = panelOpener.current; (opener?.isConnected ? opener : stage.current)?.focus({ preventScroll: true }); show(); }, [show]);
+  const closePanel = useCallback(() => { settingsPanel.current?.close(); setPanel(""); panelRef.current = ""; const opener = panelOpener.current; (opener?.isConnected ? opener : stage.current)?.focus({ preventScroll: true }); show(); }, [show]);
   const nextEpisode = useCallback(() => { if (nextRequested.current || !latest.current.nextMedia || !latest.current.onNext) return; nextRequested.current = true; latest.current.onNext(); }, []);
   useEffect(() => { nextRequested.current = false; }, [media.id]);
   useEffect(() => { if (panel) settingsPanel.current?.querySelector<HTMLElement>("button,input,select")?.focus({ preventScroll: true }); }, [panel]);
@@ -186,7 +202,7 @@ export function VideoPlayer(props: Props) {
           <button aria-label={fullscreen ? "退出全屏" : "全屏"} onClick={() => void fullscreenToggle()}>{fullscreen ? <Minimize size={21} /> : <Maximize size={21} />}</button>
         </div>
       </div>}
-      {!locked && panel && <div ref={settingsPanel} className="lmd-settings-panel" onPointerDown={e => e.stopPropagation()}><header><strong>{panel === "subtitles" ? "字幕" : panel === "danmaku" ? "弹幕" : "播放设置"}</strong><button aria-label="关闭设置" onClick={closePanel}><X size={18} /></button></header>
+      {!locked && panel && <dialog ref={settingsPanel} onCancel={e => { e.preventDefault(); closePanel(); }} className="lmd-settings-panel" aria-label={panel === "subtitles" ? "字幕" : panel === "danmaku" ? "弹幕" : "播放设置"} onPointerDown={e => e.stopPropagation()}><header><strong>{panel === "subtitles" ? "字幕" : panel === "danmaku" ? "弹幕" : "播放设置"}</strong><button aria-label="关闭设置" onClick={closePanel}><X size={18} /></button></header>
         {panel === "subtitles" && <div className="lmd-panel-fields"><label>字幕轨道<select value={subtitleId} onChange={e => { setSubtitleId(e.target.value); setSubtitleError(""); setSubtitleFallbackReason(""); }}><option value="off">关闭字幕</option>{media.subtitles.map(s => <option key={s.id} value={s.id}>{s.language} · {s.format} · {s.name}</option>)}</select></label>
           {selected && ["ASS", "SSA"].includes(selected.format) && <label>渲染方式<select value={subtitleMode} onChange={e => { setSubtitleMode(e.target.value as "styled" | "text"); setSubtitleError(""); setSubtitleFallbackReason(""); }}><option value="styled">ASS 特效 · libass</option><option value="text">纯文本后备模式</option></select></label>}
           <label>延后秒数<input type="number" min="-3600" max="3600" step="0.1" value={delay} onChange={e => setDelay(Number(e.target.value) || 0)} /></label><p>正值延后，负值提前。字幕与原视频时间同步。</p>{subtitleError && <p role="status" className="lmd-panel-message">{subtitleError}</p>}</div>}
@@ -194,9 +210,9 @@ export function VideoPlayer(props: Props) {
         {panel === "settings" && <div className="lmd-panel-fields"><label>播放速度<select value={state.playbackRate} onChange={e => core?.setPlaybackRate(+e.target.value)}>{[0.5, 0.75, 1, 1.25, 1.5, 2, 3].map(rate => <option key={rate} value={rate}>{rate}×</option>)}</select></label>
           <label>长按倍速<select value={holdRate} onChange={e => { setHoldRate(+e.target.value); persist("lmd:player:holdRate", +e.target.value); }}><option value={2}>2×</option><option value={3}>3×</option></select></label>
           <label>音轨<select value={state.audioTrackId ?? ""} disabled={state.audioTrackId === null} onChange={e => void core?.selectAudioTrack(e.target.value)}>{state.tracks.some(t => t.type === "audio") ? state.tracks.filter(t => t.type === "audio").map((t, index) => <option key={t.id} value={t.id}>{audioTrackLabel(t, index)}</option>) : <option value="">无音轨</option>}</select></label>
-          <button onClick={() => openPanel("danmaku")}>弹幕来源与校准</button><button onClick={() => core?.setMuted(!state.muted)}>{state.muted ? "取消静音" : "静音"}</button><p>{ios() ? "音量请使用设备按键。左侧滑动只调节网页画面亮度。" : "左右键快进快退，长按右键临时倍速，F 全屏。"}</p>
+          <button onClick={() => openPanel("danmaku")}>弹幕来源与校准</button><button onClick={() => core?.setMuted(!state.muted)}>{state.muted ? "取消静音" : "静音"}</button><p>{touchControls ? `单击显示或隐藏控制栏，双击播放或暂停；横滑调整进度，左侧竖滑调节网页画面亮度，${ios() ? "音量请使用设备按键" : "右侧竖滑调节音量"}；播放时长按画面临时倍速，松开恢复。` : "左右键快进快退，长按右键临时倍速，F 全屏。"}</p>
           <details><summary>播放信息</summary><p>{state.strategy || "准备中"} · {state.transport}</p><p>首帧 {state.firstFrameMs ?? "—"} ms · Seek {state.lastSeekMs ?? "—"} ms</p><p>{media.width} × {media.height}{media.hdr ? ` · ${media.hdr}` : ""}</p></details></div>}
-      </div>}
+      </dialog>}
     </div>
     {subtitleError && !panel && <div className="lmd-subtitle-notice" role="status">{subtitleError}<button onClick={() => openPanel("subtitles")}>字幕设置</button></div>}
     {pageMode && !fullscreen && <div className="player-episode-nav" aria-label="剧集导航"><button className="previous-episode-button" onClick={onPrevious} disabled={!previousMedia}><SkipBack size={18} /><span>{previousMedia ? "上一集" : "已是第一集"}</span></button><button className="next-episode-button" onClick={nextEpisode} disabled={!nextMedia}><span>{nextMedia ? "下一集" : "已是最后一集"}</span><SkipForward size={18} /></button></div>}
