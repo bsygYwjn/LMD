@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, LockKeyhole, UnlockKeyhole, Settings2, Captions, MessageSquare, SkipBack, SkipForward, RotateCcw, RotateCw, X, LoaderCircle } from "lucide-react";
-import { PlaybackCore, type PlaybackState } from "./core";
+import { PlaybackCore, audioTrackLabel, type PlaybackState } from "./core";
 import { SubtitleOverlay, type Subtitle, type FontAsset } from "./subtitles";
 import { DanmakuOverlay, DanmakuPanel, useDanmaku, stored, persist } from "./danmaku";
 import { releaseMediaSession, updateMediaSession } from "../media-session";
@@ -162,7 +162,7 @@ export function VideoPlayer(props: Props) {
         {panel === "danmaku" && <DanmakuPanel controller={danmaku} currentTime={state.currentTime} />}
         {panel === "settings" && <div className="lmd-panel-fields"><label>播放速度<select value={state.playbackRate} onChange={e => core?.setPlaybackRate(+e.target.value)}>{[0.5, 0.75, 1, 1.25, 1.5, 2, 3].map(rate => <option key={rate} value={rate}>{rate}×</option>)}</select></label>
           <label>长按倍速<select value={holdRate} onChange={e => { setHoldRate(+e.target.value); persist("lmd:player:holdRate", +e.target.value); }}><option value={2}>2×</option><option value={3}>3×</option></select></label>
-          <label>音轨<select value={state.audioTrackId || ""} disabled={!state.audioTrackId} onChange={e => void core?.selectAudioTrack(e.target.value)}>{state.tracks.filter(t => t.type === "audio").map(t => <option key={t.id} value={t.id}>{t.language} · {t.title || t.codec.toUpperCase()} · {t.channels} 声道</option>)}</select></label>
+          <label>音轨<select value={state.audioTrackId ?? ""} disabled={state.audioTrackId === null} onChange={e => void core?.selectAudioTrack(e.target.value)}>{state.tracks.some(t => t.type === "audio") ? state.tracks.filter(t => t.type === "audio").map((t, index) => <option key={t.id} value={t.id}>{audioTrackLabel(t, index)}</option>) : <option value="">无音轨</option>}</select></label>
           <button onClick={() => openPanel("danmaku")}>弹幕来源与校准</button><button onClick={() => core?.setMuted(!state.muted)}>{state.muted ? "取消静音" : "静音"}</button><p>{ios() ? "音量请使用设备按键。左侧滑动只调节网页画面亮度。" : "左右键快进快退，长按右键临时倍速，F 全屏。"}</p>
           <details><summary>播放信息</summary><p>{state.strategy || "准备中"} · {state.transport}</p><p>首帧 {state.firstFrameMs ?? "—"} ms · Seek {state.lastSeekMs ?? "—"} ms</p><p>{media.width} × {media.height}{media.hdr ? ` · ${media.hdr}` : ""}</p></details></div>}
       </div>}
