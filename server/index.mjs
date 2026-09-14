@@ -3412,7 +3412,7 @@ const server = createServer(async (request, response) => {
   response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   response.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
   response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
-  response.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' blob:; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data: blob:; connect-src 'self' blob:; worker-src 'self' blob:; frame-src 'self' blob:; child-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'");
+  response.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' blob:; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data: blob:; connect-src 'self' blob:; worker-src 'self' blob:; frame-src 'self' blob:; child-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'");
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader("Referrer-Policy", "no-referrer");
   response.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
@@ -3917,7 +3917,7 @@ const server = createServer(async (request, response) => {
       const filePath = url.searchParams.get("variant") === "remux" && media.remuxPath ? media.remuxPath : media.path;
       return streamFile(request, response, filePath, true);
     }
-    if (request.method === "GET" && /^\/api\/media\/[^/]+\/bitmap-subtitles\/[^/]+/.test(pathname)) {
+    if (["GET", "HEAD"].includes(request.method) && /^\/api\/media\/[^/]+\/bitmap-subtitles\/[^/]+/.test(pathname)) {
       const handled = await bitmapSubtitleService.handleRequest(request, response, url, pathname,
         { authorizedMediaForRequest, playbackInfo: playbackService.info, sendJson, streamFile })
         .catch((error) => {

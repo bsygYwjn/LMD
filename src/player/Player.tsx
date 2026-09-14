@@ -23,7 +23,8 @@ export function VideoPlayer(props: Props) {
   const [visible, setVisible] = useState(true), [panel, setPanel] = useState<"" | "subtitles" | "danmaku" | "settings">("");
   const [locked, setLocked] = useState(false), [pageFullscreen, setPageFullscreen] = useState(false), [systemFullscreen, setSystemFullscreen] = useState(false);
   const [subtitleId, setSubtitleId] = useState("off"), [delay, setDelay] = useState(0), [subtitleMode, setSubtitleMode] = useState<"styled" | "text">("styled");
-  const [subtitleError, setSubtitleError] = useState(""), [toast, setToast] = useState(""), [preview, setPreview] = useState<number | null>(null);
+  const [subtitleError, setSubtitleError] = useState(""), [subtitleFallbackReason, setSubtitleFallbackReason] = useState("");
+  const [toast, setToast] = useState(""), [preview, setPreview] = useState<number | null>(null);
   const [holdRate, setHoldRate] = useState(() => stored("lmd:player:holdRate", 3)), [brightness, setBrightness] = useState(1);
   const [boosting, setBoosting] = useState(false);
   const stateRef = useRef(state), latest = useRef(props), visibleRef = useRef(visible), lockedRef = useRef(locked), panelRef = useRef(panel);
@@ -36,6 +37,7 @@ export function VideoPlayer(props: Props) {
   const danmaku = useDanmaku(media.id, `${media.size}:${media.modifiedAt || ""}`);
   const fullscreen = pageFullscreen || systemFullscreen;
   const notify = useCallback((message: string) => { setToast(message); clearTimeout(toastTimer.current); toastTimer.current = setTimeout(() => setToast(""), 1400); }, []);
+  const handleSubtitleFallback = useCallback((message: string) => { setSubtitleFallbackReason(message); setSubtitleMode("text"); }, []);
   const show = useCallback(() => { setVisible(true); clearTimeout(hideTimer.current); hideTimer.current = setTimeout(() => {
     if (!stateRef.current.paused && !panelRef.current && !stage.current?.contains(document.activeElement === stage.current ? null : document.activeElement)) setVisible(false);
   }, 2600); }, []);
@@ -51,7 +53,7 @@ export function VideoPlayer(props: Props) {
   }, [pageFullscreen]);
   useEffect(() => {
     if (!video.current || media.demo) return;
-    setState(initial); setSubtitleId("off"); setDelay(0); setLocked(false); setPanel(""); setSubtitleError("");
+    setState(initial); setSubtitleId("off"); setDelay(0); setLocked(false); setPanel(""); setSubtitleError(""); setSubtitleFallbackReason("");
     const current = new PlaybackCore(video.current); coreRef.current = current; setCore(current);
     current.setVolume(stored("lmd:player:volume", 1)); current.setPlaybackRate(stored("lmd:player:rate", 1));
     const unsubscribe = current.subscribe((value, event) => {
@@ -131,7 +133,8 @@ export function VideoPlayer(props: Props) {
       onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={e => pointerUp(e)} onPointerCancel={e => pointerUp(e, true)} onMouseMove={() => { if (!locked) show(); }} onContextMenu={e => { if (boosting) e.preventDefault(); }}>
       {media.demo ? <div className="lmd-demo"><Play size={56} /><h2>你的私人放映室</h2><p>原片直放 · 按需兼容 · 字幕与弹幕</p></div> : <video ref={video} playsInline preload="metadata" />}
       <div className="lmd-brightness" style={{ opacity: 1 - brightness }} />
-      {core && <><DanmakuOverlay core={core} controller={danmaku} /><SubtitleOverlay core={core} subtitle={selected} fonts={media.fonts} delay={delay} mode={subtitleMode} report={setSubtitleError} /></>}
+      {core && <><DanmakuOverlay core={core} controller={danmaku} /><SubtitleOverlay core={core} subtitle={selected} fonts={media.fonts} delay={delay} mode={subtitleMode}
+        fallbackReason={subtitleFallbackReason} onFallback={handleSubtitleFallback} report={setSubtitleError} /></>}
       {!media.demo && state.buffering && !state.error && <div className="lmd-loading"><LoaderCircle className="spin" size={32} /><span>{state.seeking ? "正在定位…" : "准备播放…"}</span></div>}
       {!media.demo && (state.autoplayBlocked || state.error) && <div className="lmd-play-message"><p>{state.error || "点击开始播放"}</p><button onClick={() => state.error ? void core?.retry() : void core?.play()}><Play size={18} />{state.error ? "重试播放" : "播放"}</button></div>}
       {preview !== null && <div className="lmd-seek-feedback"><strong>{time(preview)}</strong><span>/ {time(state.duration)}</span></div>}
@@ -156,8 +159,8 @@ export function VideoPlayer(props: Props) {
         </div>
       </div>}
       {!locked && panel && <div className="lmd-settings-panel" onPointerDown={e => e.stopPropagation()}><header><strong>{panel === "subtitles" ? "字幕" : panel === "danmaku" ? "弹幕" : "播放设置"}</strong><button aria-label="关闭设置" onClick={() => setPanel("")}><X size={18} /></button></header>
-        {panel === "subtitles" && <div className="lmd-panel-fields"><label>字幕轨道<select value={subtitleId} onChange={e => setSubtitleId(e.target.value)}><option value="off">关闭字幕</option>{media.subtitles.map(s => <option key={s.id} value={s.id}>{s.language} · {s.format} · {s.name}</option>)}</select></label>
-          {selected && ["ASS", "SSA"].includes(selected.format) && <label>渲染方式<select value={subtitleMode} onChange={e => setSubtitleMode(e.target.value as "styled" | "text")}><option value="styled">ASS 特效 · libass</option><option value="text">纯文本后备模式</option></select></label>}
+        {panel === "subtitles" && <div className="lmd-panel-fields"><label>字幕轨道<select value={subtitleId} onChange={e => { setSubtitleId(e.target.value); setSubtitleError(""); setSubtitleFallbackReason(""); }}><option value="off">关闭字幕</option>{media.subtitles.map(s => <option key={s.id} value={s.id}>{s.language} · {s.format} · {s.name}</option>)}</select></label>
+          {selected && ["ASS", "SSA"].includes(selected.format) && <label>渲染方式<select value={subtitleMode} onChange={e => { setSubtitleMode(e.target.value as "styled" | "text"); setSubtitleError(""); setSubtitleFallbackReason(""); }}><option value="styled">ASS 特效 · libass</option><option value="text">纯文本后备模式</option></select></label>}
           <label>延后秒数<input type="number" min="-3600" max="3600" step="0.1" value={delay} onChange={e => setDelay(Number(e.target.value) || 0)} /></label><p>正值延后，负值提前。字幕与原视频时间同步。</p>{subtitleError && <p role="status" className="lmd-panel-message">{subtitleError}</p>}</div>}
         {panel === "danmaku" && <DanmakuPanel controller={danmaku} currentTime={state.currentTime} />}
         {panel === "settings" && <div className="lmd-panel-fields"><label>播放速度<select value={state.playbackRate} onChange={e => core?.setPlaybackRate(+e.target.value)}>{[0.5, 0.75, 1, 1.25, 1.5, 2, 3].map(rate => <option key={rate} value={rate}>{rate}×</option>)}</select></label>
