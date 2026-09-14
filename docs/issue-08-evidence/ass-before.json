@@ -1,0 +1,7 @@
+{
+  "base": "http://127.0.0.1:8096",
+  "title": "LMD-视频验收-S01E01-基础直放",
+  "visualApproval": "NOT ACCEPTED: inspect positioning, colors and motion screenshots",
+  "cases": [],
+  "error": "production CSP must permit WASM only"
+}
