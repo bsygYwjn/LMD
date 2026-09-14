@@ -84,6 +84,7 @@ export class PlaybackCore extends EventTarget {
   private fallbackLevel = 0;
   private nativeFallback = false;
   private recovering = false;
+  private retrying: Promise<void> | null = null;
   private ended = false;
   private startedAt = 0;
   private seekStarted = 0;
@@ -147,6 +148,7 @@ export class PlaybackCore extends EventTarget {
     this.emit(event, patch);
   }
   async load(mediaId: string, options: { startTime?: number; autoplay?: boolean } = {}) {
+    this.mediaInfo = null; this.capabilities = null;
     this.sessionUpdates.cancel(); this.pendingSeek = false; this.desiredAudioTrackId = null;
     this.sequence++; this.abort.abort(); this.abort = new AbortController();
     const sequence = this.sequence; this.switching = true; this.releaseTransport();
@@ -159,7 +161,7 @@ export class PlaybackCore extends EventTarget {
       this.mediaInfo = info; this.capabilities = capabilities;
       this.emit("loadedmetadata", { duration: info.duration, tracks: info.tracks });
       await this.openSession(options.startTime || 0);
-    } catch (error) { this.fail(error); }
+    } catch (error) { if (sequence === this.sequence && !this.disposed) this.fail(error); }
   }
   private teardownMediaTransport() {
     clearInterval(this.heartbeat); this.heartbeat = undefined;
@@ -389,7 +391,17 @@ export class PlaybackCore extends EventTarget {
       void this.keepAlive();
     } else await this.queueSessionUpdate(target, this.desiredAudioTrackId, true);
   }
-  async retry() {
+  retry(): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    if (this.retrying) return this.retrying;
+    this.retrying = this.retryPlayback().finally(() => { this.retrying = null; });
+    return this.retrying;
+  }
+  private async retryPlayback() {
+    if (!this.mediaInfo || !this.capabilities) {
+      await this.load(this.state.mediaId, { startTime: this.state.currentTime, autoplay: this.intent });
+      return;
+    }
     this.networkRetry = 0; this.sessionUpdates.cancel(); this.pendingSeek = false;
     const target = this.currentTime, existing = this.session;
     if (!existing) { await this.openSession(target); return; }
@@ -398,13 +410,26 @@ export class PlaybackCore extends EventTarget {
     this.teardownMediaTransport();
     this.emit("seeking", { currentTime: target, seeking: true, buffering: true, error: "", errorCode: "", buffered: [] });
     try {
-      const refreshed = await api<Session>(`/api/playback-sessions/${existing.sessionId}`, { position: target }, "PATCH", this.abort.signal);
+      let refreshed: Session;
+      try {
+        refreshed = await api<Session>(`/api/playback-sessions/${existing.sessionId}`, { position: target, generation: existing.generation }, "PATCH", this.abort.signal);
+      } catch (error) {
+        // A failed/aborted seek may already have advanced the server generation.
+        // Reconcile it before trying to restart the failed pipeline.
+        if ((error as { code?: string }).code !== "STALE_SESSION") throw error;
+        refreshed = await api<Session>(`/api/playback-sessions/${existing.sessionId}`, undefined, "GET", this.abort.signal);
+      }
       if (sequence !== this.sequence || this.disposed || this.session?.sessionId !== existing.sessionId) return;
-      if (refreshed.error) throw Object.assign(new Error(refreshed.error.message), { code: refreshed.error.code });
+      this.session = refreshed;
+      if (refreshed.error) {
+        refreshed = await api<Session>(`/api/playback-sessions/${existing.sessionId}`, { seekTime: target, generation: refreshed.generation }, "PATCH", this.abort.signal);
+        if (sequence !== this.sequence || this.disposed || this.session?.sessionId !== existing.sessionId) return;
+      }
       this.attachSession(refreshed, target, sequence);
     } catch (error) {
       if (sequence !== this.sequence || this.disposed) return;
       if ((error as { status?: number }).status === 410) await this.openSession(target);
+      else if ((error as { code?: string }).code === "SOURCE_CHANGED") await this.load(this.state.mediaId, { startTime: target, autoplay: this.intent });
       else this.fail(error);
     }
   }
