@@ -112,4 +112,49 @@ if (process.env.LMD_SKIP_FFMPEG_TEST !== "1") {
   console.log("PASS 增量 box 读取与截断检测");
 }
 
+async function* syntheticMdat(payloadBytes, chunkBytes = 64 * 1024) {
+  const header = Buffer.alloc(8);
+  header.writeUInt32BE(payloadBytes + 8, 0);
+  header.write("mdat", 4, 4, "ascii");
+  yield header;
+  const block = Buffer.alloc(chunkBytes, 7);
+  for (let remaining = payloadBytes, count = 0; remaining > 0; count++) {
+    const size = Math.min(remaining, block.length);
+    yield block.subarray(0, size);
+    remaining -= size;
+    if (count % 128 === 127) await new Promise(resolve => setImmediate(resolve));
+  }
+}
+
+async function benchmarkMdat(payloadBytes, concurrency = 1) {
+  const started = performance.now(), rssBefore = process.memoryUsage().rss;
+  let peakRss = rssBefore, timer = setInterval(() => { peakRss = Math.max(peakRss, process.memoryUsage().rss); }, 1);
+  timer.unref();
+  const parse = async () => {
+    let total = 0, maxChunk = 0, count = 0;
+    for await (const item of readMp4Boxes(syntheticMdat(payloadBytes))) {
+      assert.equal(item.type, "mdat");
+      for await (const chunk of item.chunks()) { total += chunk.length; maxChunk = Math.max(maxChunk, chunk.length); count++; }
+    }
+    assert.equal(total, payloadBytes + 8);
+    assert.ok(maxChunk <= 64 * 1024, "大 mdat 必须保持分块消费，不能合并成完整 Buffer");
+    return count;
+  };
+  const chunkCounts = await Promise.all(Array.from({ length: concurrency }, parse));
+  clearInterval(timer); peakRss = Math.max(peakRss, process.memoryUsage().rss);
+  return { boxMiB: Number(((payloadBytes + 8) / 1024 ** 2).toFixed(1)), concurrency, elapsedMs: Math.round(performance.now() - started),
+    peakRssDeltaMiB: Number(((peakRss - rssBefore) / 1024 ** 2).toFixed(1)), chunks: chunkCounts.reduce((sum, count) => sum + count, 0) };
+}
+
+{
+  const mib = 1024 ** 2;
+  const linear64 = await benchmarkMdat(64 * mib - 8);
+  const linear128 = await benchmarkMdat(128 * mib - 8);
+  assert.ok(linear128.elapsedMs <= linear64.elapsedMs * 4 + 100,
+    `128 MiB 处理时间应接近线性：64 MiB=${linear64.elapsedMs}ms，128 MiB=${linear128.elapsedMs}ms`);
+  const concurrent5 = await benchmarkMdat(64 * mib - 8, 5);
+  const concurrent10 = await benchmarkMdat(64 * mib - 8, 10);
+  console.log(`PASS 大 mdat 流式基准 ${JSON.stringify([linear64, linear128, concurrent5, concurrent10])}`);
+}
+
 console.log("playback-mp4 测试全部通过");

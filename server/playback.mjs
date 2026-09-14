@@ -1,12 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { METADATA_VERSION, normalizePlaybackSettings, planPlayback, playbackError } from "./playback-planner.mjs";
-import { readMp4Boxes, parseInitialization, fragmentTiming, rewriteInitializationDuration } from "./playback-mp4.mjs";
+import { readMp4Boxes, bufferMp4Box, parseInitialization, fragmentTiming, rewriteInitializationDuration } from "./playback-mp4.mjs";
 
 const hash = value => createHash("sha256").update(value).digest("hex");
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+const HLS_FRAGMENT_DURATION_SECONDS = 4;
+const HLS_TARGET_DURATION_SECONDS = 6;
 export const sourceSignature = media => `${Number(media.size)}:${media.modifiedAt}`;
 
 export function createPlaybackService(deps) {
@@ -83,18 +85,39 @@ export function createPlaybackService(deps) {
     try { await cleaning; } finally { cleaning = null; }
   }
 
-  async function publish(pipeline, name, buffer) {
-    await clean(buffer.length);
+  async function publishChunks(pipeline, name, chunks, size) {
+    await clean(size);
     if (pipeline.cancelled) throw playbackError("CANCELLED", "播放处理已取消", 409);
     const file = path.join(pipeline.directory, name);
-    await writeFile(`${file}.part`, buffer);
-    await rename(`${file}.part`, file);
+    const temporary = `${file}.part`;
+    let handle = null, written = 0;
+    try {
+      handle = await open(temporary, "w");
+      for await (const chunk of chunks) {
+        if (pipeline.cancelled || stopped) throw playbackError("CANCELLED", "播放处理已取消", 409);
+        let offset = 0;
+        while (offset < chunk.length) {
+          const result = await handle.write(chunk, offset, chunk.length - offset);
+          if (!result.bytesWritten) throw new Error("Unable to write MP4 fragment");
+          offset += result.bytesWritten;
+          written += result.bytesWritten;
+        }
+      }
+      if (written !== size) throw new Error("Incomplete MP4 fragment");
+      await handle.close(); handle = null;
+      await rename(temporary, file);
+    } catch (error) {
+      await handle?.close().catch(() => {});
+      await rm(temporary, { force: true }).catch(() => {});
+      throw error;
+    }
     const previous = entries.get(file);
-    cacheBytes += buffer.length - (previous?.size || 0);
-    entries.set(file, { size: buffer.length, accessed: Date.now(), pins: 0, pipeline });
-    metrics.bytesGenerated += buffer.length;
+    cacheBytes += size - (previous?.size || 0);
+    entries.set(file, { size, accessed: Date.now(), pins: 0, pipeline });
+    metrics.bytesGenerated += size;
     return file;
   }
+  const publish = (pipeline, name, buffer) => publishChunks(pipeline, name, [buffer], buffer.length);
 
   async function chooseEncoder() {
     if (settings.encoder !== "auto") return settings.encoder;
@@ -132,7 +155,8 @@ export function createPlaybackService(deps) {
       if (plan.audio.action === "COPY") args.push("-c:a", "copy");
       else args.push("-c:a", "aac", "-b:a", plan.audio.channels > 2 ? "384k" : "256k", "-ac", String(plan.audio.channels || 2), "-ar", "48000");
     } else args.push("-an");
-    args.push("-avoid_negative_ts", "disabled", "-max_muxing_queue_size", "4096", "-movflags", "+empty_moov+default_base_moof+frag_keyframe", "-f", "mp4", "pipe:1");
+    args.push("-avoid_negative_ts", "disabled", "-max_muxing_queue_size", "4096", "-movflags", "+empty_moov+default_base_moof+frag_keyframe",
+      "-frag_duration", String(HLS_FRAGMENT_DURATION_SECONDS * 1_000_000), "-f", "mp4", "pipe:1");
     return args;
   }
 
@@ -184,7 +208,7 @@ export function createPlaybackService(deps) {
         lastOutput = Date.now();
         if (pipeline.cancelled || stopped) break;
         if (!tracks) {
-          initialization.push(box.buffer);
+          initialization.push(await bufferMp4Box(box));
           if (box.type !== "moov") continue;
           const init = rewriteInitializationDuration(Buffer.concat(initialization), pipeline.metadata.duration);
           initialization = [];
@@ -192,7 +216,7 @@ export function createPlaybackService(deps) {
           pipeline.initPath = await publish(pipeline, "init.mp4", init);
           continue;
         }
-        if (box.type === "moof") { moof = box.buffer; continue; }
+        if (box.type === "moof") { moof = await bufferMp4Box(box); continue; }
         if (box.type !== "mdat" || !moof) continue;
         const timing = fragmentTiming(moof, tracks);
         if (pipeline.timeOffset == null) {
@@ -202,10 +226,12 @@ export function createPlaybackService(deps) {
           pipeline.timeOffset = firstInputTime - timing.start;
         }
         const sequence = pipeline.fragments.length;
-        const file = await publish(pipeline, `${sequence}.m4s`, Buffer.concat([moof, box.buffer])); moof = null;
+        const fragmentSize = moof.length + box.size;
+        const fragmentChunks = (async function* () { yield moof; for await (const chunk of box.chunks()) yield chunk; })();
+        const file = await publishChunks(pipeline, `${sequence}.m4s`, fragmentChunks, fragmentSize); moof = null;
         const fragment = { sequence, file, start: timing.start, end: timing.end,
           sourceStart: timing.start + pipeline.timeOffset, sourceEnd: timing.end + pipeline.timeOffset };
-        pipeline.fragments.push(fragment); pipeline.maxDuration = Math.max(pipeline.maxDuration, timing.end - timing.start);
+        pipeline.fragments.push(fragment);
         pipeline.accessed = Date.now(); refreshPublished(pipeline); wake(pipeline);
         // Backpressure reaches FFmpeg through its stdout pipe. It cannot keep
         // producing files while viewers pause or stop consuming this window.
@@ -250,14 +276,14 @@ export function createPlaybackService(deps) {
   async function attach(session, target) {
     const { media, metadata, plan } = session;
     const version = metadata.sourceSignature;
-    const config = JSON.stringify({ version, video: plan.video, audio: plan.audio, encoder: settings.encoder, packaging: 1 });
+    const config = JSON.stringify({ version, video: plan.video, audio: plan.audio, encoder: settings.encoder, packaging: 2 });
     let pipeline = [...pipelines.values()].find(item => item.config === config && item.media.id === media.id && !item.cancelled && !item.error && !item.evicted
       && item.target <= target && (item.fragments.at(-1)?.sourceEnd || item.target) >= target);
     if (!pipeline) {
       const key = hash(`${media.id}:${config}:${target}:${randomUUID()}`);
       pipeline = { key, config, media, metadata, plan, target, directory: path.join(root, key), consumers: new Set(),
         waiters: new Set(), fragments: [], visible: [], published: new Set(), timeOffset: null, initPath: null, child: null,
-        cancelled: false, eof: false, evicted: false, error: null, accessed: Date.now(), maxDuration: 1 };
+        cancelled: false, eof: false, evicted: false, error: null, accessed: Date.now(), targetDuration: HLS_TARGET_DURATION_SECONDS };
       pipelines.set(key, pipeline);
     } else metrics.cacheHits++;
     clearTimeout(pipeline.releaseTimer); pipeline.consumers.add(session.id); session.pipeline = pipeline; session.position = target;
@@ -401,12 +427,11 @@ export function createPlaybackService(deps) {
       session.lastSeen = Date.now(); session.heartbeatSeen = true;
       if (resource === "manifest.m3u8") {
         if (pipeline.error) throw pipeline.error;
-        // Only finished, readable fragments are ever listed: native HLS players
-        // wait forever on announcements that never resolve. VOD type + ENDLIST
-        // are added as soon as the window is complete so players treat the
-        // timeline as final instead of as a live edge.
-        const parts = ["#EXTM3U", "#EXT-X-VERSION:7", `#EXT-X-TARGETDURATION:${Math.ceil(pipeline.maxDuration)}`,
-          "#EXT-X-PLAYLIST-TYPE:VOD", `#EXT-X-MEDIA-SEQUENCE:${pipeline.visible[0]?.sequence || 0}`,
+        // The producer exposes a sliding live playlist until FFmpeg reaches EOF.
+        // TARGETDURATION is fixed when the pipeline is created; changing it while
+        // a native HLS client is polling can delay refreshes or stop playback.
+        const parts = ["#EXTM3U", "#EXT-X-VERSION:7", `#EXT-X-TARGETDURATION:${pipeline.targetDuration}`,
+          `#EXT-X-MEDIA-SEQUENCE:${pipeline.visible[0]?.sequence || 0}`,
           `#EXT-X-MAP:URI="init.mp4?generation=${session.generation}"`];
         for (const fragment of pipeline.visible) parts.push(`#EXTINF:${(fragment.end - fragment.start).toFixed(6)},`, `${fragment.sequence}.m4s?generation=${session.generation}`);
         if (pipeline.eof) parts.push("#EXT-X-ENDLIST");

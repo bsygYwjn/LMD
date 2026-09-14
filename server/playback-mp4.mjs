@@ -66,21 +66,119 @@ export function fragmentTiming(moofBuffer, tracks) {
   return { start: primary.start, end: primary.end, tracks: timings };
 }
 
-export async function* readMp4Boxes(readable, maxBytes = 128 * 1024 ** 2) {
-  let pending = Buffer.alloc(0);
-  for await (const chunk of readable) {
-    pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-    while (pending.length >= 8) {
-      let size = pending.readUInt32BE(0);
-      if (size === 1) { if (pending.length < 16) break; size = Number(pending.readBigUInt64BE(8)); }
-      if (!Number.isSafeInteger(size) || size < 8 || size > maxBytes) throw new Error("MP4 fragment exceeds safety limit");
-      if (pending.length < size) break;
-      yield { type: pending.toString("ascii", 4, 8), buffer: pending.subarray(0, size) };
-      pending = pending.subarray(size);
-    }
-    if (pending.length > maxBytes) throw new Error("MP4 buffer exceeds limit");
+class AsyncByteReader {
+  constructor(readable) {
+    this.iterator = readable[Symbol.asyncIterator]();
+    this.queue = [];
+    this.offset = 0;
+    this.length = 0;
+    this.done = false;
   }
-  if (pending.length) throw new Error("Incomplete MP4 fragment");
+
+  async fill(required) {
+    while (!this.done && this.length < required) {
+      const next = await this.iterator.next();
+      if (next.done) { this.done = true; break; }
+      const chunk = Buffer.isBuffer(next.value) ? next.value : Buffer.from(next.value);
+      if (!chunk.length) continue;
+      this.queue.push(chunk);
+      this.length += chunk.length;
+    }
+  }
+
+  async peek(length) {
+    await this.fill(length);
+    if (!this.length) return null;
+    if (this.length < length) return Buffer.alloc(0);
+    const first = this.queue[0].subarray(this.offset);
+    if (first.length >= length) return first.subarray(0, length);
+    const result = Buffer.allocUnsafe(length);
+    let written = 0;
+    for (let index = 0; written < length; index++) {
+      const chunk = this.queue[index].subarray(index ? 0 : this.offset);
+      const take = Math.min(chunk.length, length - written);
+      chunk.copy(result, written, 0, take);
+      written += take;
+    }
+    return result;
+  }
+
+  async *take(length) {
+    let remaining = length;
+    while (remaining > 0) {
+      await this.fill(1);
+      if (!this.length) throw new Error("Incomplete MP4 fragment");
+      const first = this.queue[0];
+      const available = first.length - this.offset;
+      const count = Math.min(available, remaining);
+      const chunk = first.subarray(this.offset, this.offset + count);
+      this.offset += count;
+      this.length -= count;
+      remaining -= count;
+      if (this.offset === first.length) { this.queue.shift(); this.offset = 0; }
+      yield chunk;
+    }
+  }
+}
+
+class StreamingMp4Box {
+  constructor(reader, type, size) {
+    this.reader = reader;
+    this.type = type;
+    this.size = size;
+    this.remaining = size;
+    this.reading = false;
+  }
+
+  async *chunks() {
+    if (this.reading) throw new Error("MP4 box is already being consumed");
+    this.reading = true;
+    try {
+      for await (const chunk of this.reader.take(this.remaining)) {
+        this.remaining -= chunk.length;
+        yield chunk;
+      }
+    } finally { this.reading = false; }
+  }
+
+  async drain() {
+    for await (const _ of this.chunks()) void _;
+  }
+}
+
+export async function bufferMp4Box(box) {
+  const buffer = Buffer.allocUnsafe(box.size);
+  let offset = 0;
+  for await (const chunk of box.chunks()) {
+    chunk.copy(buffer, offset);
+    offset += chunk.length;
+  }
+  if (offset !== box.size) throw new Error("Incomplete MP4 fragment");
+  return buffer;
+}
+
+// Each box is yielded as soon as its header is available. Consumers can stream
+// `box.chunks()` straight to disk, so a large mdat never needs to be repeatedly
+// concatenated or retained as a second full-size Buffer. If a consumer ignores
+// a box, it is drained before the next header is parsed.
+export async function* readMp4Boxes(readable, maxBytes = 128 * 1024 ** 2) {
+  const reader = new AsyncByteReader(readable);
+  while (true) {
+    const shortHeader = await reader.peek(8);
+    if (shortHeader === null) return;
+    if (shortHeader.length < 8) throw new Error("Incomplete MP4 fragment");
+    let size = shortHeader.readUInt32BE(0), headerSize = 8;
+    if (size === 1) {
+      const extendedHeader = await reader.peek(16);
+      if (!extendedHeader || extendedHeader.length < 16) throw new Error("Incomplete MP4 fragment");
+      size = Number(extendedHeader.readBigUInt64BE(8));
+      headerSize = 16;
+    }
+    if (!Number.isSafeInteger(size) || size < headerSize || size > maxBytes) throw new Error("MP4 fragment exceeds safety limit");
+    const box = new StreamingMp4Box(reader, shortHeader.toString("ascii", 4, 8), size);
+    yield box;
+    if (box.remaining) await box.drain();
+  }
 }
 
 // Progressive output cannot carry a complete timeline: FFmpeg writes an
