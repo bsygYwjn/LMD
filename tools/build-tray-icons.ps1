@@ -19,7 +19,7 @@ if ($document.DocumentElement.GetAttribute('viewBox') -ne '0 0 64 64' -or $paths
 }
 $brandColor = $group.GetAttribute('stroke')
 $strokeWidth = [single]::Parse($group.GetAttribute('stroke-width'), [Globalization.CultureInfo]::InvariantCulture)
-$iconSvg = $source.Replace('<title>LMD</title>', '<title>LMD</title><rect width="64" height="64" rx="14" fill="' + $brandColor + '"/>').Replace('stroke="' + $brandColor + '"', 'stroke="#FFFFFF"')
+$iconSvg = $source.Replace('<title>LMD</title>', '<title>LMD</title><rect width="64" height="64" rx="8" fill="' + $brandColor + '"/>').Replace('stroke="' + $brandColor + '"', 'stroke="#FFFFFF"')
 [System.IO.File]::WriteAllText((Join-Path $brandDirectory 'lmd-icon.svg'), $iconSvg, $utf8)
 [System.IO.File]::WriteAllText((Join-Path $brandDirectory 'lmd-mono.svg'), $source.Replace($brandColor, '#172033'), $utf8)
 [System.IO.File]::WriteAllText((Join-Path $brandDirectory 'lmd-inverse.svg'), $source.Replace($brandColor, '#FFFFFF'), $utf8)
@@ -112,10 +112,14 @@ function Write-BrandPng([string]$Destination, [int]$Size, [string]$Foreground = 
   [System.IO.File]::WriteAllBytes($Destination, [LmdBrandRenderer]::Render($paths, $strokeWidth, $Foreground, $Background, $Size))
 }
 
-function Write-BrandIcon([string]$Destination, [string]$Background = $brandColor) {
+function Write-BrandIcon(
+  [string]$Destination,
+  [string]$Foreground = '#FFFFFF',
+  [string]$Background = $brandColor
+) {
   $sizes = @(16, 20, 24, 32, 40, 48, 64, 128, 256)
   $images = New-Object 'System.Collections.Generic.List[byte[]]'
-  foreach ($size in $sizes) { $images.Add([LmdBrandRenderer]::Render($paths, $strokeWidth, '#FFFFFF', $Background, $size)) }
+  foreach ($size in $sizes) { $images.Add([LmdBrandRenderer]::Render($paths, $strokeWidth, $Foreground, $Background, $size)) }
   $stream = New-Object System.IO.MemoryStream
   $writer = New-Object System.IO.BinaryWriter($stream)
   try {
@@ -142,11 +146,11 @@ function Write-BrandIcon([string]$Destination, [string]$Background = $brandColor
 
 Write-BrandPng (Join-Path $brandDirectory 'lmd-icon.png') 512
 Write-BrandPng (Join-Path $brandDirectory 'lmd-mark.png') 512 $brandColor ''
-Write-BrandPng (Join-Path $projectDirectory 'assets\tray-running.png') 256
-Write-BrandPng (Join-Path $projectDirectory 'assets\tray-stopped.png') 256 '#FFFFFF' '#687386'
-Write-BrandIcon (Join-Path $projectDirectory 'assets\tray-running.ico')
-Write-BrandIcon (Join-Path $projectDirectory 'assets\tray-stopped.ico') '#687386'
-Copy-Item -LiteralPath (Join-Path $projectDirectory 'assets\tray-running.ico') -Destination (Join-Path $brandDirectory 'lmd.ico') -Force
+Write-BrandPng (Join-Path $projectDirectory 'assets\tray-running.png') 256 $brandColor ''
+Write-BrandPng (Join-Path $projectDirectory 'assets\tray-stopped.png') 256 '#687386' ''
+Write-BrandIcon (Join-Path $projectDirectory 'assets\tray-running.ico') $brandColor ''
+Write-BrandIcon (Join-Path $projectDirectory 'assets\tray-stopped.ico') '#687386' ''
+Write-BrandIcon (Join-Path $brandDirectory 'lmd.ico')
 Copy-Item -LiteralPath (Join-Path $brandDirectory 'lmd.ico') -Destination (Join-Path $projectDirectory 'public\favicon.ico') -Force
 Write-BrandPng (Join-Path $publicBrandDirectory 'apple-touch-icon.png') 180
 Write-BrandPng (Join-Path $publicBrandDirectory 'icon-192.png') 192

@@ -570,8 +570,20 @@ export function createMusicService({
       if (revision !== libraryRevision) throw new Error("音乐目录在扫描期间发生变化，请重新扫描。");
       scanContext.phase = "finalizing";
       scanContext.progressPercent = 98;
+      const previousTracksBeforeSave = appState.musicTracks;
       appState.musicTracks = scanned;
-      await saveState();
+      try {
+        await saveState();
+      } catch (error) {
+        const liveLibraryIds = new Set(appState.musicLibraries.map((library) => library.id));
+        const restored = new Map(appState.musicTracks.map((track) => [track.id, track]));
+        for (const track of previousTracksBeforeSave) {
+          if (liveLibraryIds.has(track.libraryId) && !restored.has(track.id)) restored.set(track.id, track);
+        }
+        appState.musicTracks = [...restored.values()];
+        await saveState().catch((restoreError) => console.error(`恢复音乐索引失败：${restoreError.message}`));
+        throw error;
+      }
       await cleanOrphanedCacheFiles();
       await queueAutomaticCompatibleCopies();
       lastCompletedAt = new Date().toISOString();

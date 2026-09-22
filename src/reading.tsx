@@ -278,6 +278,7 @@ function PdfReader({ item }: { item: ReadingItem }) {
     void (async () => {
       try {
         const pdfjs = await loadPdfJs();
+        if (!active) return;
         const task = pdfjs.getDocument({ url: item.fileUrl, enableXfa: false });
         loadingTaskRef.current = task;
         task.onPassword = (updatePassword: (password: string) => void) => {
@@ -289,7 +290,9 @@ function PdfReader({ item }: { item: ReadingItem }) {
         documentRef.current = document;
         setPageCount(document.numPages);
         setPageNumber((value) => Math.min(document.numPages, Math.max(1, value)));
-        setOutline((await document.getOutline()) || []);
+        const outline = await document.getOutline();
+        if (!active) return;
+        setOutline(outline || []);
         setLoading(false);
       } catch (loadError) {
         if (active) {
@@ -425,15 +428,21 @@ function TextReader({ item }: { item: ReadingItem }) {
   useEffect(() => {
     const element = containerRef.current;
     if (!element || !content) return;
-    const frame = requestAnimationFrame(() => { element.scrollTop = Number(saved.scrollTop) || 0; });
+    const frame = requestAnimationFrame(() => { element.scrollTop = Number(readProgress(item).scrollTop) || 0; });
+    return () => cancelAnimationFrame(frame);
+  }, [content, item.id, item.modifiedAt, item.size]);
+
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element || !content) return;
     let timer = 0;
     const onScroll = () => {
       window.clearTimeout(timer);
       timer = window.setTimeout(() => saveProgress(item, { scrollTop: element.scrollTop, fontSize, lineHeight, paper }), 180);
     };
     element.addEventListener("scroll", onScroll, { passive: true });
-    return () => { cancelAnimationFrame(frame); window.clearTimeout(timer); element.removeEventListener("scroll", onScroll); };
-  }, [content, fontSize, item, lineHeight, paper, saved.scrollTop]);
+    return () => { window.clearTimeout(timer); element.removeEventListener("scroll", onScroll); };
+  }, [content, fontSize, item, lineHeight, paper]);
 
   useEffect(() => { saveProgress(item, { fontSize, lineHeight, paper }); }, [fontSize, item, lineHeight, paper]);
   if (error) return <ReaderNotice message={error} downloadUrl={item.fileUrl} fileName={item.fileName} />;
@@ -623,10 +632,6 @@ function FoliateReader({ item, theme, immersive, onToggleImmersive, onToggleImme
             ...(nextFraction === null ? {} : { fraction: nextFraction }),
             cfi: detail.cfi || null,
             section: Number.isFinite(Number(detail.section?.current)) ? Number(detail.section.current) : null,
-            flow,
-            fontSize,
-            lineHeight,
-            paper,
           });
         }) as EventListener);
         const savedFraction = Math.max(0, Math.min(1, Number(saved.fraction) || 0));

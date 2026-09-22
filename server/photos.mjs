@@ -522,8 +522,20 @@ export function createPhotoService({
       if (revision !== libraryRevision) throw Object.assign(new Error("图片目录在扫描期间发生变化，请重新扫描。"), { code: "PHOTO_LIBRARY_CHANGED_DURING_SCAN" });
       scanContext.phase = "finalizing";
       scanContext.progressPercent = 98;
+      const previousItemsBeforeSave = appState.photoItems;
       appState.photoItems = scanned;
-      await saveState();
+      try {
+        await saveState();
+      } catch (error) {
+        const liveLibraryIds = new Set(appState.photoLibraries.map((library) => library.id));
+        const restored = new Map(appState.photoItems.map((item) => [item.id, item]));
+        for (const item of previousItemsBeforeSave) {
+          if (liveLibraryIds.has(item.libraryId) && !restored.has(item.id)) restored.set(item.id, item);
+        }
+        appState.photoItems = [...restored.values()];
+        await saveState().catch((restoreError) => console.error(`恢复图片索引失败：${restoreError.message}`));
+        throw error;
+      }
       await cleanOrphanedCacheFiles();
       lastCompletedAt = new Date().toISOString();
       scanContext.phase = "completed";

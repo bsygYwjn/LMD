@@ -923,6 +923,7 @@ dl, dt, dd { margin: 0; padding: 0; }
   height: 28px;
   display: block;
   object-fit: contain;
+  border-radius: var(--radius-lg);
   user-select: none;
 }
 .appbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
@@ -1642,6 +1643,15 @@ html.reading-immersive-active, html.reading-immersive-active body { overflow: hi
 .client-page:has(.app-main--player) { height: 100dvh; overflow: hidden; }
 .app-main--player { min-height: 0; }
 
+/* 视频舞台使用导航栏之外的剩余高度，避免 16:9 高度把控制栏推出视口。 */
+.app-main--player:has(> .lmd-player) { overflow: auto; }
+.app-main--player > .lmd-player.player-page-panel { display: flex; flex-direction: column; flex: 1 1 0; min-height: 320px; min-width: 0; }
+.player-page-panel.lmd-player > :not(.lmd-stage) { flex: 0 0 auto; }
+.player-page-panel.lmd-player > .lmd-stage:not(.is-page-fullscreen):not(:fullscreen) { flex: 1 1 0; min-height: 180px; aspect-ratio: auto; }
+.lmd-player .player-topbar > div { min-width: 0; }
+.lmd-player .player-topbar strong { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.lmd-player .player-topbar span { flex-shrink: 0; }
+
 /* ==========================================================================
    v2 动效与现代感
    ========================================================================== */
@@ -1860,3 +1870,20 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: 340px; bac
 
 /* 歌词换句动画由 WAAPI 驱动（本环境 CSS transition 不触发），此处仅保留颜色/hover 过渡 */
 .music-lyric-line { transition: color 0.3s ease, background-color var(--duration-fast) ease; }
+
+/* Static episode numbers preserve thumbnails and never animate. */
+.mcard-episode-number { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: clamp(64px, 9vw, 112px); line-height: 1; font-weight: 800; color: #fff; opacity: .22; text-shadow: 0 1px 10px #0008; pointer-events: none; }
+.mcard-title--quick { white-space: normal; overflow-wrap: anywhere; line-height: 1.5; min-height: 3em; }
+.title-language-select { max-width: 135px; min-height: 34px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card, transparent); color: var(--text); font: inherit; font-size: 12px; }
+.title-language-select option { background: var(--bg, #17191f); color: var(--text, #eee); }
+.label-agent-panel { padding: 18px; display: grid; gap: 12px; min-width: 0; }
+.label-agent-panel p { margin: 0; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.label-command { min-height: 65px; width: 100%; resize: vertical; }
+.label-prompt { min-height: 220px; width: 100%; resize: vertical; }
+.label-targets { max-height: 600px; overflow: auto; }
+.label-target { padding: 12px 0; border-bottom: 1px solid var(--border); font-size: 13px; overflow-wrap: anywhere; }
+.label-target summary { cursor: pointer; padding: 8px 0; }
+.label-target input[type=checkbox] { margin-right: 8px; }
+.label-editor { display: grid; gap: 10px; }
+.label-editor label { display: grid; gap: 4px; }
+.label-editor a { margin-right: 8px; text-decoration: underline; }

@@ -342,7 +342,8 @@ function openTrackRoute(track: MusicTrack) {
   nextUrl.searchParams.set("track", track.id);
   nextUrl.searchParams.delete("video");
   nextUrl.searchParams.delete("series");
-  window.history.pushState({ section: "music", folder: track.folderId, track: track.id }, "", nextUrl);
+  // Queue changes update this player entry; explicit library navigation owns history.
+  window.history.replaceState({ section: "music", folder: track.folderId, track: track.id }, "", nextUrl);
   window.dispatchEvent(new PopStateEvent("popstate"));
   window.scrollTo({ top: 0 });
 }

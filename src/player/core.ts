@@ -2,7 +2,11 @@ import Hls from "hls.js";
 
 export type MediaTrack = { id: string; index: number; type: string; codec: string; codecString: string; profile: string; level: number;
   width: number; height: number; frameRate: number; bitRate: number; bitDepth: number; channels: number; sampleRate: number;
-  language: string; title: string; default: boolean; attachedPicture: boolean; hdr: boolean };
+  language: string; title: string; default: boolean; forced?: boolean; attachedPicture: boolean; hdr: boolean };
+export function audioTrackLabel(track: MediaTrack, ordinal: number) {
+  return [track.title, track.language === "und" ? "未知语言" : track.language, track.codec.toUpperCase(),
+    track.channels ? `${track.channels} 声道` : "", `轨道 ${ordinal + 1}`, track.default ? "默认" : "", track.forced ? "强制" : ""].filter(Boolean).join(" · ");
+}
 export type MediaInfo = { mediaId: string; version: number; sourceSignature: string; container: string; duration: number; startTime: number; bitRate: number; tracks: MediaTrack[] };
 type Capabilities = { mse: boolean; nativeHls: boolean; h264: boolean; aac: boolean; direct: Record<string, boolean>; tracks: Record<string, { mse: boolean; file: boolean; smooth?: boolean; powerEfficient?: boolean }> };
 export type PlaybackState = { mediaId: string; currentTime: number; duration: number; paused: boolean; seeking: boolean; buffering: boolean;
@@ -86,6 +90,8 @@ export class PlaybackCore extends EventTarget {
   private frameCallback: number | undefined;
   private networkRetry = 0;
   private reloadAttempts = 0;
+  private pendingAudio: string | null = null;
+  private audioSwitch: Promise<void> | null = null;
   private state: PlaybackState = { mediaId: "", currentTime: 0, duration: 0, paused: true, seeking: false, buffering: false,
     volume: 1, muted: false, playbackRate: 1, tracks: [], audioTrackId: null, buffered: [], seekable: [], strategy: "", transport: "", timeOffset: 0,
     generation: 0, error: "", errorCode: "", autoplayBlocked: false, firstFrameMs: null, lastSeekMs: null };
@@ -137,6 +143,7 @@ export class PlaybackCore extends EventTarget {
     this.emit(event, patch);
   }
   async load(mediaId: string, options: { startTime?: number; autoplay?: boolean } = {}) {
+    this.pendingAudio = null; this.audioSwitch = null;
     this.sequence++; this.abort.abort(); this.abort = new AbortController();
     const sequence = this.sequence; this.switching = true; this.releaseTransport();
     this.intent = options.autoplay !== false; this.fallbackLevel = 0; this.nativeFallback = false; this.ended = false; this.reloadAttempts = 0; this.startedAt = performance.now();
@@ -147,10 +154,10 @@ export class PlaybackCore extends EventTarget {
       if (sequence !== this.sequence || this.disposed) return;
       this.mediaInfo = info; this.capabilities = capabilities;
       this.emit("loadedmetadata", { duration: info.duration, tracks: info.tracks });
-      await this.openSession(options.startTime || 0);
+      await this.openSession(options.startTime || 0, null);
     } catch (error) { this.fail(error); }
   }
-  private releaseTransport() {
+  private releaseTransport(preserveSession = false) {
     clearInterval(this.heartbeat); this.heartbeat = undefined;
     this.hls?.destroy(); this.hls = null;
     if (this.frameCallback !== undefined) { this.video.cancelVideoFrameCallback?.(this.frameCallback); this.frameCallback = undefined; }
@@ -158,16 +165,30 @@ export class PlaybackCore extends EventTarget {
     // keepalive keeps the release alive while the page is unloading; without it
     // the browser cancels the request and the server only frees the session when
     // the lease expires.
-    if (this.session) { const id = this.session.sessionId; this.session = null; void fetch(`/api/playback-sessions/${id}`, { method: "DELETE", keepalive: true }).catch(() => {}); }
+    if (this.session && !preserveSession) { const id = this.session.sessionId; this.session = null; void fetch(`/api/playback-sessions/${id}`, { method: "DELETE", keepalive: true }).catch(() => {}); }
   }
-  private async openSession(target: number, audioTrackId = this.state.audioTrackId) {
+  private async openSession(target: number, audioTrackId: string | null = this.state.audioTrackId, reuseSession = false) {
     if (!this.mediaInfo || !this.capabilities || this.disposed) return;
     this.sequence++; const sequence = this.sequence;
     this.abort.abort(); this.abort = new AbortController(); this.switching = true; this.pendingTarget = target;
-    this.releaseTransport();
+    const previous = reuseSession ? this.session : null;
+    this.releaseTransport(Boolean(previous));
     this.emit("seeking", { currentTime: target, seeking: true, buffering: true, error: "", errorCode: "", buffered: [] });
     try {
-      const session = await api<Session>(`/api/media/${this.mediaInfo.mediaId}/playback-sessions`, { capabilities: this.capabilities, startTime: target,
+      let session: Session;
+      if (previous) {
+        session = previous;
+        // Serialize generations; never attach an intermediate choice to the video.
+        do {
+          const selected = this.pendingAudio ?? audioTrackId;
+          this.pendingAudio = null;
+          session = await api<Session>(`/api/playback-sessions/${session.sessionId}`, {
+            generation: session.generation, seekTime: target, audioTrackId: selected,
+          }, "PATCH", this.abort.signal);
+          if (sequence !== this.sequence || this.disposed) return;
+        } while (this.pendingAudio !== null && this.pendingAudio !== session.plan.audio?.track.id);
+        this.pendingAudio = null;
+      } else session = await api<Session>(`/api/media/${this.mediaInfo.mediaId}/playback-sessions`, { capabilities: this.capabilities, startTime: target,
         audioTrackId, fallbackLevel: this.fallbackLevel, preferNativeHls: this.nativeFallback }, "POST", this.abort.signal);
       if (sequence !== this.sequence || this.disposed) { void fetch(`/api/playback-sessions/${session.sessionId}`, { method: "DELETE", keepalive: true }); return; }
       this.session = session;
@@ -220,11 +241,11 @@ export class PlaybackCore extends EventTarget {
     }
   }
   private async keepAlive() {
-    if (!this.session || this.heartbeatBusy || this.disposed) return;
+    if (!this.session || this.heartbeatBusy || this.disposed || this.switching) return;
     this.heartbeatBusy = true; const session = this.session;
     try {
       const updated = await api<Session>(`/api/playback-sessions/${session.sessionId}`, { position: this.currentTime }, "PATCH");
-      if (this.session !== session) return;
+      if (this.session !== session || this.switching) return;
       this.session = updated;
       if (updated.error) this.fail(Object.assign(new Error(updated.error.message), { code: updated.error.code }));
     } catch (error) {
@@ -277,7 +298,15 @@ export class PlaybackCore extends EventTarget {
   setVolume(volume: number) { this.video.volume = Math.max(0, Math.min(1, volume)); if (volume > 0) this.video.muted = false; }
   setMuted(muted: boolean) { this.video.muted = muted; }
   setPlaybackRate(rate: number) { if (Number.isFinite(rate) && rate >= 0.25 && rate <= 4) this.video.playbackRate = rate; }
-  async selectAudioTrack(trackId: string) { await this.openSession(this.currentTime, trackId); }
+  async selectAudioTrack(trackId: string) {
+    if (!this.mediaInfo?.tracks.some(track => track.type === "audio" && track.id === trackId) || this.disposed) return;
+    if (this.audioSwitch) { this.pendingAudio = trackId; return this.audioSwitch; }
+    if (!this.session || this.switching || trackId === this.state.audioTrackId) return;
+    this.pendingAudio = trackId;
+    const operation = this.openSession(this.currentTime, trackId, true);
+    this.audioSwitch = operation;
+    try { await operation; } finally { if (this.audioSwitch === operation) this.audioSwitch = null; }
+  }
   private pageHide = () => { if (this.session) void fetch(`/api/playback-sessions/${this.session.sessionId}`, { method: "DELETE", keepalive: true }).catch(() => {}); };
   private onOnline = () => { if (this.state.errorCode === "NETWORK_ERROR") void this.retry(); };
   async destroy() {

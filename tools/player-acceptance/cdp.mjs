@@ -1,6 +1,7 @@
 // Minimal Chrome DevTools Protocol client used for real browser verification of
 // the LMD player. Development-only helper; never imported by the server.
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 
 const CHROME_CANDIDATES = [
@@ -11,16 +12,21 @@ const CHROME_CANDIDATES = [
 ];
 
 export async function launchBrowser({ port = 9333, headless = true, userDataDir, extraArgs = [] } = {}) {
-  const executable = CHROME_CANDIDATES.find(candidate => candidate);
+  const executable = CHROME_CANDIDATES.find(candidate => existsSync(candidate));
+  if (!executable) throw new Error("未找到 Chrome 或 Edge，请安装浏览器后重试。");
   const args = [`--remote-debugging-port=${port}`, "--remote-allow-origins=*", "--no-first-run", "--no-default-browser-check", "--disable-extensions",
     "--disable-background-networking", "--disable-sync", "--disable-features=Translate,MediaRouter",
     "--autoplay-policy=no-user-gesture-required", "--mute-audio",
     headless ? "--headless=new" : "--start-maximized",
     `--user-data-dir=${userDataDir}`, ...extraArgs, "about:blank"];
   const child = spawn(executable, args, { stdio: "ignore", windowsHide: true });
+  let launchError = null;
+  child.once("error", error => { launchError = error; });
   const deadline = Date.now() + 25000;
   let version = null;
   while (Date.now() < deadline) {
+    if (launchError) throw launchError;
+    if (child.exitCode !== null) throw new Error(`浏览器提前退出（${child.exitCode}）`);
     try { version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json(); break; }
     catch { await delay(200); }
   }

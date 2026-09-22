@@ -245,8 +245,22 @@ export function createReadingService({
       if (revision !== libraryRevision) throw Object.assign(new Error("阅读目录在扫描期间发生变化，请重新扫描。"), { code: "READING_LIBRARY_CHANGED_DURING_SCAN" });
       scanContext.phase = "finalizing";
       scanContext.progressPercent = 98;
+      const previousItemsBeforeSave = appState.readingItems;
       appState.readingItems = scanned;
-      await saveState();
+      try {
+        await saveState();
+      } catch (error) {
+        // A failed save must not prune the previously published catalog. Keep
+        // concurrent library removals authoritative while restoring old items.
+        const liveLibraryIds = new Set(appState.readingLibraries.map((library) => library.id));
+        const restored = new Map(appState.readingItems.map((item) => [item.id, item]));
+        for (const item of previousItemsBeforeSave) {
+          if (liveLibraryIds.has(item.libraryId) && !restored.has(item.id)) restored.set(item.id, item);
+        }
+        appState.readingItems = [...restored.values()];
+        await saveState().catch((restoreError) => console.error(`恢复阅读索引失败：${restoreError.message}`));
+        throw error;
+      }
       lastCompletedAt = new Date().toISOString();
       scanContext.phase = "completed";
       scanContext.progressPercent = 100;

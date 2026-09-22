@@ -1,0 +1,77 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { createLabelService } from './labels.mjs';
+
+const directory = await mkdtemp(path.join(tmpdir(), 'lmd-label-test-'));
+const root = path.join(directory, 'library');
+const app = { libraries: [{ id: 'lib', path: root }], displayGroups: [], media: [] };
+const add = (id, folder) => app.media.push({ id, libraryId: 'lib', fileName: `${id}.mkv`, path: path.join(root, folder, `${id}.mkv`), size: 10 });
+add('01', 'work/season'); add('02', 'work/season'); add('03', 'other');
+let time = 1000;
+const options = { directory, getState: () => app, folderForMedia: m => path.dirname(m.path), stableId: p => path.relative(root, p) || 'root', episodeForMedia: m => Number(m.id), now: () => time, leaseMs: 100 };
+const resultFor = batch => ({ batchId: batch.batchId, groups: batch.groups.map(g => ({ id: g.id, version: g.version, status: 'completed', titles: { title: '吹响吧！上低音号', originalTitle: '響け！ユーフォニアム', sources: ['https://anime-eupho.com/'], evidence: '固定测试资料，模拟作品及单集表对应。' }, episodes: [{ slot: 1, originalEpisodeTitle: 'あらたなユーフォニアム' }] })) });
+try {
+  let service = await createLabelService(options);
+  assert.equal(service.status().pending, 2);
+  for (const batchId of ['__proto__', 'constructor', 'toString', null, {}]) {
+    await assert.rejects(service.release({ batchId }), /批次不存在/);
+    assert.throws(() => service.validate({ batchId, groups: [] }), /批次不存在/);
+  }
+  assert.equal(Object.hasOwn(Object.prototype, 'closed'), false, 'invalid batch IDs cannot mutate shared object prototypes');
+  const wholeLibrary = await service.claim({ scope: 'recursive' });
+  assert.equal(wholeLibrary.groups.length, 2, 'recursive mode without selected IDs includes pending works across the library');
+  await service.release({ batchId: wholeLibrary.batchId });
+  assert.ok(service.targets().find(t => t.id === 'work'));
+  const [a, b] = await Promise.all([service.claim({ id: 'work', scope: 'recursive' }), service.claim({ id: 'work', scope: 'recursive' })]);
+  assert.equal(a.groups.length, 1); assert.equal(b.groups.length, 0);
+  assert.ok(!JSON.stringify(a).includes(root));
+  const result = resultFor(a);
+  assert.throws(() => service.validate({ ...result, path: 'bad' }), /不允许字段/);
+  const illegal = structuredClone(result); illegal.groups[0].titles.season = 2;
+  assert.throws(() => service.validate(illegal), /不允许字段/);
+  const insufficient = structuredClone(result); insufficient.groups[0].titles.sources = [];
+  assert.throws(() => service.validate(insufficient), /缺少来源/);
+  assert.equal(service.validate(result).valid, true);
+  assert.equal((await service.apply(result)).success, 1);
+  assert.equal((await service.apply(result)).duplicate, true);
+  assert.equal(service.media(app.media[0]).originalEpisodeTitle, 'あらたなユーフォニアム');
+  add('04', 'work/season');
+  assert.equal((await service.claim({ id: 'work', scope: 'recursive' })).groups.length, 0);
+  service = await createLabelService(options);
+  assert.equal(service.media(app.media[3]).title, '吹响吧！上低音号');
+  const priorId = app.media[0].id;
+  app.media[0].id = 'migrated-id';
+  assert.equal(service.media(app.media[0]).originalEpisodeTitle, 'あらたなユーフォニアム');
+  app.media[0].id = priorId;
+  await service.manual('01', { title: '独立标题' });
+  assert.equal(service.media(app.media[0]).title, '独立标题');
+  assert.equal(service.media(app.media[0]).originalTitle, undefined);
+  await service.manual('work', { clear: true });
+  const intermediate = await service.claim({ id: 'work' });
+  await service.manual('01', { title: '手动优先' });
+  assert.throws(() => service.validate(resultFor(intermediate)), /手动修改优先/);
+  await service.release({ batchId: intermediate.batchId });
+  await service.manual('work', { clear: true });
+  const single = await service.claim({ id: '01' });
+  assert.equal(single.groups[0].kind, 'video');
+  await service.release({ batchId: single.batchId });
+  const expired = await service.claim({ id: '03' }); time += 101;
+  assert.throws(() => service.validate(resultFor(expired)), /过期/);
+  const review = await service.claim({ id: 'other' });
+  await service.apply({ batchId: review.batchId, groups: [{ id: review.groups[0].id, version: review.groups[0].version, status: 'review', reason: '同名冲突' }] });
+  assert.equal((await service.claim({ id: 'other' })).groups.length, 0);
+  assert.equal((await service.claim({ id: 'other', retry: true })).groups.length, 1);
+  app.displayGroups.push({ id: 'work', path: path.join(root, 'work'), title: '旧标题' });
+  // A previous explicit clear is a persistent tombstone; another legacy folder remains protected.
+  add('05', 'legacy/sub'); app.displayGroups.push({ path: path.join(root, 'legacy'), title: '旧记录' });
+  assert.equal((await service.claim({ id: path.join('legacy', 'sub') })).groups.length, 0);
+  assert.equal((await service.claim({ id: 'root', scope: 'children' })).groups.length, 1);
+  const driveRoot = path.parse(root).root;
+  const driveApp = { libraries: [{ id: 'drive', path: driveRoot }], displayGroups: [], media: [{ id: 'drive-video', libraryId: 'drive', path: path.join(driveRoot, 'LmdRootFixture', 'video.mp4'), fileName: 'video.mp4' }] };
+  const driveService = await createLabelService({ ...options, directory: path.join(directory, 'drive-labels'), getState: () => driveApp, stableId: p => p });
+  assert.ok(driveService.targets().some(t => t.kind === 'folder' && t.name === 'LmdRootFixture'), 'drive root libraries retain descendant folder targets');
+  assert.equal((await driveService.claim({ scope: 'recursive' })).groups.length, 1);
+  console.log('labels: concurrency, scopes, atomic group/episodes, legacy protection, new episodes, restart, conflict, review, expiry, validation passed');
+} finally { await rm(directory, { recursive: true, force: true }); }

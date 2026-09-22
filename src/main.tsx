@@ -1,3 +1,5 @@
+import { chooseTitle, localizedDisplay, setTitleLanguage, useTitleLanguage } from "./title-language";
+import { prompt as labelPrompt } from "../tools/label-prompt.mjs";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrandMark } from "./BrandMark";
@@ -71,7 +73,7 @@ type BrowserCompatibility = {
   deviceCodecDependent: boolean;
 };
 type QuickSelection = { number: number; label: string; kind: "episode" | "extra" };
-type MediaDisplay = { groupId: string; folderId?: string; seriesTitle: string; season: number; episode: number; quickSelection: QuickSelection | null; alias: string; configured: boolean };
+type MediaDisplay = { searchTitles?: string; title?: string; originalTitle?: string; episodeTitle?: string; originalEpisodeTitle?: string; groupId: string; folderId?: string; seriesTitle: string; season: number; episode: number; quickSelection: QuickSelection | null; alias: string; configured: boolean };
 type Media = {
   id: string;
   title: string;
@@ -103,6 +105,8 @@ type LibraryFolder = { id: string; name: string; path: string };
 type DisplayGroup = { id: string; folderName?: string; title: string; season: number; configured: boolean; mediaCount: number };
 type DisplayFolder = DisplayGroup & { path: string; customTitle: string; sampleAlias: string; kind?: "music" | "video" | "reading" | "photo"; ebookCount?: number; spreadsheetCount?: number; libraryName?: string; relativePath?: string };
 type CatalogFolder = {
+  searchTitles?: string;
+  originalTitle?: string;
   id: string;
   parentId: string | null;
   name: string;
@@ -131,8 +135,8 @@ type MediaToolsInstallStatus = {
 type PlaybackSettings = { cacheMaxBytes: number; cacheTtlSeconds: number; aheadSeconds: number; backBufferSeconds: number;
   heartbeatSeconds: number; leaseSeconds: number; initialLeaseSeconds: number; releaseGraceSeconds: number; noOutputSeconds: number; cleanupSeconds: number;
   maxBufferBytes: number; encoder: "auto" | "libx264" | "h264_nvenc" | "h264_qsv" | "h264_amf" };
-type PlaybackStatus = { sessions: number; pipelines: number; cacheBytes: number; cacheMaxBytes: number; sessionsCreated: number;
-  pipelinesCreated: number; cacheHits: number; fallbacks: number; seeks: number; bytesGenerated: number };
+type PlaybackStatus = { sessions: number; pipelines: number; cacheBytes: number; cacheMaxBytes: number; sessionsCreated: number; sessionsReleased: number;
+  pipelinesCreated: number; pipelinesReleased: number; cacheHits: number; fallbacks: number; seeks: number; audioTrackSwitches: number; bytesGenerated: number };
 type DanmakuSettings = { appId: string; configured: boolean; environmentManaged: boolean };
 type AccessUser = {
   id: string;
@@ -292,7 +296,9 @@ function App() {
   const [musicOverview, setMusicOverview] = useState<MusicOverview | null>(null);
   const [readingOverview, setReadingOverview] = useState<ReadingOverview | null>(null);
   const [photoOverview, setPhotoOverview] = useState<PhotoOverview | null>(null);
-  const [catalog, setCatalog] = useState<Catalog | null>(null);
+  const [rawCatalog, setCatalog] = useState<Catalog | null>(null);
+  const titleLanguage = useTitleLanguage();
+  const catalog = useMemo(() => rawCatalog ? { ...rawCatalog, media: rawCatalog.media.map(m => ({ ...m, display: m.display ? localizedDisplay(m.display, titleLanguage) : undefined })), folders: rawCatalog.folders?.map(f => ({ ...f, searchTitles: `${f.title} ${f.originalTitle || ""}`, title: chooseTitle(f.title, f.originalTitle, titleLanguage) })) } : null, [rawCatalog, titleLanguage]);
   const [musicCatalog, setMusicCatalog] = useState<MusicCatalog | null>(null);
   const [readingCatalog, setReadingCatalog] = useState<ReadingCatalog | null>(null);
   const [photoCatalog, setPhotoCatalog] = useState<PhotoCatalog | null>(null);
@@ -515,7 +521,7 @@ function AccessLoginScreen({ theme, onToggleTheme, onAuthenticated }: {
     <main className="login-page">
       <header className="login-top">
         <span className="appbar-brand"><BrandMark /><strong>LMD</strong></span>
-        <ThemeToggle theme={theme} onToggle={onToggleTheme} />
+        <TitleLanguageToggle /><ThemeToggle theme={theme} onToggle={onToggleTheme} />
       </header>
       <section className="login-panel">
         <h1>登录后访问媒体库</h1>
@@ -529,6 +535,11 @@ function AccessLoginScreen({ theme, onToggleTheme, onAuthenticated }: {
       </section>
     </main>
   );
+}
+
+function TitleLanguageToggle() {
+  const value = useTitleLanguage();
+  return <select className="title-language-select" aria-label="作品名称语言" value={value} onChange={e => setTitleLanguage(e.target.value as "zh" | "original")}><option value="zh">中文常见名称</option><option value="original">首映原名</option></select>;
 }
 
 function ThemeToggle({ theme, onToggle }: { theme: ThemeMode; onToggle: () => void }) {
@@ -553,7 +564,7 @@ function mediaDisplayName(media: Media) {
 }
 
 function mediaQuickSelectionName(media: Media) {
-  return media.display?.quickSelection?.label || mediaDisplayName(media);
+  return media.display?.episodeTitle || media.display?.originalEpisodeTitle || media.display?.quickSelection?.label || mediaDisplayName(media);
 }
 
 function mediaLiveContentKey(media: Media) {
@@ -617,7 +628,7 @@ function ClientHeader({ section, onSelectSection, onHome, theme, onToggleTheme, 
       <div className="appbar-actions">
         {typeof search === "string" && onSearchChange && <label className="search-box"><Search size={14} /><input aria-label={searchAriaLabel || "搜索"} value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder={searchPlaceholder || "搜索…"} /></label>}
         {onScan && <button type="button" className="icon-btn" onClick={onScan} disabled={scanBusy} title={scanTitle} aria-label={scanTitle}><RefreshCw size={15} className={scanBusy ? "spin" : ""} /></button>}
-        <ThemeToggle theme={theme} onToggle={onToggleTheme} />
+        <TitleLanguageToggle /><ThemeToggle theme={theme} onToggle={onToggleTheme} />
         <ViewerSession accessStatus={accessStatus} onLogout={onLogout} />
       </div>
     </header>
@@ -706,12 +717,12 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, photoCatalog, error,
     .filter((item) => currentFolder && mediaFolderId(item) === currentFolder.id)
     .sort((left, right) => (left.display?.episode || 0) - (right.display?.episode || 0)
       || left.fileName.localeCompare(right.fileName, "zh-CN", { numeric: true, sensitivity: "base" })), [allMedia, currentFolder]);
-  const matchesSearch = (item: Media) => `${mediaQuickSelectionName(item)} ${mediaDisplayName(item)} ${item.title} ${item.fileName} ${item.tags.join(" ")}`.toLowerCase().includes(normalizedSearch);
+  const matchesSearch = (item: Media) => `${mediaQuickSelectionName(item)} ${mediaDisplayName(item)} ${item.display?.searchTitles || ""} ${item.display?.title || ""} ${item.display?.originalTitle || ""} ${item.display?.originalEpisodeTitle || ""} ${item.title} ${item.fileName} ${item.tags.join(" ")}`.toLowerCase().includes(normalizedSearch);
   const matchingFolderIds = useMemo(() => {
     const matches = new Set<string>();
     if (!normalizedSearch) return matches;
     for (const folder of folders) {
-      if (`${folder.title} ${folder.name}`.toLowerCase().includes(normalizedSearch)) matches.add(folder.id);
+      if (`${folder.title} ${folder.originalTitle || ""} ${folder.searchTitles || ""} ${folder.name}`.toLowerCase().includes(normalizedSearch)) matches.add(folder.id);
     }
     for (const item of allMedia) {
       if (matchesSearch(item) && mediaFolderId(item)) matches.add(mediaFolderId(item));
@@ -1179,6 +1190,7 @@ function MediaCard({ media, onPlay }: { media: Media; onPlay: () => void }) {
       <button type="button" className="mcard-hit" onClick={onPlay} aria-label={quickSelection ? `播放 ${quickSelectionName}，原文件 ${media.fileName}` : `播放 ${displayName}`} />
       <div className="mcard-poster">
         {media.thumbnailUrl && <img className="mcard-img" src={media.thumbnailUrl} alt="" loading="lazy" onError={(event) => { event.currentTarget.hidden = true; }} />}
+        {quickSelection && <span className="mcard-episode-number" aria-hidden="true">{quickSelection.number}</span>}
         <span className="tag mcard-badge">{media.extension}</span>
         {media.hdr && <span className="tag mcard-hdr">{media.hdr}</span>}
         <span className="mcard-res">{media.height ? `${media.height}P` : "原画"}</span>
@@ -1403,7 +1415,7 @@ function AdminApp(props: {
         <a className="admin-status" href="/" target="_blank" rel="noopener noreferrer" aria-label="打开观看端（端口 8096）" title="在新标签页打开观看端"><span className={error ? "status-dot status-dot--warning" : "status-dot"} /><div><strong>{error ? "服务异常" : "服务在线"}</strong><span>端口 8096 · 打开观看端</span></div></a>
       </aside>
       <main className="admin-main">
-        <header className="admin-topbar"><h1>{sectionTitle}</h1><ThemeToggle theme={theme} onToggle={onToggleTheme} /></header>
+        <header className="admin-topbar"><h1>{sectionTitle}</h1><TitleLanguageToggle /><ThemeToggle theme={theme} onToggle={onToggleTheme} /></header>
         {error && <StatusBanner tone="warning" icon={<AlertTriangle size={14} />}>{error}</StatusBanner>}
         <TimedStatusBanner notice={notice ? { text: notice, tone: "success" } : null} onDismiss={dismissNotice} />
         {section === "overview" && <OverviewPanel overview={overview} musicOverview={musicOverview} readingOverview={readingOverview} photoOverview={photoOverview} onRefresh={onRefresh} onNotice={onNotice} onLibraryAdded={promptForTurboScan} onPlay={onPlay} />}
@@ -1590,6 +1602,51 @@ function OverviewPanel({ overview, musicOverview, readingOverview, photoOverview
   );
 }
 
+type LabelTarget = { id: string; kind: "folder" | "video"; name: string; title?: string; originalTitle?: string; episodeTitle?: string; originalEpisodeTitle?: string; status: string; protected: boolean; sources?: string[]; evidence?: string; reason?: string; source?: string };
+function LabelAgentPanel({ onRefresh, onNotice }: { onRefresh: (quiet?: boolean) => Promise<void>; onNotice: (value: string) => void }) {
+  const [targets, setTargets] = useState<LabelTarget[]>([]);
+  const [counts, setCounts] = useState<Record<string, number>>({});
+  const [selected, setSelected] = useState<string[]>([]);
+  const [scope, setScope] = useState("direct");
+  const [filter, setFilter] = useState("");
+  const [retry, setRetry] = useState(false);
+  const [failure, setFailure] = useState("");
+  const refreshLabels = useCallback(async () => {
+    try { const [items, status] = await Promise.all([api<LabelTarget[]>("/api/labels/targets"), api<Record<string, number>>("/api/labels/status")]); setTargets(items); setCounts(status); setFailure(""); }
+    catch (error) { setFailure(error instanceof Error ? error.message : "无法读取打标任务"); }
+  }, []);
+  useEffect(() => { void refreshLabels(); const timer = setInterval(() => void refreshLabels(), 10000); return () => clearInterval(timer); }, [refreshLabels]);
+  const command = `node tools/lmd-label.mjs claim${selected.length ? ` --ids ${selected.join(",")}` : ""} --scope ${scope} --limit 10${retry ? " --retry" : ""}${window.location.port && window.location.port !== "8096" ? ` --port ${window.location.port}` : ""}`;
+  const copy = async (value: string) => { try { await navigator.clipboard.writeText(value); onNotice("已复制，请在服务器电脑手动启动的 Agent 中使用。"); } catch { onNotice("无法复制，请选中下方文本手动复制。"); } };
+  const visible = targets.filter(t => `${t.name} ${t.title || ""} ${t.originalTitle || ""}`.toLowerCase().includes(filter.toLowerCase()));
+  return <div className="label-agent-panel">
+    <p>CLI：<code>tools/lmd-label.mjs</code> · 待处理 {counts.pending || 0} · 完成/受保护 {counts.completed || 0} · 待确认 {counts.review || 0} · 处理中 {counts.claimed || 0}</p>
+    <p>页面和扫描不会启动 Agent。已有作品标题及继承该标题的视频整组跳过；重新识别请先清除打标。来源由 Agent 提供，服务端仅校验格式、范围和保护规则。</p>
+    {failure && <p role="alert">{failure}</p>}
+    <div className="adm-actions"><button className="btn btn--sm" onClick={() => void copy(`${labelPrompt}\n本次范围命令：${command}`)}>复制提示词与范围</button><button className="btn btn--sm" onClick={() => void copy(command)}>复制领取命令</button><button className="btn btn--sm" onClick={() => void refreshLabels()}>刷新状态</button></div>
+    <label>领取范围 <select className="input" value={scope} onChange={e => setScope(e.target.value)}><option value="direct">所选视频 / 文件夹整组</option><option value="children">直属子文件夹</option><option value="recursive">递归作品组</option></select></label>
+    <label><input type="checkbox" checked={retry} onChange={e => setRetry(e.target.checked)} />显式重试待确认条目</label>
+    <textarea className="input label-command" readOnly value={command} aria-label="可复制领取命令" />
+    <details><summary>精简提示词</summary><textarea className="input label-prompt" readOnly value={labelPrompt} aria-label="Agent 提示词" /></details>
+    <input className="input" value={filter} onChange={e => setFilter(e.target.value)} placeholder="筛选文件夹或单视频" aria-label="筛选打标目标" />
+    <p>已选择 {selected.length} 项；未选择时按全库待处理作品组领取。</p>
+    <div className="label-targets">{visible.map(t => <div className="label-target" key={`${t.kind}:${t.id}`}><label><input type="checkbox" checked={selected.includes(t.id)} onChange={e => setSelected(current => e.target.checked ? [...current, t.id] : current.filter(id => id !== t.id))} />{t.kind === "folder" ? "文件夹" : "视频"} · {t.name}</label><LabelEditor target={t} onSaved={async () => { await refreshLabels(); await onRefresh(true); }} onNotice={onNotice} /></div>)}</div>
+  </div>;
+}
+function LabelEditor({ target, onSaved, onNotice }: { target: LabelTarget; onSaved: () => Promise<void>; onNotice: (value: string) => void }) {
+  const [value, setValue] = useState({ title: target.title || "", originalTitle: target.originalTitle || "", episodeTitle: target.episodeTitle || "", originalEpisodeTitle: target.originalEpisodeTitle || "" });
+  const [busy, setBusy] = useState(false);
+  useEffect(() => setValue({ title: target.title || "", originalTitle: target.originalTitle || "", episodeTitle: target.episodeTitle || "", originalEpisodeTitle: target.originalEpisodeTitle || "" }), [target.title, target.originalTitle, target.episodeTitle, target.originalEpisodeTitle]);
+  const save = async (clear = false) => { setBusy(true); try { await api(`/api/labels/${target.id}`, { method: "PATCH", body: JSON.stringify(clear ? { clear: true } : value) }); await onSaved(); onNotice(clear ? "已清除此范围的打标，可重新领取。" : "显示标题已保存。"); } catch (e) { onNotice(e instanceof Error ? e.message : "保存失败"); } finally { setBusy(false); } };
+  const states: Record<string, string> = { completed: "已完成 / 受保护", pending: "待处理", review: "待确认", claimed: "处理中" };
+  return <details><summary>{states[target.status] || target.status} · {target.title || target.originalTitle || "未打标"}{target.originalTitle && target.title ? ` / ${target.originalTitle}` : ""}</summary><div className="label-editor">
+    {([['title', '中文常见作品名'], ['originalTitle', '首映原名'], ...(target.kind === 'video' ? [['episodeTitle', '正式中文集名'], ['originalEpisodeTitle', '正式原文集名']] : [])] as [keyof typeof value, string][]).map(([key, name]) => <label key={key}>{name}<input className="input" value={value[key]} onChange={e => setValue(v => ({ ...v, [key]: e.target.value }))} /></label>)}
+    <div className="adm-actions"><button className="btn btn--sm" disabled={busy} onClick={() => void save()}>保存标题</button><button className="btn btn--sm" disabled={busy} onClick={() => void save(true)}>清除此范围打标</button></div>
+    {(target.reason || target.evidence) && <p>{target.reason || target.evidence}</p>}
+    {!!target.sources?.length && <p>{target.source === 'agent' ? 'Agent 提供来源' : '来源'}：{target.sources.map((url, i) => <a key={url} href={url} target="_blank" rel="noreferrer">来源 {i + 1} </a>)}</p>}
+  </div></details>;
+}
+
 function DisplayFoldersPanel({ folders, onRefresh, onNotice }: { folders: DisplayFolder[]; onRefresh: (quiet?: boolean) => Promise<void>; onNotice: (value: string) => void }) {
   const [expanded, setExpanded] = useState(false);
   return (
@@ -1597,12 +1654,13 @@ function DisplayFoldersPanel({ folders, onRefresh, onNotice }: { folders: Displa
       <div className="adm-section-head">
         <button type="button" className={`adm-disclosure${expanded ? " is-open" : ""}`} onClick={() => setExpanded((value) => !value)} aria-expanded={expanded} aria-controls="display-folders-list">
           <ChevronRight size={15} />
-          <span className="adm-disclosure-title"><strong>网页作品代号</strong><span>每个视频文件夹填写一次作品名和季度；只改变网页显示，不修改原视频或字幕文件名。</span></span>
+          <span className="adm-disclosure-title"><strong>标题 / 本地 Agent 打标</strong><span>手动启动本地 Agent 查证双语作品名和正式集名；只改变网页显示。</span></span>
         </button>
         <div className="adm-actions"><span className="lib-stats">{folders.filter((folder) => folder.configured).length}/{folders.length} 个已设置</span></div>
       </div>
       {expanded && <div className="adm-rows" id="display-folders-list">
-        {folders.length ? folders.map((folder) => <DisplayFolderRow key={folder.id} folder={folder} onRefresh={onRefresh} onNotice={onNotice} />) : <div className="adm-rows-empty"><FolderOpen size={16} /><span>还没有可设置的作品文件夹。添加视频目录并扫描后会自动列出。</span></div>}
+        <LabelAgentPanel onRefresh={onRefresh} onNotice={onNotice} />
+        <details className="label-agent-panel"><summary>原手动作品名 / 季度设置</summary>{folders.length ? folders.map((folder) => <DisplayFolderRow key={folder.id} folder={folder} onRefresh={onRefresh} onNotice={onNotice} />) : <div className="adm-rows-empty"><FolderOpen size={16} /><span>还没有可设置的作品文件夹。添加视频目录并扫描后会自动列出。</span></div>}</details>
       </div>}
     </section>
   );

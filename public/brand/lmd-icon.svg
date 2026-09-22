@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <title>LMD</title><rect width="64" height="64" rx="14" fill="#3267E3"/>
+  <title>LMD</title><rect width="64" height="64" rx="8" fill="#3267E3"/>
   <g stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
     <path d="M 14 14 L 14 44 Q 14 50 20 50 L 48 50"/>
     <path d="M 31 14 L 50 26 L 31 38"/>

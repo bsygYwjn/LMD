@@ -81,6 +81,15 @@
   .lmd-text-subtitles { font-size: clamp(15px,3vw,25px); }
 }
 @media (prefers-reduced-motion:reduce) { .lmd-controls,.lmd-lock,.lmd-stage-heading { transition: none; } }
+@media (max-width:400px) {
+  .lmd-control-row { flex-wrap: wrap; }
+  .lmd-control-row > button { flex-shrink: 0; }
+  .lmd-time { flex: 1 0 calc(100% - 88px); }
+  .lmd-control-spacer { display: none; }
+  .lmd-settings-panel { bottom: 116px; max-height: calc(100% - 124px); }
+  .player-page-panel.lmd-player > .lmd-stage:not(.is-page-fullscreen):not(:fullscreen) { min-height: 260px; }
+  .app-main--player > .lmd-player.player-page-panel { min-height: 400px; }
+}
 /* 播放核心自检面板（?playerTest=1）：仅在验收时挂载，不参与日常播放布局。 */
 .lmd-selftest { margin: 16px auto 40px; width: min(980px,calc(100% - 32px)); padding: 16px 18px 18px; border-radius: 16px; background: #13171ef2; border: 1px solid #ffffff17; color: #e9edf5; font-size: 13px; line-height: 1.6; }
 .lmd-selftest header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }

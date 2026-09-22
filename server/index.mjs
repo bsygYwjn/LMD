@@ -8,6 +8,7 @@ import { availableParallelism, networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { createLabelService } from "./labels.mjs";
 import { createMusicService } from "./music.mjs";
 import { createReadingService } from "./reading.mjs";
 import { createPhotoService } from "./photos.mjs";
@@ -216,6 +217,7 @@ async function loadState() {
 }
 
 let appState = await loadState();
+const labelService = await createLabelService({ directory: DATA_DIR, getState: () => appState, folderForMedia: folderPathForMedia, stableId, episodeForMedia: m => detectedEpisodeNumber(m.fileName) });
 let musicService = null;
 let readingService = null;
 let photoService = null;
@@ -3047,34 +3049,48 @@ function mediaDisplayInfo(media, displayIndex = null) {
   const detectedEpisode = selectionMetadata.episodeNumberByMediaId.get(media.id) ?? null;
   const quickSelection = selectionMetadata.quickSelectionByMediaId.get(media.id) || null;
   const episode = detectedEpisode ?? folderItems.findIndex((item) => item.id === media.id) + 1;
-  const seriesTitle = group?.title?.trim() || path.basename(folderPath);
+  const labels = labelService.media(media);
+  const seriesTitle = labels.title || labels.originalTitle || path.basename(folderPath);
   return {
     groupId: stableId(folderPath),
+    ...labels,
     seriesTitle,
     season,
     episode,
     quickSelection,
     alias: `${seriesTitle} - S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`,
-    configured: Boolean(group?.title?.trim()),
+    configured: Boolean(labels.title || labels.originalTitle),
   };
 }
 
 function displayFolderSummaries(displayIndex = null) {
   const index = displayIndex || createDisplayIndex();
-  return [...index.folders.values()].map(({ folderPath, items }) => {
+  const allFolders = new Map(index.folders);
+  for (const item of appState.media) {
+    const root = path.resolve(videoLibraryForMedia(item)?.path || folderPathForMedia(item));
+    let current = path.resolve(folderPathForMedia(item));
+    while (pathIsSameOrDescendant(current, root)) {
+      if (!allFolders.has(current.toLowerCase())) allFolders.set(current.toLowerCase(), { folderPath: current, items: appState.media.filter(m => pathIsSameOrDescendant(folderPathForMedia(m), current)) });
+      if (current === root) break;
+      current = path.dirname(current);
+    }
+  }
+  return [...allFolders.values()].map(({ folderPath, items }) => {
     const group = displayGroupForFolder(folderPath, index);
     const folderName = path.basename(folderPath);
     const season = Number(group?.season) || inferSeasonNumber(folderPath, items);
-    const title = group?.title?.trim() || folderName;
+    const labels = labelService.folder(folderPath);
+    const title = labels?.title || labels?.originalTitle || folderName;
     const firstDisplay = items[0] ? mediaDisplayInfo(items[0], index) : null;
     return {
       id: stableId(folderPath),
       path: folderPath,
       folderName,
       title,
-      customTitle: group?.title?.trim() || "",
+      ...labels,
+      customTitle: labelService.own(folderPath)?.title || "",
       season,
-      configured: Boolean(group?.title?.trim()),
+      configured: Boolean(labels?.title || labels?.originalTitle),
       mediaCount: items.length,
       sampleAlias: firstDisplay?.alias || "",
     };
@@ -3166,13 +3182,14 @@ function catalogFolderNodes(mediaItems, displayIndex = null) {
       let node = nodes.get(id);
       if (!node) {
         const folderName = path.basename(folderPath) || library?.name || "视频目录";
-        const group = displayGroupForFolder(folderPath, displayIndex);
+        const group = labelService.folder(folderPath);
         node = {
           id,
           parentId,
           name: folderName,
-          title: group?.title?.trim() || (index === 0 ? library?.name?.trim() : "") || folderName,
-          configured: Boolean(group?.title?.trim()),
+          title: group?.title?.trim() || group?.originalTitle || (index === 0 ? library?.name?.trim() : "") || folderName,
+          originalTitle: group?.originalTitle || "",
+          configured: Boolean(group?.title || group?.originalTitle),
           directMediaCount: 0,
           mediaCount: 0,
           childCount: 0,
@@ -3412,7 +3429,7 @@ const server = createServer(async (request, response) => {
   response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   response.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
   response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
-  response.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' blob:; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data: blob:; connect-src 'self' blob:; worker-src 'self' blob:; frame-src 'self' blob:; child-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'");
+  response.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' blob:; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data: blob:; connect-src 'self' blob:; worker-src 'self' blob:; frame-src 'self' blob:; child-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'");
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader("Referrer-Policy", "no-referrer");
   response.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
@@ -3440,6 +3457,17 @@ const server = createServer(async (request, response) => {
     if (await musicService.handleRequest(request, response, url, pathname)) return;
     if (await readingService.handleRequest(request, response, url, pathname)) return;
     if (await photoService.handleRequest(request, response, url, pathname)) return;
+    if (pathname.startsWith("/api/labels/")) {
+      if (!requireLocalManagement(request, response)) return;
+      try {
+        const action = pathname.slice("/api/labels/".length);
+        if (request.method === "GET" && action === "status") return sendJson(response, 200, labelService.status());
+        if (request.method === "GET" && action === "targets") return sendJson(response, 200, labelService.targets());
+        if (request.method === "POST" && ["claim", "validate", "apply", "release"].includes(action)) return sendJson(response, 200, await labelService[action](await readJson(request)));
+        if (request.method === "PATCH") return sendJson(response, 200, await labelService.manual(action, await readJson(request)));
+        return sendJson(response, 404, { error: "未知打标操作" });
+      } catch (error) { return sendJson(response, 400, { error: error.message }); }
+    }
     if (request.method === "POST" && pathname === "/api/service/stop") {
       if (!requireLocalManagement(request, response)) return;
       sendJson(response, 202, { ok: true, message: "共享服务正在关闭，系统托盘会继续运行。" });
@@ -3847,6 +3875,8 @@ const server = createServer(async (request, response) => {
       if (!title) return sendJson(response, 400, { error: "请填写网页上显示的作品名。" });
       if (title.length > 120) return sendJson(response, 400, { error: "作品名不能超过 120 个字符。" });
       if (!Number.isInteger(season) || season < 1 || season > 99) return sendJson(response, 400, { error: "季度必须是 1 到 99 之间的整数。" });
+      if (Object.keys(body).some(k => !["title", "season"].includes(k))) return sendJson(response, 400, { error: "不允许修改此字段" });
+      await labelService.manual(groupId, { title });
       appState.displayGroups = appState.displayGroups.filter((group) => group.id !== groupId && path.resolve(group.path).toLowerCase() !== path.resolve(folder.path).toLowerCase());
       appState.displayGroups.push({ id: groupId, path: folder.path, title, season, updatedAt: new Date().toISOString() });
       await saveState();
@@ -3917,7 +3947,7 @@ const server = createServer(async (request, response) => {
       const filePath = url.searchParams.get("variant") === "remux" && media.remuxPath ? media.remuxPath : media.path;
       return streamFile(request, response, filePath, true);
     }
-    if (request.method === "GET" && /^\/api\/media\/[^/]+\/bitmap-subtitles\/[^/]+/.test(pathname)) {
+    if (["GET", "HEAD"].includes(request.method) && /^\/api\/media\/[^/]+\/bitmap-subtitles\/[^/]+/.test(pathname)) {
       const handled = await bitmapSubtitleService.handleRequest(request, response, url, pathname,
         { authorizedMediaForRequest, playbackInfo: playbackService.info, sendJson, streamFile })
         .catch((error) => {

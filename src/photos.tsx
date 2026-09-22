@@ -468,13 +468,13 @@ export function PhotoLibraryView({ catalog, folderId, photoId, search, onOpenFol
 
   useEffect(() => {
     const node = loadMoreRef.current;
-    if (!node || renderLimit >= directItems.length) return;
+    if (selectedPhoto || !node || renderLimit >= directItems.length) return;
     const observer = new IntersectionObserver((entries) => {
       if (entries.some((entry) => entry.isIntersecting)) setRenderLimit((value) => Math.min(directItems.length, value + 80));
     }, { rootMargin: "500px" });
     observer.observe(node);
     return () => observer.disconnect();
-  }, [directItems.length, renderLimit]);
+  }, [directItems.length, renderLimit, selectedPhoto?.id]);
 
   if (selectedPhoto) {
     return <PhotoViewer item={selectedPhoto} folderName={folderById.get(selectedPhoto.folderId)?.title || "图片库"} index={Math.max(selectedIndex, 0)} total={folderItems.length} previous={selectedIndex > 0 ? folderItems[selectedIndex - 1] : null} next={selectedIndex >= 0 ? folderItems[selectedIndex + 1] || null : null} onSelectPhoto={onSwitchPhoto} onClose={onBackToLibrary} />;
