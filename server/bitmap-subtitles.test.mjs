@@ -49,7 +49,11 @@ export function createHarness({ frames = [], fail = null, root, customRunCommand
     authorizedMediaForRequest: () => media,
     playbackInfo: async () => metadata,
     sendJson: (res, code, payload) => { res.statusCode = code; res.body = payload; res.headersSent = true; requests.push({ code, payload }); },
-    streamFile: async (_req, res, file) => { res.body = { file }; res.headersSent = true; requests.push({ file }); },
+    streamFile: async (_req, res, file, _track, options) => {
+      assert.equal(res.headersSent, false, "图片响应头由 streamFile 统一写入");
+      res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": options.cacheControl });
+      res.body = { file }; res.headersSent = true; requests.push({ file });
+    },
   };
   return { service, deps, media, metadata, requests, invocations, runCount: () => runCount };
 }
@@ -90,7 +94,8 @@ try {
     const args = harness.invocations[0];
     assert.deepEqual(args.slice(args.indexOf("-ss"), args.indexOf("-ss") + 2), ["-ss", "0.000"]);
     assert.deepEqual(args.slice(args.indexOf("-t"), args.indexOf("-t") + 2), ["-t", "37.000"]);
-    assert.ok(args.includes("format=rgba,showinfo"));
+    assert.deepEqual(args.slice(args.indexOf("-filter_complex"), args.indexOf("-filter_complex") + 2), ["-filter_complex", "[0:2]format=rgba,showinfo[caption]"]);
+    assert.deepEqual(args.slice(args.indexOf("-map"), args.indexOf("-map") + 2), ["-map", "[caption]"]);
     assert.equal(args.some(value => String(value).includes("alphaextract") || String(value).includes("cropdetect")), false,
       "FFmpeg 不得丢弃 RGB，也不能把 cropdetect 误当成裁剪");
     console.log("PASS 窗口解码参数、坐标协议与签名 URL");

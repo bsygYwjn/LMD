@@ -707,7 +707,9 @@ export function createMusicService({
     if (activeFlacJobs >= 1 || !flacQueue.length) return;
     const task = flacQueue.shift();
     activeFlacJobs += 1;
-    task().finally(() => {
+    void task().catch((error) => {
+      console.error(`保存音乐兼容副本任务状态失败：${error.message}`);
+    }).finally(() => {
       activeFlacJobs -= 1;
       drainFlacQueue();
     });
@@ -773,7 +775,7 @@ export function createMusicService({
         await saveState();
       }
     });
-    void saveState();
+    void saveState().catch((error) => console.error(`保存音乐兼容副本队列失败：${error.message}`));
     drainFlacQueue();
     return job;
   }
@@ -821,7 +823,10 @@ export function createMusicService({
       .map((filePath) => path.resolve(filePath).toLowerCase()));
     const compatibleEntries = await readdir(compatibleAudioDirectory, { withFileTypes: true }).catch(() => []);
     for (const entry of compatibleEntries) {
-      if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".flac") || entry.name.includes(".partial.")) continue;
+      // This directory is user-selected and can already contain original music.
+      // Only generated copies with our exact ID/signature naming scheme belong
+      // to LMD; never treat arbitrary FLAC files as disposable cache entries.
+      if (!entry.isFile() || !/^[0-9a-f]{20}-[0-9a-f]{16}\.flac$/i.test(entry.name)) continue;
       const filePath = path.resolve(compatibleAudioDirectory, entry.name);
       if (!compatibleReferences.has(filePath.toLowerCase())) await unlink(filePath).catch(() => {});
     }

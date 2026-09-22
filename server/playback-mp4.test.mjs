@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { boxes, parseInitialization, rewriteInitializationDuration, readMp4Boxes } from "./playback-mp4.mjs";
 
 const ffmpeg = process.env.LMD_FFMPEG || path.join(process.cwd(), "tools", "ffmpeg", "bin", "ffmpeg.exe");
@@ -124,6 +125,21 @@ if (process.env.LMD_SKIP_FFMPEG_TEST !== "1") {
   assert.deepEqual(seen, ["ftyp", "moov", "mdat"], "分块读取应还原完整 box 序列");
   await assert.rejects(async () => { for await (const _ of readMp4Boxes(chunks(payload.subarray(0, 20), 5))) void _; }, /Incomplete MP4 fragment/);
   console.log("PASS 增量 box 读取与截断检测");
+}
+
+{
+  for (const failure of [false, true]) {
+    let returned = false;
+    const readable = Readable.from((async function* () {
+      try { yield box("mdat", Buffer.alloc(200)); yield box("mdat", Buffer.alloc(200)); }
+      finally { returned = true; }
+    })());
+    const consume = async () => { for await (const item of readMp4Boxes(readable)) { if (failure) throw new Error("cancelled consumer"); break; } };
+    if (failure) await assert.rejects(consume, /cancelled consumer/); else await consume();
+    assert.equal(readable.destroyed, true, "提前停止分片消费必须关闭源管道");
+    assert.equal(returned, true, "提前退出必须通知源迭代器释放资源");
+  }
+  console.log("PASS 分片消费者取消与异常均释放源管道");
 }
 
 async function* syntheticMdat(payloadBytes, chunkBytes = 64 * 1024) {

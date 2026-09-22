@@ -18,19 +18,25 @@ $env:LMD_PLAYER_TEST='1'; node server/index.mjs
 # 播放核心验收：目录 → 详情 → 播放页 → 控制条 → 移动视口
 node tools/player-acceptance/browser-check.mjs
 
-# 管理设置页验收：播放缓存卡片、依赖 play 凭证卡片与后端契约
+# 管理设置页验收：须指向 LMD_PLAYER_TEST=1、独立 LMD_DATA_DIR 的测试服务
 node tools/player-acceptance/settings-check.mjs
 ```
 
 可用 `LMD_BASE_URL` 指向其他地址。脚本会在同目录生成 `chrome-profile/`、`shots/`（截图与 `report.json`），可以随时删除。
 
+若原生 WebSocket CDP 在本机超时，可把 `PLAYWRIGHT_MODULE` 设置为本机 Playwright 的模块入口绝对路径，播放与设置验收会改用 Playwright CDP 通路。可选 `LMD_BROWSER_EXECUTABLE` 指定 Chrome 或 Edge 的可执行文件；未指定时使用 Playwright 随附浏览器。此选项只影响验收脚本。
+
+`LMD_BROWSER_EXECUTABLE` 可指定已安装的 Chrome/Edge 可执行文件。播放、设置与移动验收脚本还支持通过 `PLAYWRIGHT_MODULE` 指向已安装的 Playwright 模块，使用其浏览器连接运行同一套断言；这是开发验收依赖，不打入运行包。可选通路用于原生 WebSocket CDP 连接停滞的环境。
+
+四媒体库的隔离浏览器回归使用 `node tools/library-browser-regression.mjs`，须先构建。它通过内存生成媒体并使用独立端口，支持 `LMD_PLAYWRIGHT_MODULE` 指定 Playwright 的模块 URL，不访问真实服务或媒体目录。
+
 ## browser-check 覆盖内容
 
 - 目录浏览、进入播放页、创建 video 元素、自定义控制条与缓冲条
 - 实际出画、`requestVideoFrameCallback` 真实渲染帧、首帧耗时
-- 媒体时长从已生成分片收敛到原片精确长度
+- 播放器完整时间轴与服务端原片时长一致；定位按原片时钟校验
 - 单击暂停/恢复、进度条缓冲内定位、冷 Seek、连续快速 Seek 收敛
-- 倍速切换、切换音轨后在新会话继续播放
+- 倍速切换、切换音轨后沿原片时间轴继续播放、普通定位复用会话
 - 全屏进入与退出
 - 离开播放页后本次创建的全部会话逐个确认已释放
 - 移动视口（412×915 + 触摸）出画、滑动预览与提交 Seek、双击切换、防误触锁定
@@ -39,7 +45,7 @@ node tools/player-acceptance/settings-check.mjs
 ## settings-check 覆盖内容
 
 - 读取/保存/恢复播放设置，拒绝非法租约与越界参数
-- 弹幕凭证保存与清除，读取接口不回传密钥
+- 弹幕凭证读取不回传密钥；保存与清除由 `server/danmaku.test.mjs` 的临时目录测试覆盖
 - 运行设置页渲染播放卡片（7 个字段）与弹幕卡片（2 个字段）
 - 不再出现过时的“自动生成完整兼容副本”描述
 

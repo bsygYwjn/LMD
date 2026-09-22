@@ -36,5 +36,5 @@ jobs:
           New-Item -ItemType Directory -Path tools/ffmpeg/bin -Force | Out-Null
           Copy-Item -LiteralPath $binary.FullName -Destination tools/ffmpeg/bin/ffmpeg.exe
           Copy-Item -LiteralPath (Join-Path $binary.DirectoryName 'ffprobe.exe') -Destination tools/ffmpeg/bin/ffprobe.exe
-      - run: pnpm run test:all
       - run: pnpm run build
+      - run: pnpm run test:all

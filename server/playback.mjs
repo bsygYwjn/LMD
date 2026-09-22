@@ -440,6 +440,7 @@ export function createPlaybackService(deps) {
           const previousAudioTrackId = session.plan.audio?.track.id || null;
           const nextPosition = Math.max(0, Math.min(finite(body.seekTime, session.position), Math.max(0, session.metadata.duration - 0.05)));
           const nextPlan = planPlayback(session.metadata, session.capabilities, { ...session.plan,
+            preferNativeHls: session.plan.transport === "native-hls",
             audioTrackId: body.audioTrackId ?? previousAudioTrackId, videoTrackId: session.plan.video.track.id });
           const retired = releasePipeline(session, true), previousRetirement = session.retirement;
           session.generation++;

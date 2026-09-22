@@ -12,7 +12,8 @@ const CHROME_CANDIDATES = [
 ];
 
 export async function launchBrowser({ port = 9333, headless = true, userDataDir, extraArgs = [] } = {}) {
-  const executable = CHROME_CANDIDATES.find(candidate => existsSync(candidate));
+  const executable = process.env.LMD_BROWSER_EXECUTABLE || CHROME_CANDIDATES.find(candidate => existsSync(candidate));
+  if (executable && !existsSync(executable)) throw new Error(`指定浏览器不存在：${executable}`);
   if (!executable) throw new Error("未找到 Chrome 或 Edge，请安装浏览器后重试。");
   const args = [`--remote-debugging-port=${port}`, "--remote-allow-origins=*", "--no-first-run", "--no-default-browser-check", "--disable-extensions",
     "--disable-background-networking", "--disable-sync", "--disable-features=Translate,MediaRouter",

@@ -114,15 +114,16 @@ export function planPlayback(metadata, capabilities = {}, options = {}) {
   const nativeHls = capabilities.nativeHls === true;
   const mse = capabilities.mse === true;
   if (!mse && !nativeHls) throw playbackError("NO_TRANSPORT", "当前浏览器没有可用的流式媒体播放能力");
+  const useMse = mse && !(options.preferNativeHls && nativeHls);
   const videoCopy = failure < 3 && ["h264", "hevc", "av1", "vp9"].includes(video.codec)
-    && (mse ? videoCap.mse === true : videoCap.file === true && ["h264", "hevc"].includes(video.codec));
+    && (useMse ? videoCap.mse === true : videoCap.file === true && ["h264", "hevc"].includes(video.codec));
   const audioCopy = audio && failure < 2 && ["aac", "mp3", "ac3", "eac3", "opus", "flac", "alac"].includes(audio.codec)
-    && (mse ? audioCap.mse === true : audioCap.file === true && ["aac", "ac3", "eac3"].includes(audio.codec));
+    && (useMse ? audioCap.mse === true : audioCap.file === true && ["aac", "ac3", "eac3"].includes(audio.codec));
   if (!videoCopy && capabilities.h264 !== true) throw playbackError("NO_DECODER", "当前浏览器未检测到兼容的 H.264 解码能力");
   if (audio && !audioCopy && capabilities.aac !== true) throw playbackError("NO_DECODER", "当前浏览器未检测到兼容的 AAC 解码能力");
   const actions = [videoCopy, ...(audio ? [Boolean(audioCopy)] : [])];
   const strategy = actions.every(Boolean) ? "REMUX" : actions.some(Boolean) ? "PARTIAL_TRANSCODE" : "TRANSCODE";
-  return { strategy, transport: mse && !options.preferNativeHls ? "mse" : "native-hls", fallbackLevel: failure,
+  return { strategy, transport: useMse ? "mse" : "native-hls", fallbackLevel: failure,
     video: { track: video, action: videoCopy ? "COPY" : "ENCODE", codec: videoCopy ? video.codec : "h264", toneMap: !videoCopy && video.hdr },
     audio: audio ? { track: audio, action: audioCopy ? "COPY" : "ENCODE", codec: audioCopy ? audio.codec : "aac",
       channels: audioCopy ? audio.channels : (audio.channels <= 2 ? audio.channels : capabilities.multichannelAac === true ? Math.min(6, audio.channels) : 2) } : null,

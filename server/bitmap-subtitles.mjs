@@ -90,8 +90,10 @@ export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, run
     try {
       const pattern = path.join(temporaryDirectory, "cue-%05d.png");
       const args = ["-hide_banner", "-nostdin", "-loglevel", "info", "-ss", decodeStart.toFixed(3), "-i", media.path,
-        "-t", decodeDuration.toFixed(3), "-map", `0:${track.index}`, "-vf", "format=rgba,showinfo",
-        "-fps_mode", "passthrough", "-f", "image2", "-y", pattern];
+        // A complex video graph activates FFmpeg's subtitle-to-video adapter;
+        // mapping the subtitle stream directly asks image2 for a subtitle encoder.
+        "-t", decodeDuration.toFixed(3), "-filter_complex", `[0:${track.index}]format=rgba,showinfo[caption]`,
+        "-map", "[caption]", "-c:v", "png", "-fps_mode", "passthrough", "-f", "image2", "-y", pattern];
       const result = await runCommand(tools.ffmpeg, args, 120000, { onChild: child => {
         job.child = child;
         if (job.cancelled) child.kill();
@@ -195,9 +197,7 @@ export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, run
       const file = cue && path.join(entry.spriteDir, cue.fileName), info = file ? await stat(file).catch(() => null) : null;
       if (!info?.isFile()) throw playbackError("SEGMENT_EXPIRED", "字幕图片已过期，请重新定位", 410);
       entry.usedAt = Date.now();
-      response.writeHead(200, { "Content-Type": "image/png", "Content-Length": info.size, "Cache-Control": "private, max-age=3600, immutable" });
-      if (request.method === "HEAD") return response.end(), true;
-      await deps.streamFile(request, response, file, false);
+      await deps.streamFile(request, response, file, false, { cacheControl: "private, max-age=3600, immutable" });
       return true;
     }
     const start = Math.max(0, Number(url.searchParams.get("start")) || 0);

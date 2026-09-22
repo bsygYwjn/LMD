@@ -48,6 +48,23 @@ try {
   New-Item -ItemType Directory -Path $releaseDirectory | Out-Null
 
   foreach ($directory in $requiredDirectories) {
+    if ($directory -eq 'tools') {
+      # Development browser profiles, screenshots and sample downloads can hold
+      # local data. Only ship the runtime media tools and the title-agent CLI.
+      $releaseTools = Join-Path $releaseDirectory 'tools'
+      New-Item -ItemType Directory -Path $releaseTools | Out-Null
+      $ffmpegDirectory = Join-Path $projectRootFull 'tools\ffmpeg'
+      if (Test-Path -LiteralPath $ffmpegDirectory) {
+        Copy-Item -LiteralPath $ffmpegDirectory -Destination (Join-Path $releaseTools 'ffmpeg') -Recurse -Force
+      }
+      foreach ($toolFile in @('lmd-label.mjs', 'label-prompt.mjs')) {
+        $sourceTool = Join-Path $projectRootFull "tools\$toolFile"
+        if (Test-Path -LiteralPath $sourceTool) {
+          Copy-Item -LiteralPath $sourceTool -Destination (Join-Path $releaseTools $toolFile)
+        }
+      }
+      continue
+    }
     Copy-Item -LiteralPath (Join-Path $projectRootFull $directory) -Destination (Join-Path $releaseDirectory $directory) -Recurse -Force
   }
   foreach ($file in $requiredFiles) {

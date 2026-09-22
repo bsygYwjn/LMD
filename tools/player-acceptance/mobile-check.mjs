@@ -1,9 +1,12 @@
 // Run: node tools/player-acceptance/mobile-check.mjs <local MP4>
 // No requests reach a real LMD backend; all session responses are local stubs.
+// Optional PLAYWRIGHT_MODULE selects an installed Playwright entry and bundled
+// Chromium; otherwise the existing native Chrome/Edge CDP launcher is used.
 import { createServer } from "vite";
 import react from "@vitejs/plugin-react";
 import { mkdir, copyFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { launchBrowser, Session, delay } from "./cdp.mjs";
@@ -26,8 +29,30 @@ if (process.argv.includes("--serve")) {
   console.log("Isolated player preview: http://127.0.0.1:8266/mobile-fixture (stub API; local test media only)");
   await new Promise(() => {});
 }
-const browser = await launchBrowser({ port: cdpPort, userDataDir: path.join(scratch, "chrome-profile") });
-const cdp = await Session.connect(browser.wsUrl);
+let browser, cdp;
+if (process.env.PLAYWRIGHT_MODULE) {
+  const moduleUrl = process.env.PLAYWRIGHT_MODULE.startsWith("file:") ? process.env.PLAYWRIGHT_MODULE : pathToFileURL(process.env.PLAYWRIGHT_MODULE).href;
+  const { chromium } = await import(moduleUrl);
+  browser = await chromium.launch({ headless: true, args: ["--mute-audio", "--autoplay-policy=no-user-gesture-required"] });
+  const page = await browser.newPage();
+  const transport = await page.context().newCDPSession(page);
+  // Retain the same Session assertions and event collection over Playwright's
+  // supported CDP transport, without opening a remote-debugging socket.
+  cdp = new Session({
+    send(message) {
+      const { id, method, params } = JSON.parse(message);
+      void transport.send(method, params).then(
+        result => cdp.onMessage({ id, result }),
+        error => cdp.onMessage({ id, error: { message: error.message } }),
+      );
+    },
+    close() { void transport.detach().catch(() => {}); },
+  });
+  for (const method of ["Runtime.consoleAPICalled", "Runtime.exceptionThrown", "Log.entryAdded"]) transport.on(method, params => cdp.onMessage({ method, params }));
+} else {
+  browser = await launchBrowser({ port: cdpPort, userDataDir: path.join(scratch, "chrome-profile") });
+  cdp = await Session.connect(browser.wsUrl);
+}
 cdp.collect(); const results = [];
 const click = async label => {
   const point = await cdp.evaluate(`(() => { const e=document.querySelector('button[aria-label="${label}"]');e.scrollIntoView({block:'nearest'});const r=e.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}; })()`);
@@ -77,4 +102,4 @@ try {
     console.log(`PASS ${width}x${height}: bounds, overlap, stage stability, clock, settings/subtitles, lock, fullscreen, help`);
   }
   await writeFile(path.join(scratch,"results.json"), JSON.stringify(results,null,2));
-} catch (error) { console.error(cdp.failures); console.error(await cdp.evaluate("document.body.innerText")); throw error; } finally { cdp.close(); browser.close(); await server.close(); }
+} catch (error) { console.error(cdp.failures); console.error(await cdp.evaluate("document.body.innerText").catch(() => "无法读取失败页面")); throw error; } finally { cdp.close(); await browser.close(); await server.close(); }

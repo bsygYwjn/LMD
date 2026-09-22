@@ -116,6 +116,11 @@ try {
   const transcode = await json("/api/media/media0/playback-sessions", { capabilities: caps, fallbackLevel: 3, startTime: 21 });
   assert.equal(transcode.strategy, "TRANSCODE"); assert.ok(Math.abs(transcode.sourceStart - 21) < 0.1);
   await json(`/api/playback-sessions/${transcode.sessionId}`, undefined, "DELETE");
+  const native = await json("/api/media/media0/playback-sessions", { capabilities: caps, preferNativeHls: true });
+  assert.equal(native.transport, "native-hls");
+  const nativeSeek = await json(`/api/playback-sessions/${native.sessionId}`, { generation: 1, seekTime: 11 }, "PATCH");
+  assert.equal(nativeSeek.transport, "native-hls", "Seek 后必须保留已经选定的原生 HLS 后备通道");
+  await json(`/api/playback-sessions/${native.sessionId}`, undefined, "DELETE");
   let status;
   for (let i = 0; i < 50; i++) {
     status = (await json("/api/settings/video-playback")).status;

@@ -163,21 +163,27 @@ export async function bufferMp4Box(box) {
 // a box, it is drained before the next header is parsed.
 export async function* readMp4Boxes(readable, maxBytes = 128 * 1024 ** 2) {
   const reader = new AsyncByteReader(readable);
-  while (true) {
-    const shortHeader = await reader.peek(8);
-    if (shortHeader === null) return;
-    if (shortHeader.length < 8) throw new Error("Incomplete MP4 fragment");
-    let size = shortHeader.readUInt32BE(0), headerSize = 8;
-    if (size === 1) {
-      const extendedHeader = await reader.peek(16);
-      if (!extendedHeader || extendedHeader.length < 16) throw new Error("Incomplete MP4 fragment");
-      size = Number(extendedHeader.readBigUInt64BE(8));
-      headerSize = 16;
+  try {
+    while (true) {
+      const shortHeader = await reader.peek(8);
+      if (shortHeader === null) return;
+      if (shortHeader.length < 8) throw new Error("Incomplete MP4 fragment");
+      let size = shortHeader.readUInt32BE(0), headerSize = 8;
+      if (size === 1) {
+        const extendedHeader = await reader.peek(16);
+        if (!extendedHeader || extendedHeader.length < 16) throw new Error("Incomplete MP4 fragment");
+        size = Number(extendedHeader.readBigUInt64BE(8));
+        headerSize = 16;
+      }
+      if (!Number.isSafeInteger(size) || size < headerSize || size > maxBytes) throw new Error("MP4 fragment exceeds safety limit");
+      const box = new StreamingMp4Box(reader, shortHeader.toString("ascii", 4, 8), size);
+      yield box;
+      if (box.remaining) await box.drain();
     }
-    if (!Number.isSafeInteger(size) || size < headerSize || size > maxBytes) throw new Error("MP4 fragment exceeds safety limit");
-    const box = new StreamingMp4Box(reader, shortHeader.toString("ascii", 4, 8), size);
-    yield box;
-    if (box.remaining) await box.drain();
+  } finally {
+    // Forward early cancellation to the underlying stdout iterator. Otherwise
+    // unread pipe data can keep FFmpeg's close event and session retirement pending.
+    await reader.iterator.return?.();
   }
 }
 

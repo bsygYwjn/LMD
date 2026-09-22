@@ -4,9 +4,9 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { access, copyFile, mkdir, open, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
-import { availableParallelism, networkInterfaces } from "node:os";
+import { availableParallelism, hostname, networkInterfaces } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { domainToASCII, fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createLabelService } from "./labels.mjs";
 import { createMusicService } from "./music.mjs";
@@ -311,6 +311,23 @@ function isLoopbackRequest(request) {
   return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
 }
 
+function hasTrustedLocalHost(request) {
+  try {
+    const host = new URL(`http://${request.headers.host || "localhost"}`);
+    if (host.username || host.password || host.pathname !== "/" || host.search || host.hash) return false;
+    const name = host.hostname.toLowerCase().replace(/\.$/, "");
+    const allowed = new Set(["localhost", "127.0.0.1", "[::1]", domainToASCII(hostname()).toLowerCase()]);
+    for (const interfaces of Object.values(networkInterfaces())) {
+      for (const item of interfaces || []) {
+        allowed.add(item.family === "IPv6" ? `[${item.address.toLowerCase()}]` : item.address);
+      }
+    }
+    return allowed.has(name);
+  } catch {
+    return false;
+  }
+}
+
 function requestIpAddress(request) {
   const address = String(request.socket.remoteAddress || "").split("%")[0];
   return address.startsWith("::ffff:") ? address.slice(7) : address;
@@ -370,6 +387,16 @@ function publicAccessUser(user) {
     updatedAt: user.updatedAt,
     lastLoginAt: user.lastLoginAt || null,
   };
+}
+
+// Credential comparisons use asynchronous scrypt. Serialize the entire user
+// mutation so concurrent requests cannot claim the same access code or edit a
+// user that another request has just removed.
+let accessUserMutationQueue = Promise.resolve();
+function mutateAccessUsers(operation) {
+  const result = accessUserMutationQueue.then(operation);
+  accessUserMutationQueue = result.catch(() => {});
+  return result;
 }
 
 async function accessCodeCredentials(accessCode) {
@@ -3450,6 +3477,9 @@ const server = createServer(async (request, response) => {
   }
 
   try {
+    // A browser-controlled DNS name must not gain local-admin privileges just
+    // because it resolves to loopback. LAN viewers keep their existing hosts.
+    if (isLoopbackRequest(request) && !hasTrustedLocalHost(request)) return sendJson(response, 403, { error: "本机访问地址无效，请使用 localhost 或本机 IP 地址。", code: "HOST_REJECTED" });
     if (!sameOriginMutation(request)) return sendJson(response, 403, { error: "已拒绝跨站操作。", code: "ORIGIN_REJECTED" });
     if (await playerTestService.handleRequest(request, response, url, pathname)) return;
     if (await playbackService.handleRequest(request, response, url, pathname)) return;
@@ -3762,66 +3792,75 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && pathname === "/api/access-control/users") {
       if (!requireLocalManagement(request, response)) return;
       const body = await readJson(request);
-      const accessCode = String(body.accessCode || "").trim();
-      if (!ACCESS_CODE_PATTERN.test(accessCode)) return sendJson(response, 400, { error: "访问码必须是六位数字。" });
-      if (await userForAccessCode(accessCode, null, true)) return sendJson(response, 409, { error: "这个访问码已经关联了一个用户，请换一个六位数字。" });
-      const submittedCategoryIds = [...new Set(Array.isArray(body.categoryIds) ? body.categoryIds.map(String) : [])];
-      const categoryIds = validAccessCategoryIds(submittedCategoryIds);
-      if (categoryIds.length !== submittedCategoryIds.length) return sendJson(response, 400, { error: "部分文件夹分类已经不存在，请刷新控制端后重新选择。" });
-      if (!categoryIds.length) return sendJson(response, 400, { error: "请至少为这个访问码选择一个文件夹分类。" });
-      const now = new Date().toISOString();
-      const user = {
-        id: randomUUID(),
-        categoryIds,
-        folderIds: [],
-        enabled: true,
-        createdAt: now,
-        updatedAt: now,
-        lastLoginAt: null,
-        ...await accessCodeCredentials(accessCode),
-      };
-      appState.accessControl.users.push(user);
-      await saveState();
-      return sendJson(response, 201, publicAccessUser(user));
-    }
-    if (request.method === "PATCH" && /^\/api\/access-control\/users\/[^/]+$/.test(pathname)) {
-      if (!requireLocalManagement(request, response)) return;
-      const userId = pathname.split("/").pop();
-      const user = appState.accessControl.users.find((item) => item.id === userId);
-      if (!user) return sendJson(response, 404, { error: "找不到这位访问用户。" });
-      const body = await readJson(request);
-      if (body.categoryIds !== undefined) {
+      return await mutateAccessUsers(async () => {
+        const accessCode = String(body.accessCode || "").trim();
+        if (!ACCESS_CODE_PATTERN.test(accessCode)) return sendJson(response, 400, { error: "访问码必须是六位数字。" });
+        if (await userForAccessCode(accessCode, null, true)) return sendJson(response, 409, { error: "这个访问码已经关联了一个用户，请换一个六位数字。" });
         const submittedCategoryIds = [...new Set(Array.isArray(body.categoryIds) ? body.categoryIds.map(String) : [])];
         const categoryIds = validAccessCategoryIds(submittedCategoryIds);
         if (categoryIds.length !== submittedCategoryIds.length) return sendJson(response, 400, { error: "部分文件夹分类已经不存在，请刷新控制端后重新选择。" });
         if (!categoryIds.length) return sendJson(response, 400, { error: "请至少为这个访问码选择一个文件夹分类。" });
-        user.categoryIds = categoryIds;
-        user.folderIds = [];
-      }
-      if (body.enabled !== undefined) {
-        if (typeof body.enabled !== "boolean") return sendJson(response, 400, { error: "请提供有效的用户状态。" });
-        user.enabled = body.enabled;
-        if (!body.enabled) appState.accessControl.sessions = appState.accessControl.sessions.filter((session) => session.userId !== user.id);
-      }
-      if (body.accessCode !== undefined) {
-        const accessCode = String(body.accessCode || "").trim();
-        if (!ACCESS_CODE_PATTERN.test(accessCode)) return sendJson(response, 400, { error: "访问码必须是六位数字。" });
-        if (await userForAccessCode(accessCode, user.id, true)) return sendJson(response, 409, { error: "这个访问码已经关联了另一个用户，请换一个六位数字。" });
-        Object.assign(user, await accessCodeCredentials(accessCode));
-        appState.accessControl.sessions = appState.accessControl.sessions.filter((session) => session.userId !== user.id);
-      }
-      user.updatedAt = new Date().toISOString();
-      await saveState();
-      return sendJson(response, 200, publicAccessUser(user));
+        const now = new Date().toISOString();
+        const user = {
+          id: randomUUID(),
+          categoryIds,
+          folderIds: [],
+          enabled: true,
+          createdAt: now,
+          updatedAt: now,
+          lastLoginAt: null,
+          ...await accessCodeCredentials(accessCode),
+        };
+        appState.accessControl.users.push(user);
+        await saveState();
+        return sendJson(response, 201, publicAccessUser(user));
+      });
+    }
+    if (request.method === "PATCH" && /^\/api\/access-control\/users\/[^/]+$/.test(pathname)) {
+      if (!requireLocalManagement(request, response)) return;
+      const userId = pathname.split("/").pop();
+      const body = await readJson(request);
+      return await mutateAccessUsers(async () => {
+        const user = appState.accessControl.users.find((item) => item.id === userId);
+        if (!user) return sendJson(response, 404, { error: "找不到这位访问用户。" });
+        const updates = {};
+        let revokeSessions = false;
+        if (body.categoryIds !== undefined) {
+          const submittedCategoryIds = [...new Set(Array.isArray(body.categoryIds) ? body.categoryIds.map(String) : [])];
+          const categoryIds = validAccessCategoryIds(submittedCategoryIds);
+          if (categoryIds.length !== submittedCategoryIds.length) return sendJson(response, 400, { error: "部分文件夹分类已经不存在，请刷新控制端后重新选择。" });
+          if (!categoryIds.length) return sendJson(response, 400, { error: "请至少为这个访问码选择一个文件夹分类。" });
+          updates.categoryIds = categoryIds;
+          updates.folderIds = [];
+        }
+        if (body.enabled !== undefined) {
+          if (typeof body.enabled !== "boolean") return sendJson(response, 400, { error: "请提供有效的用户状态。" });
+          updates.enabled = body.enabled;
+          if (!body.enabled) revokeSessions = true;
+        }
+        if (body.accessCode !== undefined) {
+          const accessCode = String(body.accessCode || "").trim();
+          if (!ACCESS_CODE_PATTERN.test(accessCode)) return sendJson(response, 400, { error: "访问码必须是六位数字。" });
+          if (await userForAccessCode(accessCode, user.id, true)) return sendJson(response, 409, { error: "这个访问码已经关联了另一个用户，请换一个六位数字。" });
+          Object.assign(updates, await accessCodeCredentials(accessCode));
+          revokeSessions = true;
+        }
+        Object.assign(user, updates, { updatedAt: new Date().toISOString() });
+        if (revokeSessions) appState.accessControl.sessions = appState.accessControl.sessions.filter((session) => session.userId !== user.id);
+        await saveState();
+        return sendJson(response, 200, publicAccessUser(user));
+      });
     }
     if (request.method === "DELETE" && /^\/api\/access-control\/users\/[^/]+$/.test(pathname)) {
       if (!requireLocalManagement(request, response)) return;
       const userId = pathname.split("/").pop();
-      if (!appState.accessControl.users.some((user) => user.id === userId)) return sendJson(response, 404, { error: "找不到这位访问用户。" });
-      appState.accessControl.users = appState.accessControl.users.filter((user) => user.id !== userId);
-      appState.accessControl.sessions = appState.accessControl.sessions.filter((session) => session.userId !== userId);
-      await saveState();
-      return sendJson(response, 200, { ok: true });
+      return await mutateAccessUsers(async () => {
+        if (!appState.accessControl.users.some((user) => user.id === userId)) return sendJson(response, 404, { error: "找不到这位访问用户。" });
+        appState.accessControl.users = appState.accessControl.users.filter((user) => user.id !== userId);
+        appState.accessControl.sessions = appState.accessControl.sessions.filter((session) => session.userId !== userId);
+        await saveState();
+        return sendJson(response, 200, { ok: true });
+      });
     }
     if (request.method === "POST" && pathname === "/api/libraries") {
       if (!requireLocalManagement(request, response)) return;

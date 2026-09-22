@@ -5,7 +5,8 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { launchBrowser, Session, delay } from "./cdp.mjs";
+import { delay } from "./cdp.mjs";
+import { launchAcceptanceSession } from "./playwright-session.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const BASE = process.env.LMD_BASE_URL || "http://127.0.0.1:8096";
@@ -15,7 +16,11 @@ const results = [];
 const record = (name, ok, detail = "") => { results.push({ name, ok, detail }); console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? `  — ${detail}` : ""}`); };
 const report = { base: BASE, startedAt: new Date().toISOString(), results, metrics: {} };
 
-const videoProbe = `(() => { const v = document.querySelector('.lmd-stage video'); return v ? { currentTime: v.currentTime, duration: v.duration, paused: v.paused, readyState: v.readyState, networkState: v.networkState,
+// Remux/seek transports use a local media clock. The shipped progress control
+// exposes PlaybackCore's original-file clock, which all user seek targets use.
+const videoProbe = `(() => { const v = document.querySelector('.lmd-stage video'), progress = document.querySelector('input[aria-label="播放进度"]'); return v ? {
+  currentTime: Number(progress?.value ?? v.currentTime), duration: Number(progress?.max ?? v.duration), mediaTime: v.currentTime, mediaDuration: v.duration,
+  paused: v.paused, seeking: v.seeking || Boolean(document.querySelector('.lmd-loading')), readyState: v.readyState, networkState: v.networkState,
   error: v.error ? { code: v.error.code, message: v.error.message } : null, src: (v.currentSrc || v.src || '').slice(0, 160) } : null; })()`;
 
 async function waitFor(session, expression, timeout, label) {
@@ -155,8 +160,7 @@ async function main() {
   // clean baseline before measuring; otherwise the assertions see stale state.
   const baseline = await resetBaseline();
   console.log(`基线：sessions=${baseline.sessions} pipelines=${baseline.pipelines}`);
-  const browser = await launchBrowser({ port: 9333, userDataDir: profile });
-  const session = await Session.connect(browser.target.webSocketDebuggerUrl);
+  const { browser, session } = await launchAcceptanceSession({ port: 9333, userDataDir: profile });
   session.collect();
   await Promise.all([session.send("Page.enable"), session.send("Runtime.enable"), session.send("Log.enable"), session.send("Network.enable")]);
   const responses = [];
@@ -194,12 +198,12 @@ async function main() {
     report.metrics.playbackSource = probe.src;
     record("播放立即开始且时间轴可用", Number.isFinite(probe.duration) && probe.duration > 1, `duration=${probe.duration}s`);
 
-    // hls.js can only know the full length once the playlist is complete; the
-    // reported duration must converge to the original file length.
-    const durationProbe = await waitFor(session, `(() => { const v = document.querySelector('.lmd-stage video');
-      return Number.isFinite(v.duration) && v.duration > 55 ? v.duration : null; })()`, 60000, "时长收敛到原片长度").catch(error => ({ error: String(error.message).slice(0, 200) }));
+    const mediaId = new URL(await session.evaluate("location.href")).searchParams.get("video");
+    const metadata = await (await fetch(`${BASE}/api/media/${encodeURIComponent(mediaId)}/info`)).json();
+    const durationProbe = await waitFor(session, `(() => { const state = ${videoProbe};
+      return state && Math.abs(state.duration - ${Number(metadata.duration)}) < 0.1 ? state.duration : null; })()`, 10000, "完整原片时间轴").catch(error => ({ error: String(error.message).slice(0, 200) }));
     report.metrics.convergedDuration = durationProbe;
-    record("媒体时长收敛到原片长度", durationProbe > 55, `duration=${durationProbe}`);
+    record("播放器时间轴显示完整原片时长", Math.abs(durationProbe - metadata.duration) < 0.1 && durationProbe > 55, `duration=${durationProbe}, source=${metadata.duration}`);
 
     const rendered = await session.evaluate(`(async () => { const v = document.querySelector('.lmd-stage video');
       if (!v.requestVideoFrameCallback) return null;
@@ -232,10 +236,10 @@ async function main() {
       let landed = null;
       while (Date.now() < deadline) {
         const current = await session.evaluate(videoProbe);
-        if (current && !current.paused && current.readyState >= 2 && Math.abs(current.currentTime - position) < 12) { landed = current.currentTime; break; }
+        if (current && !current.paused && !current.seeking && current.readyState >= 2 && Math.abs(current.currentTime - position) < 3) { landed = current.currentTime; break; }
         await delay(250);
       }
-      record("切换音轨后在新会话继续播放", landed !== null, `位置 ${position.toFixed(2)}s → ${landed === null ? "未恢复" : landed.toFixed(2)}s`);
+      record("切换音轨后沿原片时间轴继续播放", landed !== null, `位置 ${position.toFixed(2)}s → ${landed === null ? "未恢复" : landed.toFixed(2)}s`);
     } else {
       record("样例包含多音轨", false, JSON.stringify(audioOptions));
     }
@@ -275,7 +279,7 @@ async function main() {
     const warm = Math.min(duration - 1, current.currentTime + 2);
     const warmStart = Date.now();
     await seekWithBar(session, warm.toFixed(2));
-    const warmLanded = await waitFor(session, `(() => { const v = document.querySelector('.lmd-stage video'); return Math.abs(v.currentTime - ${warm}) < 2.5 ? v.currentTime : null; })()`, 15000, "缓冲内定位");
+    const warmLanded = await waitFor(session, `(() => { const state = ${videoProbe}; return !state.paused && !state.seeking && state.readyState >= 2 && Math.abs(state.currentTime - ${warm}) < 2.5 ? state.currentTime : null; })()`, 15000, "缓冲内定位");
     report.metrics.warmSeekMs = Date.now() - warmStart;
     record("进度条在已缓冲范围内定位", warmLanded !== null, `用时 ${report.metrics.warmSeekMs}ms`);
     const warmStillPlaying = await session.evaluate("!document.querySelector('.lmd-stage video').paused");
@@ -285,7 +289,7 @@ async function main() {
     const coldStart = Date.now();
     const coldWrite = await seekWithBar(session, target.toFixed(2));
     report.metrics.coldSeekWrite = coldWrite;
-    const coldLanded = await waitFor(session, `(() => { const v = document.querySelector('.lmd-stage video'); return Math.abs(v.currentTime - ${target}) < 3 ? v.currentTime : null; })()`, 30000, "冷 Seek")
+    const coldLanded = await waitFor(session, `(() => { const state = ${videoProbe}; return !state.paused && !state.seeking && state.readyState >= 2 && Math.abs(state.currentTime - ${target}) < 3 ? state.currentTime : null; })()`, 30000, "冷 Seek")
       .catch(async () => {
         const state = await session.evaluate(videoProbe);
         throw new Error(`冷 Seek 未生效: write=${JSON.stringify(coldWrite)} state=${JSON.stringify(state)} POST=${JSON.stringify(sessionPosts.slice(-4))} 页面错误=${JSON.stringify(session.failures.slice(-3))}`);
@@ -331,7 +335,7 @@ async function main() {
 
     report.metrics.sessionDelta = { created: afterLeave.sessionsCreated - startHealth.sessionsCreated, seeks: afterLeave.seeks - startHealth.seeks,
       cacheBytes: afterLeave.cacheBytes, fallbacks: afterLeave.fallbacks - startHealth.fallbacks };
-    record("会话按消费者计数且无泄漏式增长", report.metrics.sessionDelta.created >= 1 && report.metrics.sessionDelta.created <= 16, JSON.stringify(report.metrics.sessionDelta));
+    record("普通定位与音轨切换复用会话", report.metrics.sessionDelta.created === 0, JSON.stringify(report.metrics.sessionDelta));
     record("缓存占用有界", afterLeave.cacheBytes <= 10 * 1024 ** 3, `${(afterLeave.cacheBytes / 1024 ** 2).toFixed(1)} MiB`);
 
     // Mobile pass.
@@ -352,13 +356,14 @@ async function main() {
       const stage = document.querySelector('.lmd-stage'), video = document.querySelector('.lmd-stage video');
       const rect = stage.getBoundingClientRect(), cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
       const fire = (type, x, y) => stage.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, composed: true, pointerId: 7, pointerType: 'touch', isPrimary: true, clientX: x, clientY: y }));
-      const before = video.currentTime;
+      const clock = () => Number(document.querySelector('input[aria-label="播放进度"]')?.value ?? video.currentTime);
+      const before = clock();
       fire('pointerdown', cx, cy);
       for (let step = 1; step <= 6; step++) { fire('pointermove', cx + step * 30, cy); await new Promise(r => setTimeout(r, 40)); }
       const preview = document.querySelector('.lmd-seek-feedback')?.textContent || '';
       fire('pointerup', cx + 180, cy);
       await new Promise(r => setTimeout(r, 3000));
-      const afterSwipe = video.currentTime;
+      const afterSwipe = clock();
       const doubleTap = async () => { fire('pointerdown', cx - 120, cy - 50); fire('pointerup', cx - 120, cy - 50); };
       await doubleTap(); await new Promise(r => setTimeout(r, 150)); await doubleTap();
       await new Promise(r => setTimeout(r, 900));
@@ -401,7 +406,7 @@ async function main() {
   } finally {
     clearInterval(collector);
     await writeFile(path.join(shots, "report.json"), JSON.stringify(report, null, 2)).catch(() => {});
-    session.close(); browser.close();
+    session.close(); await browser.close();
   }
   const failed = results.filter(item => !item.ok);
   console.log(`\n共 ${results.length} 项，失败 ${failed.length} 项`);
