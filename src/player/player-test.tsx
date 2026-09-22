@@ -74,7 +74,8 @@ function tap(element: Element, options: PointerEventInit = {}) {
   element.dispatchEvent(new PointerEvent("pointerup", { ...base, ...options }));
 }
 const health = async () => (await (await fetch("/api/health", { cache: "no-store" })).json()).playback as
-  { sessions: number; pipelines: number; cacheBytes: number; sessionsCreated: number; seeks: number; fallbacks: number; bytesGenerated: number };
+  { sessions: number; pipelines: number; cacheBytes: number; sessionsCreated: number; sessionsReleased: number;
+    pipelinesCreated: number; pipelinesReleased: number; seeks: number; audioTrackSwitches: number; fallbacks: number; bytesGenerated: number };
 
 async function runChecks(media: PlayerMedia) {
   const desktop = window.innerWidth >= 900;
@@ -143,8 +144,8 @@ async function runChecks(media: PlayerMedia) {
   check("Seek 后仍在推进", await waitPlaying(12).then(() => true, () => false));
 
   // 6. 连续快速 Seek：只有最后一次生效
-  const targets = [Math.max(2, target - 8), Math.min(duration - 2, target + 6), Math.max(2, target - 4), target];
-  for (const value of targets) { seekLocally(value); await sleep(140); }
+  const targets = Array.from({ length: 10 }, (_, index) => index % 2 ? Math.max(2, duration - 2) : 2);
+  for (const value of targets) { seekLocally(value); await sleep(20); }
   const finalTarget = targets.at(-1)!;
   const landed = await waitFor(() => { const value = video()!.currentTime; return Math.abs(value - finalTarget) < 3 ? value : null; }, 25000, "最后一次 Seek 生效");
   await sleep(4500);
@@ -168,7 +169,7 @@ async function runChecks(media: PlayerMedia) {
     const position = video()!.currentTime;
     setNativeValue(audioSelect, next); audioSelect.dispatchEvent(new Event("change", { bubbles: true }));
     const resumed = await waitFor(() => { const element = video()!; return !element.paused && Math.abs(element.currentTime - position) < 8 && element.readyState >= 2 ? element.currentTime : null; }, 30000, "切轨后继续播放");
-    check("切换音轨后在新会话继续播放", true, `位置 ${position.toFixed(2)}s → ${resumed.toFixed(2)}s`);
+    check("切换音轨后在原会话新代次继续播放", true, `位置 ${position.toFixed(2)}s → ${resumed.toFixed(2)}s`);
   } else {
     check("样例包含多音轨（用于切轨验收）", false, audioSelect ? `仅 ${audioSelect.options.length} 个音轨` : "未找到音轨选择");
   }
@@ -179,15 +180,18 @@ async function runChecks(media: PlayerMedia) {
   // 复用既有结构化导航（品牌按钮回到目录），不新增返回按钮。
   document.querySelector<HTMLElement>(".client-header .brand-home-button")?.click();
   await waitFor(() => (document.querySelector(".lmd-stage") ? null : true), 8000, "返回目录").catch(() => {});
-  await sleep(2200);
-  const afterLeave = await health();
+  let afterLeave = await health();
+  for (let i = 0; i < 100 && (afterLeave.sessions !== 0 || afterLeave.pipelines !== 0); i++) { await sleep(300); afterLeave = await health(); }
   metrics.healthAfterLeave = afterLeave;
   check("离开播放页释放会话与处理进程", afterLeave.sessions === 0 && afterLeave.pipelines === 0, JSON.stringify({ before: beforeLeave.sessions, after: afterLeave.sessions }));
 
   const created = afterLeave.sessionsCreated - initial.sessionsCreated;
   const seeks = afterLeave.seeks - initial.seeks;
   metrics.sessionDelta = { created, seeks };
-  check("每个消费者独立建立会话（无泄漏式增长）", created >= 1 && created <= 12, `新增会话 ${created}`);
+  check("冷 Seek、连续 Seek 与切轨复用同一会话", created === 0 && seeks === 2, `新增会话 ${created}，服务端 Seek ${seeks}`);
+  check("会话与处理进程释放计数闭合", afterLeave.sessionsReleased === afterLeave.sessionsCreated
+    && afterLeave.pipelinesReleased === afterLeave.pipelinesCreated,
+  `会话 ${afterLeave.sessionsReleased}/${afterLeave.sessionsCreated}，管线 ${afterLeave.pipelinesReleased}/${afterLeave.pipelinesCreated}`);
   check("缓存占用受容量约束", afterLeave.cacheBytes <= 10 * 1024 ** 3, `${(afterLeave.cacheBytes / 1024 ** 2).toFixed(1)} MiB`);
 }
 

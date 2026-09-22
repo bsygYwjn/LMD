@@ -17,7 +17,8 @@ export function createPlaybackService(deps) {
   const sessions = new Map(), pipelines = new Map(), probes = new Map(), entries = new Map();
   let stopped = false, cacheBytes = 0, cleaning = null, encoderProbe = null;
   let settings = normalizePlaybackSettings(appState.settings.videoPlayback);
-  const metrics = { sessionsCreated: 0, pipelinesCreated: 0, cacheHits: 0, fallbacks: 0, seeks: 0, bytesGenerated: 0 };
+  const metrics = { sessionsCreated: 0, sessionsReleased: 0, pipelinesCreated: 0, pipelinesReleased: 0,
+    cacheHits: 0, fallbacks: 0, seeks: 0, audioTrackSwitches: 0, bytesGenerated: 0 };
 
   const ready = (async () => {
     await mkdir(root, { recursive: true });
@@ -47,7 +48,12 @@ export function createPlaybackService(deps) {
     const key = `${media.id}:${signature}`;
     if (!probes.has(key)) probes.set(key, (async () => {
       if (!getMediaTools().available) throw playbackError("TOOLS_UNAVAILABLE", "FFmpeg 尚未就绪，请在服务器运行设置中安装", 503);
-      const result = await probeVideo(media.path);
+      let result;
+      try { result = await probeVideo(media.path); }
+      catch (error) {
+        console.error(`[playback probe ${media.id}] ${error.message}`);
+        throw playbackError("PROBE_FAILED", "无法分析这个媒体文件，请检查文件是否损坏后重试", 422);
+      }
       if (!result.playbackMetadata?.tracks.some(track => track.type === "video" && !track.attachedPicture)) throw playbackError("PROBE_FAILED", "无法分析这个媒体文件", 422);
       const metadata = { ...result.playbackMetadata, sourceSignature: signature };
       const current = appState.media.find(item => item.id === media.id);
@@ -257,21 +263,34 @@ export function createPlaybackService(deps) {
         pipeline.error = error.code ? error : playbackError("PIPELINE_FAILED", "媒体分片处理失败", 422);
         console.error(`[playback ${pipeline.key.slice(0, 10)}] ${error.message}\n${stderr.slice(-2000)}`);
       }
-    } finally { clearInterval(watchdog); if (pipeline.child === child) pipeline.child = null; wake(pipeline); }
+    } finally {
+      clearInterval(watchdog);
+      if (pipeline.child === child) pipeline.child = null;
+      metrics.pipelinesReleased++;
+      wake(pipeline);
+    }
   }
 
-  function releasePipeline(session) {
+  function releasePipeline(session, immediate = false) {
     const pipeline = session.pipeline;
-    if (!pipeline) return;
+    if (!pipeline) return null;
     pipeline.consumers.delete(session.id); session.pipeline = null; refreshPublished(pipeline); wake(pipeline);
     if (!pipeline.consumers.size) {
       clearTimeout(pipeline.releaseTimer);
+      if (immediate) {
+        pipeline.cancelled = true; pipeline.child?.kill(); wake(pipeline);
+        return pipeline.promise || Promise.resolve();
+      }
       pipeline.releaseTimer = setTimeout(() => {
         if (!pipeline.consumers.size && pipeline.child) { pipeline.cancelled = true; pipeline.child.kill(); wake(pipeline); }
       }, settings.releaseGraceSeconds * 1000);
     }
+    return null;
   }
-  function release(session) { releasePipeline(session); sessions.delete(session.id); }
+  function release(session) {
+    if (!sessions.has(session.id)) return;
+    releasePipeline(session); sessions.delete(session.id); metrics.sessionsReleased++;
+  }
 
   async function attach(session, target) {
     const { media, metadata, plan } = session;
@@ -341,11 +360,17 @@ export function createPlaybackService(deps) {
 
   async function handleRequest(request, response, url, pathname) {
     if (!/^\/api\/(?:playback-sessions(?:\/|$)|media\/[^/]+\/(?:info|playback-sessions)$|settings\/video-playback$)/.test(pathname)) return false;
+    const allow = methods => {
+      if (methods.includes(request.method)) return;
+      response.setHeader("Allow", methods.join(", "));
+      throw playbackError("METHOD_NOT_ALLOWED", "不支持的操作", 405);
+    };
     try {
       await ready;
       if (stopped) throw playbackError("SERVICE_STOPPING", "媒体服务正在停止", 503);
       if (pathname === "/api/settings/video-playback") {
         if (!requireLocalManagement(request, response)) return true;
+        allow(["GET", "PATCH"]);
         if (request.method === "PATCH") {
           const body = await readJson(request); settings = normalizePlaybackSettings({ ...settings, ...body });
           appState.settings.videoPlayback = settings; encoderProbe = null; await saveState();
@@ -360,15 +385,15 @@ export function createPlaybackService(deps) {
       const mediaRoute = /^\/api\/media\/([^/]+)\/(info|playback-sessions)$/.exec(pathname);
       if (mediaRoute) {
         const media = authorizedMediaForRequest(request, response, mediaRoute[1]); if (!media) return true;
+        allow(mediaRoute[2] === "info" ? ["GET", "HEAD"] : ["POST"]);
         const metadata = await info(media);
-        if (mediaRoute[2] === "info" && request.method === "GET") { sendJson(response, 200, { mediaId: media.id, ...metadata }); return true; }
-        if (request.method !== "POST") throw playbackError("METHOD_NOT_ALLOWED", "不支持的操作", 405);
+        if (mediaRoute[2] === "info") { sendJson(response, 200, { mediaId: media.id, ...metadata }); return true; }
         if (sessions.size >= (appState.settings.maxStreams || 10)) throw playbackError("STREAM_LIMIT", "同时播放的会话已达上限", 503);
         const body = await readJson(request), capabilities = body.capabilities || {};
         const plan = planPlayback(metadata, capabilities, body);
         const session = { id: randomUUID(), generation: 1, owner: ownerFor(request), media, metadata, capabilities, plan,
           position: Math.max(0, Math.min(finite(body.startTime), Math.max(0, metadata.duration - 0.05))), lastSeen: Date.now(), pipeline: null,
-          createdAt: Date.now() };
+          retirement: null, createdAt: Date.now() };
         sessions.set(session.id, session); metrics.sessionsCreated++; if (plan.fallbackLevel) metrics.fallbacks++;
         // The client only adopts the session once it has read the response. Until
         // the body is actually flushed, an aborted request (the player unmounting
@@ -388,6 +413,7 @@ export function createPlaybackService(deps) {
       }
       const route = /^\/api\/playback-sessions\/([^/]+)(?:\/(file|manifest\.m3u8|init\.mp4|\d+\.m4s))?$/.exec(pathname);
       if (!route) throw playbackError("NOT_FOUND", "播放地址不存在", 404);
+      allow(route[2] ? ["GET", "HEAD"] : ["GET", "HEAD", "PATCH", "DELETE"]);
       const session = sessions.get(route[1]);
       if (!session) throw playbackError("SESSION_EXPIRED", "播放会话已过期", 410);
       if (!authorizedMediaForRequest(request, response, session.media.id)) { release(session); return true; }
@@ -401,21 +427,39 @@ export function createPlaybackService(deps) {
       const resource = route[2];
       if (!resource && request.method === "DELETE") { release(session); sendJson(response, 200, { ok: true }); return true; }
       if (!resource && request.method === "PATCH") {
-        const body = await readJson(request); session.lastSeen = Date.now(); session.heartbeatSeen = true;
+        const body = await readJson(request);
+        if (!sessions.has(session.id)) throw playbackError("SESSION_EXPIRED", "播放会话已过期", 410);
+        if (body.generation !== undefined && body.generation !== session.generation)
+          throw playbackError("STALE_SESSION", "播放请求已被替换", 409);
+        if ((body.seekTime !== undefined || body.audioTrackId !== undefined) && body.generation === undefined)
+          throw playbackError("STALE_SESSION", "播放请求已被替换", 409);
+        session.lastSeen = Date.now(); session.heartbeatSeen = true;
         if (body.position !== undefined) session.position = Math.max(0, Math.min(finite(body.position), session.metadata.duration));
         if (body.seekTime !== undefined || body.audioTrackId !== undefined) {
           if (body.generation !== session.generation) throw playbackError("STALE_SESSION", "播放请求已被替换", 409);
-          releasePipeline(session); session.generation++; metrics.seeks++;
-          session.position = Math.max(0, Math.min(finite(body.seekTime, session.position), Math.max(0, session.metadata.duration - 0.05)));
-          session.plan = planPlayback(session.metadata, session.capabilities, { ...session.plan, audioTrackId: body.audioTrackId ?? session.plan.audio?.track.id, videoTrackId: session.plan.video.track.id });
+          const previousAudioTrackId = session.plan.audio?.track.id || null;
+          const nextPosition = Math.max(0, Math.min(finite(body.seekTime, session.position), Math.max(0, session.metadata.duration - 0.05)));
+          const nextPlan = planPlayback(session.metadata, session.capabilities, { ...session.plan,
+            audioTrackId: body.audioTrackId ?? previousAudioTrackId, videoTrackId: session.plan.video.track.id });
+          const retired = releasePipeline(session, true), previousRetirement = session.retirement;
+          session.generation++;
+          const generation = session.generation;
+          session.position = nextPosition; session.plan = nextPlan;
+          if (body.seekTime !== undefined) metrics.seeks++;
+          if (body.audioTrackId !== undefined && (nextPlan.audio?.track.id || null) !== previousAudioTrackId) metrics.audioTrackSwitches++;
+          const retirement = Promise.allSettled([previousRetirement, retired].filter(Boolean));
+          session.retirement = retirement;
+          await retirement;
+          if (session.retirement === retirement) session.retirement = null;
+          if (!sessions.has(session.id) || generation !== session.generation) throw playbackError("STALE_SESSION", "播放请求已被替换", 409);
           if (session.plan.strategy !== "DIRECT") await attach(session, session.position);
-          const generation = session.generation; await waitForReady(session, generation);
+          await waitForReady(session, generation);
           if (generation !== session.generation) throw playbackError("STALE_SESSION", "播放请求已被替换", 409);
         }
         if (session.pipeline) { refreshPublished(session.pipeline); wake(session.pipeline); }
         sendJson(response, 200, descriptor(session)); return true;
       }
-      if (!resource && request.method === "GET") { session.lastSeen = Date.now(); sendJson(response, 200, descriptor(session)); return true; }
+      if (!resource && ["GET", "HEAD"].includes(request.method)) { session.lastSeen = Date.now(); sendJson(response, 200, descriptor(session)); return true; }
       if (!["GET", "HEAD"].includes(request.method)) throw playbackError("METHOD_NOT_ALLOWED", "不支持的操作", 405);
       if (Number(url.searchParams.get("generation")) !== session.generation) throw playbackError("STALE_SESSION", "旧播放地址已失效", 409);
       if (resource === "file" && session.plan.strategy === "DIRECT") { await streamFile(request, response, session.media.path, false); return true; }

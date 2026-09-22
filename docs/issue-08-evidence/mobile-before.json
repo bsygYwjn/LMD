@@ -1,0 +1,79 @@
+{
+  "base": "http://127.0.0.1:8096",
+  "scope": "Chromium responsive emulation, not Android/iOS hardware",
+  "results": [
+    {
+      "width": 320,
+      "height": 568,
+      "before": {
+        "height": 166.5,
+        "clipped": [
+          "全屏"
+        ],
+        "overflow": false
+      },
+      "after": {
+        "height": 330,
+        "panelFits": true
+      },
+      "ok": false
+    },
+    {
+      "width": 360,
+      "height": 800,
+      "before": {
+        "height": 189,
+        "clipped": [],
+        "overflow": false
+      },
+      "after": {
+        "height": 330,
+        "panelFits": true
+      },
+      "ok": false
+    },
+    {
+      "width": 390,
+      "height": 844,
+      "before": {
+        "height": 205.875,
+        "clipped": [],
+        "overflow": false
+      },
+      "after": {
+        "height": 330,
+        "panelFits": true
+      },
+      "ok": false
+    },
+    {
+      "width": 412,
+      "height": 915,
+      "before": {
+        "height": 218.25,
+        "clipped": [],
+        "overflow": false
+      },
+      "after": {
+        "height": 330,
+        "panelFits": true
+      },
+      "ok": false
+    },
+    {
+      "width": 844,
+      "height": 390,
+      "before": {
+        "height": 456.75,
+        "clipped": [],
+        "overflow": false
+      },
+      "after": {
+        "height": 456.75,
+        "panelFits": false
+      },
+      "ok": false
+    }
+  ],
+  "error": "Layout regression; inspect report and screenshots"
+}

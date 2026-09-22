@@ -77,7 +77,8 @@ try {
 
   const pageResponse = await fetch(`${localBaseUrl}/`);
   const csp = pageResponse.headers.get("content-security-policy") || "";
-  assert.match(csp, /script-src 'self'/, "页面应只允许执行本地脚本");
+  assert.match(csp, /script-src 'self' 'wasm-unsafe-eval'/, "页面应允许本地脚本与 JASSUB 所需的 WebAssembly 编译");
+  assert.doesNotMatch(csp, /(?:^|[ ;])'unsafe-eval'(?:[ ;]|$)/, "不得为字幕放开通用 JavaScript eval");
   assert.match(csp, /object-src 'none'/, "页面应禁止对象嵌入");
   assert.match(csp, /worker-src 'self' blob:/, "PDF、字幕和表格 Worker 应受显式 CSP 约束");
   assert.match(csp, /connect-src 'self' blob:/, "电子书章节应只允许读取本地接口与受控 Blob 资源");

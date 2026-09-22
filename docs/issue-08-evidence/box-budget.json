@@ -1,0 +1,40 @@
+{
+  "scope": "parser only; excludes FFmpeg, disk publication and browser",
+  "project": "C:\\Users\\dytdy\\Desktop\\LMD本地视频共享",
+  "moduleSha256": "6fb576c633dd2db006ffcc4cba36c1682f83f8f580e7b3c4b8d58261118d6385",
+  "node": "v24.19.0",
+  "results": [
+    {
+      "sizeMiB": 64,
+      "concurrency": 1,
+      "elapsedMs": 31.8502,
+      "baselineMiB": 51.96484375,
+      "peakMiB": 90.58984375,
+      "deltaMiB": 38.625
+    },
+    {
+      "sizeMiB": 128,
+      "concurrency": 1,
+      "elapsedMs": 62.9487,
+      "baselineMiB": 51.6875,
+      "peakMiB": 90.74609375,
+      "deltaMiB": 39.05859375
+    },
+    {
+      "sizeMiB": 64,
+      "concurrency": 5,
+      "elapsedMs": 151.4887,
+      "baselineMiB": 51.82421875,
+      "peakMiB": 96.875,
+      "deltaMiB": 45.05078125
+    },
+    {
+      "sizeMiB": 128,
+      "concurrency": 10,
+      "elapsedMs": 601.1996,
+      "baselineMiB": 51.77734375,
+      "peakMiB": 99.1484375,
+      "deltaMiB": 47.37109375
+    }
+  ]
+}
