@@ -1,5 +1,5 @@
 import { chooseTitle, localizedDisplay, setTitleLanguage, useTitleLanguage } from "./title-language";
-import { prompt as labelPrompt } from "../tools/label-prompt.mjs";
+import { buildPrompt as buildLabelPrompt } from "../tools/label-prompt.mjs";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrandMark } from "./BrandMark";
@@ -1602,43 +1602,82 @@ function OverviewPanel({ overview, musicOverview, readingOverview, photoOverview
   );
 }
 
-type LabelTarget = { id: string; kind: "folder" | "video"; name: string; title?: string; originalTitle?: string; episodeTitle?: string; originalEpisodeTitle?: string; status: string; protected: boolean; sources?: string[]; evidence?: string; reason?: string; source?: string };
+type LabelCounts = { pending: number; completed: number; review: number; claimed: number };
+type LabelTarget = { id: string; parentId?: string | null; ancestorNames?: string[]; counts?: LabelCounts; kind: "folder" | "video"; name: string; title?: string; originalTitle?: string; episodeTitle?: string; originalEpisodeTitle?: string; status: string; protected: boolean; sources?: string[]; evidence?: string; reason?: string; source?: string };
+type LabelSetup = { nodePath: string; cliPath: string; port: number };
 function LabelAgentPanel({ onRefresh, onNotice }: { onRefresh: (quiet?: boolean) => Promise<void>; onNotice: (value: string) => void }) {
   const [targets, setTargets] = useState<LabelTarget[]>([]);
-  const [counts, setCounts] = useState<Record<string, number>>({});
+  const [counts, setCounts] = useState<LabelCounts | null>(null);
+  const [setup, setSetup] = useState<LabelSetup | null>(null);
+  const [folderId, setFolderId] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
-  const [scope, setScope] = useState("direct");
+  const [scope, setScope] = useState<"recursive" | "direct" | "children">("recursive");
   const [filter, setFilter] = useState("");
   const [retry, setRetry] = useState(false);
+  const [advanced, setAdvanced] = useState(false);
+  const [showPrompt, setShowPrompt] = useState(false);
+  const [copied, setCopied] = useState(false);
   const [failure, setFailure] = useState("");
+  const sequence = useRef(0);
+  const selectedKey = selected.join(",");
   const refreshLabels = useCallback(async () => {
-    try { const [items, status] = await Promise.all([api<LabelTarget[]>("/api/labels/targets"), api<Record<string, number>>("/api/labels/status")]); setTargets(items); setCounts(status); setFailure(""); }
-    catch (error) { setFailure(error instanceof Error ? error.message : "无法读取打标任务"); }
-  }, []);
-  useEffect(() => { void refreshLabels(); const timer = setInterval(() => void refreshLabels(), 10000); return () => clearInterval(timer); }, [refreshLabels]);
-  const command = `node tools/lmd-label.mjs claim${selected.length ? ` --ids ${selected.join(",")}` : ""} --scope ${scope} --limit 10${retry ? " --retry" : ""}${window.location.port && window.location.port !== "8096" ? ` --port ${window.location.port}` : ""}`;
-  const copy = async (value: string) => { try { await navigator.clipboard.writeText(value); onNotice("已复制，请在服务器电脑手动启动的 Agent 中使用。"); } catch { onNotice("无法复制，请选中下方文本手动复制。"); } };
+    const request = ++sequence.current;
+    try {
+      const query = new URLSearchParams({ scope });
+      if (selectedKey) query.set("ids", selectedKey); else if (folderId) query.set("id", folderId);
+      const [items, status, config] = await Promise.all([api<LabelTarget[]>("/api/labels/targets"), api<LabelCounts>(`/api/labels/status?${query}`), api<LabelSetup>("/api/labels/setup")]);
+      if (request !== sequence.current) return;
+      setTargets(items); setCounts(status); setSetup(config); setFailure("");
+      if (!folderId) setFolderId(items.find(t => t.kind === "folder" && !t.parentId)?.id || items.find(t => t.kind === "folder")?.id || "");
+    } catch (error) { if (request === sequence.current) setFailure(error instanceof Error ? error.message : "无法读取打标任务，请确认本机服务正在运行。"); }
+  }, [folderId, selectedKey, scope]);
+  useEffect(() => { void refreshLabels(); const timer = setInterval(() => void refreshLabels(), 10000); return () => { clearInterval(timer); sequence.current++; }; }, [refreshLabels]);
+  useEffect(() => setCopied(false), [folderId, selectedKey, scope, retry]);
+  const folders = targets.filter(t => t.kind === "folder").sort((a, b) => [...a.ancestorNames || [], a.name].join("/").localeCompare([...b.ancestorNames || [], b.name].join("/"), "zh-CN", { numeric: true }));
+  const folder = targets.find(t => t.id === folderId);
+  const taskText = setup && folderId ? buildLabelPrompt({ ...setup, ...(selected.length ? { ids: selected } : { id: folderId }), scope, limit: 3, retry }) : "";
+  const copyTask = async () => {
+    if (!taskText) return;
+    try { await navigator.clipboard.writeText(taskText); setCopied(true); onNotice("任务已复制。发给服务器电脑上的 Agent，即可连续处理整个所选范围。"); }
+    catch { setShowPrompt(true); onNotice("浏览器未允许复制，已展开任务文本，请手动复制。"); }
+  };
+  const total = counts ? counts.pending + counts.completed + counts.review + counts.claimed : 0;
+  const copyLabel = copied ? "已复制，发给 Agent 即可" : counts?.completed ? "复制继续打标任务" : "复制打标任务";
   const visible = targets.filter(t => `${t.name} ${t.title || ""} ${t.originalTitle || ""}`.toLowerCase().includes(filter.toLowerCase()));
-  return <div className="label-agent-panel">
-    <p>CLI：<code>tools/lmd-label.mjs</code> · 待处理 {counts.pending || 0} · 完成/受保护 {counts.completed || 0} · 待确认 {counts.review || 0} · 处理中 {counts.claimed || 0}</p>
-    <p>页面和扫描不会启动 Agent。已有作品标题及继承该标题的视频整组跳过；重新识别请先清除打标。来源由 Agent 提供，服务端仅校验格式、范围和保护规则。</p>
-    {failure && <p role="alert">{failure}</p>}
-    <div className="adm-actions"><button className="btn btn--sm" onClick={() => void copy(`${labelPrompt}\n本次范围命令：${command}`)}>复制提示词与范围</button><button className="btn btn--sm" onClick={() => void copy(command)}>复制领取命令</button><button className="btn btn--sm" onClick={() => void refreshLabels()}>刷新状态</button></div>
-    <label>领取范围 <select className="input" value={scope} onChange={e => setScope(e.target.value)}><option value="direct">所选视频 / 文件夹整组</option><option value="children">直属子文件夹</option><option value="recursive">递归作品组</option></select></label>
-    <label><input type="checkbox" checked={retry} onChange={e => setRetry(e.target.checked)} />显式重试待确认条目</label>
-    <textarea className="input label-command" readOnly value={command} aria-label="可复制领取命令" />
-    <details><summary>精简提示词</summary><textarea className="input label-prompt" readOnly value={labelPrompt} aria-label="Agent 提示词" /></details>
-    <input className="input" value={filter} onChange={e => setFilter(e.target.value)} placeholder="筛选文件夹或单视频" aria-label="筛选打标目标" />
-    <p>已选择 {selected.length} 项；未选择时按全库待处理作品组领取。</p>
-    <div className="label-targets">{visible.map(t => <div className="label-target" key={`${t.kind}:${t.id}`}><label><input type="checkbox" checked={selected.includes(t.id)} onChange={e => setSelected(current => e.target.checked ? [...current, t.id] : current.filter(id => id !== t.id))} />{t.kind === "folder" ? "文件夹" : "视频"} · {t.name}</label><LabelEditor target={t} onSaved={async () => { await refreshLabels(); await onRefresh(true); }} onNotice={onNotice} /></div>)}</div>
+  return <div className="label-agent-panel label-simple">
+    <div className="label-intro"><strong>为整个文件夹补全标题</strong><p>选择文件夹，复制任务，发给服务器电脑上使用的 Agent。它会逐批处理全部子文件夹，已有标题会保留。</p></div>
+    <label className="label-folder-choice">选择文件夹<select className="input" value={folderId} disabled={!folders.length} onChange={e => { setFolderId(e.target.value); setSelected([]); setScope("recursive"); setCounts(null); }}>
+      {!folders.length && <option value="">{setup ? "请先添加视频目录并扫描" : "正在读取视频目录…"}</option>}
+      {folders.map(t => <option key={t.id} value={t.id}>{[...t.ancestorNames || [], t.name].join(" / ")}</option>)}
+    </select></label>
+    <p className="label-scope-caption">{selected.length ? `自定义范围：${selected.length} 项` : folder ? `${folder.name} · 包含全部子文件夹` : "等待视频目录"}{scope !== "recursive" ? ` · 高级模式：${scope === "direct" ? "作为一个作品" : "直属子文件夹"}` : ""}</p>
+    <div className="label-counts" aria-label="所选范围打标进度">{([["pending", "待处理"], ["completed", "已完成"], ["review", "待确认"], ["claimed", "处理中"]] as const).map(([key, name]) => <div key={key}><strong>{counts ? counts[key] : "—"}</strong><span>{name}</span></div>)}</div>
+    {total > 0 && <progress className="label-progress" value={counts?.completed || 0} max={total} aria-label="已完成作品比例" />}
+    {failure && <p role="alert" className="label-failure">{failure}<button className="btn btn--sm" onClick={() => void refreshLabels()}>重试连接</button></p>}
+    <div className="adm-actions label-primary-actions"><button className="btn btn--primary" disabled={!taskText || !!failure} onClick={() => void copyTask()}>{copied ? <Check size={16} /> : <Copy size={16} />}{copyLabel}</button><button className="btn btn--sm" onClick={() => void refreshLabels()}>刷新进度</button></div>
+    <p className="label-help">中断后再次复制此任务即可继续。网页不会启动 Agent；待确认的条目会单独保留。</p>
+    {showPrompt && <label>可复制的完整任务<textarea className="input label-prompt" readOnly value={taskText} onFocus={e => e.currentTarget.select()} /></label>}
+    <details className="label-advanced" onToggle={e => setAdvanced(e.currentTarget.open)}><summary>高级选项与手动修改</summary>{advanced && <div className="label-advanced-body">
+      <p>通常保持默认即可。单视频、批量选择、来源与标题编辑集中在这里。</p>
+      <label>范围方式<select className="input" value={scope} onChange={e => setScope(e.target.value as "recursive" | "direct" | "children")}><option value="recursive">全部子文件夹（默认）</option><option value="children">直属子文件夹</option><option value="direct">所选项作为一个作品 / 单视频</option></select></label>
+      {scope === "direct" && <p>只适合同一部作品。包含多部作品的目录请选择“全部子文件夹”。</p>}
+      <label><input type="checkbox" checked={retry} onChange={e => setRetry(e.target.checked)} />重新核实待确认条目</label>
+      <p>CLI：<code>{setup?.cliPath || "等待服务连接"}</code></p>
+      <details><summary>查看完整任务与命令</summary><textarea className="input label-prompt" readOnly value={taskText} onFocus={e => e.currentTarget.select()} aria-label="Agent 完整任务" /></details>
+      <p>来源由 Agent 提供，服务端校验格式与修改范围。手动清除会影响所选范围及其子项。</p>
+      <input className="input" value={filter} onChange={e => setFilter(e.target.value)} placeholder="查找文件夹或单视频" aria-label="筛选打标目标" />
+      {!!selected.length && <button className="btn btn--sm" onClick={() => { setSelected([]); setScope("recursive"); }}>恢复所选文件夹范围</button>}
+      <div className="label-targets">{visible.map(t => <div className="label-target" key={`${t.kind}:${t.id}`}><label><input type="checkbox" checked={selected.includes(t.id)} onChange={e => setSelected(current => e.target.checked ? [...current, t.id] : current.filter(id => id !== t.id))} />{t.kind === "folder" ? "文件夹" : "视频"} · {t.name}</label><LabelEditor target={t} onSaved={async () => { await refreshLabels(); await onRefresh(true); }} onNotice={onNotice} /></div>)}</div>
+    </div>}</details>
   </div>;
 }
+
 function LabelEditor({ target, onSaved, onNotice }: { target: LabelTarget; onSaved: () => Promise<void>; onNotice: (value: string) => void }) {
   const [value, setValue] = useState({ title: target.title || "", originalTitle: target.originalTitle || "", episodeTitle: target.episodeTitle || "", originalEpisodeTitle: target.originalEpisodeTitle || "" });
   const [busy, setBusy] = useState(false);
   useEffect(() => setValue({ title: target.title || "", originalTitle: target.originalTitle || "", episodeTitle: target.episodeTitle || "", originalEpisodeTitle: target.originalEpisodeTitle || "" }), [target.title, target.originalTitle, target.episodeTitle, target.originalEpisodeTitle]);
   const save = async (clear = false) => { setBusy(true); try { await api(`/api/labels/${target.id}`, { method: "PATCH", body: JSON.stringify(clear ? { clear: true } : value) }); await onSaved(); onNotice(clear ? "已清除此范围的打标，可重新领取。" : "显示标题已保存。"); } catch (e) { onNotice(e instanceof Error ? e.message : "保存失败"); } finally { setBusy(false); } };
-  const states: Record<string, string> = { completed: "已完成 / 受保护", pending: "待处理", review: "待确认", claimed: "处理中" };
+  const states: Record<string, string> = { completed: "已完成 / 受保护", pending: "待处理", partial: "部分完成", review: "待确认", claimed: "处理中" };
   return <details><summary>{states[target.status] || target.status} · {target.title || target.originalTitle || "未打标"}{target.originalTitle && target.title ? ` / ${target.originalTitle}` : ""}</summary><div className="label-editor">
     {([['title', '中文常见作品名'], ['originalTitle', '首映原名'], ...(target.kind === 'video' ? [['episodeTitle', '正式中文集名'], ['originalEpisodeTitle', '正式原文集名']] : [])] as [keyof typeof value, string][]).map(([key, name]) => <label key={key}>{name}<input className="input" value={value[key]} onChange={e => setValue(v => ({ ...v, [key]: e.target.value }))} /></label>)}
     <div className="adm-actions"><button className="btn btn--sm" disabled={busy} onClick={() => void save()}>保存标题</button><button className="btn btn--sm" disabled={busy} onClick={() => void save(true)}>清除此范围打标</button></div>
@@ -1654,9 +1693,8 @@ function DisplayFoldersPanel({ folders, onRefresh, onNotice }: { folders: Displa
       <div className="adm-section-head">
         <button type="button" className={`adm-disclosure${expanded ? " is-open" : ""}`} onClick={() => setExpanded((value) => !value)} aria-expanded={expanded} aria-controls="display-folders-list">
           <ChevronRight size={15} />
-          <span className="adm-disclosure-title"><strong>标题 / 本地 Agent 打标</strong><span>手动启动本地 Agent 查证双语作品名和正式集名；只改变网页显示。</span></span>
+          <span className="adm-disclosure-title"><strong>视频标题打标</strong><span>选择文件夹，将任务发给 Agent，自动补全中文名称与正式集名。</span></span>
         </button>
-        <div className="adm-actions"><span className="lib-stats">{folders.filter((folder) => folder.configured).length}/{folders.length} 个已设置</span></div>
       </div>
       {expanded && <div className="adm-rows" id="display-folders-list">
         <LabelAgentPanel onRefresh={onRefresh} onNotice={onNotice} />

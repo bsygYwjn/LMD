@@ -3491,7 +3491,13 @@ const server = createServer(async (request, response) => {
       if (!requireLocalManagement(request, response)) return;
       try {
         const action = pathname.slice("/api/labels/".length);
-        if (request.method === "GET" && action === "status") return sendJson(response, 200, labelService.status());
+        if (request.method === "GET" && action === "setup") return sendJson(response, 200, { nodePath: process.execPath, cliPath: path.join(PROJECT_DIR, "tools", "lmd-label.mjs"), port: PORT });
+        if (request.method === "GET" && action === "status") {
+          const scope = {};
+          for (const field of ["id", "folder", "scope"]) if (url.searchParams.has(field)) scope[field] = url.searchParams.get(field);
+          if (url.searchParams.has("ids")) scope.ids = url.searchParams.get("ids").split(",");
+          return sendJson(response, 200, labelService.status(scope));
+        }
         if (request.method === "GET" && action === "targets") return sendJson(response, 200, labelService.targets());
         if (request.method === "POST" && ["claim", "validate", "apply", "release"].includes(action)) return sendJson(response, 200, await labelService[action](await readJson(request)));
         if (request.method === "PATCH") return sendJson(response, 200, await labelService.manual(action, await readJson(request)));

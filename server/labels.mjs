@@ -77,11 +77,12 @@ export async function createLabelService({ directory, getState, folderForMedia, 
     const legacy = getState().displayGroups.find(g => key(g.path) === k);
     return legacy ? { title: legacy.title, source: 'manual', version: legacy.updatedAt || hash(legacy) } : null;
   }
-  function inherited(p, s = state) {
+  const excludes = (record, p) => record?.excludedPaths?.some(excluded => inside(key(p), excluded)) || false;
+  function inherited(p, s = state, origin = p) {
     let current = key(p);
     while (true) {
       const record = own(current, s);
-      if (hasTitle(record)) return record;
+      if (hasTitle(record) && !excludes(record, origin)) return record;
       const parent = path.dirname(current);
       if (parent === current) return null;
       current = parent;
@@ -105,14 +106,17 @@ export async function createLabelService({ directory, getState, folderForMedia, 
     return [...folders.values(), ...videos];
   }
   function version(target, s) {
-    return hash([target.kind, key(target.path), own(target.path, s), inherited(path.dirname(target.path), s), target.members.map(m => [m.id, key(m.path), m.size, m.modifiedAt, own(m.path, s), inherited(folderForMedia(m), s)])]);
+    return hash([target.kind, key(target.path), own(target.path, s), inherited(path.dirname(target.path), s, target.path), target.members.map(m => [m.id, key(m.path), m.size, m.modifiedAt, own(m.path, s), inherited(folderForMedia(m), s)])]);
   }
   function protectedTarget(target, s) {
     return hasTitle(inherited(target.path, s)) || target.members.some(m => hasTitle(inherited(m.path, s)));
   }
+  function underReview(target, s) {
+    return Object.entries(s.records).some(([p, r]) => r.status === 'review' && target.members.some(m => inside(key(m.path), p) && !excludes(r, m.path)));
+  }
   function active(s) { return Object.values(s.batches).filter(b => !b.closed && b.expiresAt > now()); }
   function available(target, s) {
-    if (protectedTarget(target, s) || Object.entries(s.records).some(([p, r]) => r.status === 'review' && (inside(key(target.path), p) || inside(p, key(target.path))))) return false;
+    if (protectedTarget(target, s) || underReview(target, s)) return false;
     const members = new Set(target.members.map(m => key(m.path)));
     return !active(s).some(b => b.groups.some(g => g.members.some(p => members.has(p))));
   }
@@ -124,49 +128,114 @@ export async function createLabelService({ directory, getState, folderForMedia, 
       const work = parent || t;
       groups.set(work.id, work);
     }
-    return [...groups.values()];
+    // Direct-media folders and their extras must own disjoint media. Otherwise
+    // a menu claimed first blocks its parent, and a reviewed menu also marks
+    // the unprocessed main episodes as review. Season folders still share a work.
+    const works = [...groups.values()];
+    return works.map(t => {
+      const excludedPaths = works.filter(other => other.id !== t.id && inside(key(other.path), key(t.path))).map(other => key(other.path));
+      return excludedPaths.length ? { ...t, excludedPaths, members: t.members.filter(m => !excludedPaths.some(p => inside(key(m.path), p))) } : t;
+    }).filter(t => t.members.length > 0);
   }
-  function publicTarget(t, s) {
+  function resolveScope(all, body) {
+    if ([body.id, body.ids, body.folder].filter(value => value !== undefined).length > 1) throw new Error('id、ids 与 folder 只可指定一种');
+    const scope = body.scope || 'recursive';
+    if (!['direct', 'children', 'recursive'].includes(scope)) throw new Error('范围应为 direct、children 或 recursive');
+    let ids = body.ids || (body.id !== undefined ? [body.id] : []);
+    if (body.folder !== undefined) {
+      const name = text(body.folder, 1000);
+      if (!name) throw new Error('文件夹名不能为空');
+      const matches = all.filter(t => t.kind === 'folder' && t.name === name);
+      if (!matches.length) throw new Error(`文件夹不存在：${name}`);
+      if (matches.length > 1) throw new Error(`文件夹名称重复，请使用 --id：${matches.map(t => t.id).join(', ')}`);
+      ids = [matches[0].id];
+    }
+    if (!Array.isArray(ids) || ids.length > 100 || ids.some(id => typeof id !== 'string' || !id)) throw new Error('范围 ID 无效');
+    const roots = [...new Set(ids)].map(id => { const t = all.find(t => t.id === id); if (!t) throw new Error(`目标不存在：${id}`); return t; });
+    return { scope, roots };
+  }
+  function scopeGroups(all, { roots, scope }, works = defaultGroups(all)) {
+    if (!roots.length) return works;
+    const selected = new Map();
+    for (const root of roots) {
+      if (root.kind === 'video' || scope === 'direct') selected.set(root.id, root);
+      else if (scope === 'children') {
+        for (const t of all) if (t.kind === 'folder' && key(path.dirname(t.path)) === key(root.path)) selected.set(t.id, t);
+      } else {
+        const descendants = works.filter(t => inside(key(t.path), key(root.path)));
+        for (const t of descendants) selected.set(t.id, t);
+        // A season may have both episodes owned by its parent work and separate
+        // extra groups. Clip that parent partition to this selection as well.
+        const ancestor = works.find(t => t.id !== root.id && inside(key(root.path), key(t.path)) && t.members.some(m => inside(key(m.path), key(root.path))));
+        if (ancestor) {
+          const excludedPaths = ancestor.excludedPaths?.filter(p => inside(p, key(root.path)));
+          selected.set(root.id, { ...root, members: root.members.filter(m => !excludes(ancestor, m.path)), ...(excludedPaths?.length ? { excludedPaths } : {}) });
+        } else if (!descendants.length) selected.set(root.id, root);
+      }
+    }
+    return [...selected.values()];
+  }
+  function directStatus(t, s) {
+    return protectedTarget(t, s) ? 'completed' : underReview(t, s) ? 'review' : available(t, s) ? 'pending' : 'claimed';
+  }
+  function countsFor(groups, s) {
+    const counts = { pending: 0, completed: 0, review: 0, claimed: 0, total: groups.length };
+    for (const t of groups) counts[directStatus(t, s)]++;
+    return counts;
+  }
+  function contextFor(t, all) {
+    const names = [];
+    let p = t.kind === 'video' ? folderForMedia(t.members[0]) : path.dirname(t.path);
+    for (let i = 0; i < 2; i++) {
+      const parent = all.find(candidate => candidate.kind === 'folder' && key(candidate.path) === key(p));
+      if (!parent || parent.id === t.id) break;
+      names.unshift(parent.name);
+      p = path.dirname(parent.path);
+    }
+    return names;
+  }
+  function publicTarget(t, s, all, works) {
     const record = own(t.path, s);
-    const { groupPath, ...safeRecord } = { ...inherited(t.kind === 'video' ? folderForMedia(t.members[0]) : t.path), ...record };
-    return { ...safeRecord, id: t.id, kind: t.kind, name: t.name, version: version(t, s), protected: protectedTarget(t, s), status: protectedTarget(t, s) ? 'completed' : record?.status === 'review' ? 'review' : available(t, s) ? 'pending' : 'claimed' };
+    const { groupPath, excludedPaths, ...safeRecord } = { ...inherited(t.kind === 'video' ? folderForMedia(t.members[0]) : t.path), ...record };
+    const counts = countsFor(scopeGroups(all, { roots: [t], scope: 'recursive' }, works), s);
+    const ancestors = [];
+    let p = t.kind === 'video' ? folderForMedia(t.members[0]) : path.dirname(t.path);
+    while (true) {
+      const parent = all.find(candidate => candidate.kind === 'folder' && key(candidate.path) === key(p));
+      if (!parent || parent.id === t.id || ancestors.some(a => a.id === parent.id)) break;
+      ancestors.push(parent);
+      p = path.dirname(parent.path);
+    }
+    return { ...safeRecord, id: t.id, kind: t.kind, name: t.name, parentId: ancestors[0]?.id || null, ancestorNames: ancestors.reverse().map(a => a.name), version: version(t, s), counts,
+      // Protection of a direct write is intentionally stricter than completion
+      // of a recursive range: one labelled child must not block its siblings.
+      directProtected: protectedTarget(t, s), protected: counts.total > 0 && counts.completed === counts.total,
+      status: counts.claimed ? 'claimed' : counts.pending ? 'pending' : counts.review ? 'review' : 'completed' };
   }
-  function status() {
-    const all = targets(), groups = defaultGroups(all), counts = { pending: 0, completed: 0, review: 0, claimed: 0 };
-    for (const t of groups) counts[publicTarget(t, state).status]++;
-    return { ...counts, batches: active(state).map(b => ({ id: b.id, expiresAt: b.expiresAt, groups: b.groups.length })) };
+  function status(body = {}) {
+    fields(body, ['id', 'ids', 'folder', 'scope']);
+    const all = targets(), selection = resolveScope(all, body), groups = scopeGroups(all, selection), members = new Set(groups.flatMap(t => t.members.map(m => key(m.path))));
+    return { ...countsFor(groups, state), batches: active(state).filter(b => b.groups.some(g => g.members.some(p => members.has(p)))).map(b => ({ id: b.id, expiresAt: b.expiresAt, groups: b.groups.filter(g => g.members.some(p => members.has(p))).length })) };
   }
   function claim(body) {
-    fields(body, ['id', 'ids', 'scope', 'limit', 'retry']);
-    if (body.id && body.ids) throw new Error('id 与 ids 不可同时指定');
-    const scope = body.scope || 'direct';
-    if (!['direct', 'children', 'recursive'].includes(scope)) throw new Error('范围应为 direct、children 或 recursive');
+    fields(body, ['id', 'ids', 'folder', 'scope', 'limit', 'retry']);
     const limit = body.limit ?? 10;
     if (!Number.isInteger(limit) || limit < 1 || limit > 10) throw new Error('每批 1–10 个作品组');
     return transaction(s => {
-      const all = targets(), ids = body.ids || (body.id ? [body.id] : []);
-      if (!Array.isArray(ids) || ids.length > 100) throw new Error('范围 ID 无效');
-      const roots = ids.map(id => { const t = all.find(t => t.id === id); if (!t) throw new Error(`目标不存在：${id}`); return t; });
-      let candidates = roots.length ? all.filter(t => roots.some(r => t.id === r.id && (scope === 'direct' || r.kind === 'video') || r.kind === 'folder' && t.kind === 'folder' && (scope === 'children' ? key(path.dirname(t.path)) === key(r.path) : scope === 'recursive' && inside(key(t.path), key(r.path))))) : defaultGroups(all);
-      // Recursive scopes claim leaf/direct-media works, never one mixed library as a work.
-      if (scope === 'recursive') {
-        const works = defaultGroups(all);
-        candidates = roots.length ? works.filter(t => roots.some(r => r.kind === 'folder' && inside(key(t.path), key(r.path)) || r.id === t.id)) : works;
-        for (const r of roots.filter(r => r.kind === 'video')) candidates.push(r);
-      }
+      const all = targets(), candidates = scopeGroups(all, resolveScope(all, body));
       const selected = [], used = new Set();
       for (const t of candidates) {
         if (selected.length >= limit) break;
         if (body.retry === true) for (const [p, record] of Object.entries(s.records)) {
-          if (record.status === 'review' && inside(p, key(t.path))) s.records[p] = { version: randomUUID(), status: 'pending' };
+          if (record.status === 'review' && inside(p, key(t.path)) && !excludes(t, p)) s.records[p] = { version: randomUUID(), status: 'pending' };
         }
         if (!available(t, s) || t.members.some(m => used.has(key(m.path)))) continue;
         selected.push(t); t.members.forEach(m => used.add(key(m.path)));
       }
       if (!selected.length) return { batchId: null, groups: [] };
-      const batch = { id: randomUUID(), expiresAt: now() + leaseMs, groups: selected.map(t => ({ id: t.id, kind: t.kind, path: key(t.path), version: version(t, s), members: t.members.map(m => key(m.path)) })) };
+      const batch = { id: randomUUID(), expiresAt: now() + leaseMs, groups: selected.map(t => ({ id: t.id, kind: t.kind, path: key(t.path), version: version(t, s), members: t.members.map(m => key(m.path)), ...(t.excludedPaths ? { excludedPaths: t.excludedPaths } : {}) })) };
       s.batches[batch.id] = batch;
-      return { batchId: batch.id, expiresAt: batch.expiresAt, groups: selected.map(t => ({ id: t.id, version: version(t, s), kind: t.kind, directory: t.kind === 'folder' ? t.name : path.basename(folderForMedia(t.members[0])), representative: t.members[0].fileName, episodes: t.members.map((m, i) => ({ slot: i + 1, episode: episodeForMedia(m), seasonHint: m.fileName.match(/s(\d+)e\d+/i)?.[1] || path.basename(folderForMedia(m)) })) })) };
+      return { batchId: batch.id, expiresAt: batch.expiresAt, groups: selected.map(t => ({ id: t.id, version: version(t, s), kind: t.kind, directory: t.kind === 'folder' ? t.name : path.basename(folderForMedia(t.members[0])), context: contextFor(t, all), representative: (t.members.find(m => key(folderForMedia(m)) === key(t.path)) || t.members[0]).fileName, episodes: t.members.map((m, i) => ({ slot: i + 1, fileName: path.basename(m.path), episode: episodeForMedia(m), seasonHint: m.fileName.match(/s(\d+)e\d+/i)?.[1] || path.basename(folderForMedia(m)) })) })) };
     });
   }
   function batchFor(s, id) {
@@ -186,19 +255,22 @@ export async function createLabelService({ directory, getState, folderForMedia, 
       const claimed = batch.groups.find(t => t.id === g.id);
       if (!claimed || seen.has(g.id)) throw new Error('目标越界或重复');
       seen.add(g.id);
-      const target = all.find(t => t.id === g.id && key(t.path) === claimed.path);
+      const current = all.find(t => t.id === g.id && key(t.path) === claimed.path);
+      // Keep pre-partition batches compatible. A newer batch retains exactly
+      // its claimed partition even if another worker processes a sibling first.
+      const target = current && claimed.excludedPaths ? { ...current, members: current.members.filter(m => !excludes(claimed, m.path)) } : current;
       if (!target || claimed.version !== g.version || version(target, s) !== claimed.version || protectedTarget(target, s)) throw new Error('目标已改变或已有标题；手动修改优先，请释放批次');
       if (g.status === 'review') {
         if (g.titles || g.episodes) throw new Error('待确认项目不能提交标题');
         const reason = text(g.reason, 400);
         if (!reason) throw new Error('待确认需要简短原因');
-        changes.push([claimed.path, { status: 'review', reason }]);
+        changes.push([claimed.path, { status: 'review', reason, ...(claimed.excludedPaths ? { excludedPaths: claimed.excludedPaths } : {}) }]);
         continue;
       }
       if (g.status !== 'completed') throw new Error('状态应为 completed 或 review');
       const record = titles(g.titles, true);
       if (!hasTitle(record) || !record.originalTitle) throw new Error('请提供作品标题及首映正式原名');
-      changes.push([claimed.path, { ...record, status: 'completed' }]);
+      changes.push([claimed.path, { ...record, status: 'completed', ...(claimed.excludedPaths ? { excludedPaths: claimed.excludedPaths } : {}) }]);
       if (g.episodes !== undefined) {
         if (!Array.isArray(g.episodes)) throw new Error('集名应为数组');
         const slots = new Set();
@@ -216,11 +288,11 @@ export async function createLabelService({ directory, getState, folderForMedia, 
     return { batch, digest, changes };
   }
   return {
-    status, targets: () => targets().map(t => publicTarget(t, state)),
-    folder: p => inherited(p), own,
+    status, targets: () => { const all = targets(), works = defaultGroups(all); return all.map(t => publicTarget(t, state, all, works)); },
+    folder: p => { const record = inherited(p); if (!record) return null; const { groupPath, excludedPaths, ...safe } = record; return safe; }, own,
     media: m => {
       const override = own(m.path);
-      const { groupPath, ...record } = hasTitle(override) ? { ...override } : { ...inherited(folderForMedia(m)), ...override };
+      const { groupPath, excludedPaths, ...record } = hasTitle(override) ? { ...override } : { ...inherited(folderForMedia(m)), ...override };
       return record;
     },
     claim,
