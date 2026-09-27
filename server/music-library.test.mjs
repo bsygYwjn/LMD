@@ -245,8 +245,22 @@ try {
   assert.equal(compatibleResponse.headers.get("content-type"), "audio/flac");
   assert.equal((await compatibleResponse.arrayBuffer()).byteLength, 16);
 
+  const originalDownload = await fetch(`${lanBaseUrl}${alacTrack.downloadUrl}`);
+  assert.equal(originalDownload.status, 200);
+  assert.match(originalDownload.headers.get("content-disposition") || "", /^attachment; filename\*=UTF-8''/);
+  assert.deepEqual(Buffer.from(await originalDownload.arrayBuffer()), await readFile(alacPath), "download must return ALAC source bytes even after a FLAC compatibility copy exists");
+  const downloadHead = await fetch(`${lanBaseUrl}${localTrack.downloadUrl}`, { method: "HEAD" });
+  assert.equal(downloadHead.status, 200);
+  assert.equal(Number(downloadHead.headers.get("content-length")), (await readFile(flacPath)).length);
+  assert.equal((await downloadHead.arrayBuffer()).byteLength, 0);
+  const downloadRange = await fetch(`${lanBaseUrl}${localTrack.downloadUrl}`, { headers: { Range: "bytes=2-17" } });
+  assert.equal(downloadRange.status, 206);
+  assert.deepEqual(Buffer.from(await downloadRange.arrayBuffer()), (await readFile(flacPath)).subarray(2, 18));
+  const invalidDownloadRange = await fetch(`${lanBaseUrl}${localTrack.downloadUrl}`, { headers: { Range: "bytes=9999999999-" } });
+  assert.equal(invalidDownloadRange.status, 416);
+
   const storedState = JSON.parse(await readFile(path.join(dataDirectory, "state.json"), "utf8"));
-  assert.equal(storedState.version, 11);
+  assert.equal(storedState.version, 12);
   assert.equal(storedState.libraries.length, 1, "版本 8 的视频 libraries 必须原样保留");
   assert.equal(storedState.libraries[0].id, "legacy-library");
   assert.equal(storedState.media.length, 1, "版本 8 的视频记录必须在音乐迁移后保留");

@@ -2,7 +2,7 @@
 // only the requested time window to RGBA PNGs, crops each image to its alpha
 // bounds, and publishes the original canvas coordinates for browser drawing.
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { cropTransparentRgbaPng } from "./png-alpha-crop.mjs";
 import { playbackError } from "./playback-planner.mjs";
@@ -35,9 +35,9 @@ export function parseFrameIndex(text) {
   return frames;
 }
 
-export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, runCommand }) {
+export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, runCommand, scheduler }) {
   const root = path.join(cacheDirectory, "playback", "bitmaps");
-  const indexes = new Map(), running = new Map(), missing = new Map();
+  const indexes = new Map(), running = new Map(), missing = new Map(), executions = new Set();
   let lastSweep = 0;
 
   const keyFor = (media, track, signatureHash, windowId) => `${media.id}:${track.index}:${signatureHash}:${windowId}`;
@@ -76,9 +76,17 @@ export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, run
     }
   }
 
-  async function renderWindow(media, track, metadata, sourceSignature, signatureHash, start, duration, job) {
+  async function renderWindow(media, track, metadata, sourceSignature, signatureHash, start, duration, job, sourceIdentity) {
     const tools = getMediaTools();
     if (!tools.available) throw playbackError("TOOLS_UNAVAILABLE", "FFmpeg 尚未就绪，暂时无法渲染位图字幕", 503);
+    const checkSource = async () => {
+      const info = await stat(media.path).catch(() => null);
+      const identity = await realpath(media.path).catch(() => null);
+      if (!info?.isFile() || `${info.size}:${info.mtime.toISOString()}` !== sourceSignature || identity !== sourceIdentity)
+        throw playbackError('SOURCE_CHANGED', '字幕准备期间视频文件发生变化，请重新打开', 409);
+      if (job.cancelled) throw abortError();
+    };
+    await checkSource();
     const windowId = windowIdOf(start, duration), directory = directoryFor(media, track, signatureHash, windowId);
     const temporaryDirectory = `${directory}.partial-${randomUUID()}`;
     const mediaDuration = Number(metadata?.duration) || 0;
@@ -94,7 +102,7 @@ export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, run
         // mapping the subtitle stream directly asks image2 for a subtitle encoder.
         "-t", decodeDuration.toFixed(3), "-filter_complex", `[0:${track.index}]format=rgba,showinfo[caption]`,
         "-map", "[caption]", "-c:v", "png", "-fps_mode", "passthrough", "-f", "image2", "-y", pattern];
-      const result = await runCommand(tools.ffmpeg, args, 120000, { onChild: child => {
+      const result = await runCommand(tools.ffmpeg, args, 120000, { signal: job.controller.signal, onChild: child => {
         job.child = child;
         if (job.cancelled) child.kill();
       } });
@@ -119,6 +127,7 @@ export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, run
       const entry = { version: INDEX_VERSION, sourceSignature, signatureHash, trackIndex: track.index, codec: track.codec,
         windowId, start, duration, cues: prepared, createdAt: Date.now() };
       await writeFile(path.join(temporaryDirectory, "index.json"), JSON.stringify(entry));
+      await checkSource();
       await rm(directory, { recursive: true, force: true }).catch(() => {});
       await rename(temporaryDirectory, directory);
       return { ...entry, spriteDir: directory, usedAt: Date.now() };
@@ -129,7 +138,7 @@ export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, run
     }
   }
 
-  async function indexFor(media, track, metadata, start, duration, request) {
+  async function indexFor(media, track, metadata, start, duration, request, response, sourceIdentity) {
     const sourceSignature = sourceSignatureOf(media, metadata), signatureHash = signatureHashOf(sourceSignature);
     const windowId = windowIdOf(start, duration), key = keyFor(media, track, signatureHash, windowId);
     const cached = indexes.get(key);
@@ -140,9 +149,17 @@ export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, run
     const diskEntry = await loadEntry(media, track, sourceSignature, signatureHash, start, duration);
     if (diskEntry) { indexes.set(key, diskEntry); return diskEntry; }
     let job = running.get(key);
-    if (!job) {
-      job = { child: null, cancelled: false, consumers: new Set(), promise: null };
-      job.promise = renderWindow(media, track, metadata, sourceSignature, signatureHash, start, duration, job)
+    if (!job || job.cancelled) {
+      job = { child: null, cancelled: false, consumers: new Set(), promise: null, controller: new AbortController() };
+      const execute = async () => {
+        job.controller.signal.throwIfAborted();
+        const operation = renderWindow(media, track, metadata, sourceSignature, signatureHash, start, duration, job, sourceIdentity);
+        executions.add(operation);
+        try { return await operation; } finally { executions.delete(operation); }
+      };
+      const operation = scheduler ? scheduler.schedule({ key: `bitmap:${key}`, sourcePath: media.path, kind: 'bitmap', priority: 15,
+        signal: job.controller.signal, run: execute }) : execute();
+      job.promise = operation
         .then(entry => {
           indexes.set(key, entry); missing.delete(key);
           if (indexes.size > 16) for (const [oldestKey] of indexes) { if (indexes.size <= 16) break; if (oldestKey !== key) indexes.delete(oldestKey); }
@@ -162,13 +179,15 @@ export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, run
     const onAbort = () => {
       if (aborted) return;
       aborted = true; job.consumers.delete(consumer);
-      if (!job.consumers.size) { job.cancelled = true; job.child?.kill(); }
+      if (!job.consumers.size) { job.cancelled = true; job.controller.abort(abortError()); job.child?.kill(); }
       rejectAbort?.(abortError());
     };
     if (canAbort) request.once("aborted", onAbort);
+    response?.once?.('close', onAbort);
     try { return await (abortedPromise ? Promise.race([job.promise, abortedPromise]) : job.promise); }
     finally {
       if (typeof request?.off === "function") request.off("aborted", onAbort);
+      response?.off?.('close', onAbort);
       job.consumers.delete(consumer);
     }
   }
@@ -179,7 +198,11 @@ export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, run
     if (!["GET", "HEAD"].includes(request.method)) throw playbackError("METHOD_NOT_ALLOWED", "不支持的操作", 405);
     const media = deps.authorizedMediaForRequest(request, response, route[1]);
     if (!media) return true;
+    // Capture before probing/queueing: a reparse-point replacement must never
+    // establish a fresh trusted identity merely because it waited in the queue.
+    const sourceIdentity = await realpath(media.path);
     const metadata = await deps.playbackInfo(media);
+    if (await realpath(media.path).catch(() => null) !== sourceIdentity) throw playbackError('SOURCE_CHANGED', '视频来源路径已变化，请重新打开', 409);
     const track = metadata.tracks.find(item => item.index === Number(route[2]) && item.type === "subtitle");
     if (!track || !isBitmapTrack(track)) throw playbackError("NOT_BITMAP_SUBTITLE", "这不是可渲染的位图字幕轨道", 404);
     const sourceSignature = sourceSignatureOf(media, metadata), signatureHash = signatureHashOf(sourceSignature);
@@ -196,13 +219,16 @@ export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, run
       const cue = entry?.cues.find(item => item.fileName === resource);
       const file = cue && path.join(entry.spriteDir, cue.fileName), info = file ? await stat(file).catch(() => null) : null;
       if (!info?.isFile()) throw playbackError("SEGMENT_EXPIRED", "字幕图片已过期，请重新定位", 410);
+      if (!deps.authorizedMediaForRequest(request, response, route[1])) return true;
       entry.usedAt = Date.now();
       await deps.streamFile(request, response, file, false, { cacheControl: "private, max-age=3600, immutable" });
       return true;
     }
     const start = Math.max(0, Number(url.searchParams.get("start")) || 0);
     const duration = Math.min(MAX_WINDOW_SECONDS, Math.max(1, Number(url.searchParams.get("duration")) || 35));
-    const entry = await indexFor(media, track, metadata, start, duration, request);
+    const entry = await indexFor(media, track, metadata, start, duration, request, response, sourceIdentity);
+    // Permission changes while queued apply before exposing completed resources.
+    if (!deps.authorizedMediaForRequest(request, response, route[1])) return true;
     if (Date.now() - lastSweep > 600000) { lastSweep = Date.now(); void sweep().catch(() => {}); }
     const cues = entry.cues.filter(cue => cue.end > start && cue.start < start + duration).map(cue => publicCue(media, track, entry, cue));
     const canvasWidth = Math.max(track.width || 0, ...cues.map(cue => cue.canvasWidth));
@@ -215,8 +241,9 @@ export function createBitmapSubtitleService({ cacheDirectory, getMediaTools, run
 
   async function stop() {
     indexes.clear(); missing.clear();
-    for (const job of running.values()) { job.cancelled = true; job.child?.kill(); }
+    for (const job of running.values()) { job.cancelled = true; job.controller.abort(abortError()); job.child?.kill(); }
     await Promise.allSettled([...running.values()].map(job => job.promise));
+    await Promise.allSettled([...executions]);
   }
   return { handleRequest, stop, isBitmapTrack, status: () => ({ indexed: indexes.size, rendering: running.size, failed: missing.size }) };
 }

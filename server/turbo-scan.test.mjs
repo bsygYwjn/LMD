@@ -156,10 +156,10 @@ async function observeTurboScan(instance) {
       assert.equal(scan.mode, "turbo", "运行中的极速扫描必须标记 turbo 模式");
       assert.equal(scan.maxParallelFiles, TURBO_CONCURRENCY, "测试环境必须采用 LMD_TURBO_SCAN_CONCURRENCY 覆盖值");
       assert.equal(scan.maxParallelMediaTools, TURBO_MEDIA_TOOL_CONCURRENCY, "测试环境必须采用媒体工具并发覆盖值");
-      if (scan.progressPercent > 0 && scan.progressPercent < 100) observedIntermediateProgress = true;
+      if (scan.processedFiles > 0 && scan.phase !== "indexed") observedIntermediateProgress = true;
     }
 
-    if (!request.result.scanning && scan.phase === "completed" && scan.progressPercent === 100) {
+    if (!request.result.scanning && scan.phase === "indexed" && scan.progressPercent === 100) {
       assert.equal(scan.mode, "turbo");
       assert.equal(scan.pendingMode, null);
       assert.equal(scan.maxParallelFiles, TURBO_CONCURRENCY);
@@ -293,7 +293,7 @@ try {
   assert.equal(request.response.status, 200, request.result.error);
   assertScanShape(request.result.scan);
   assert.equal(request.result.scan.mode, "standard");
-  assert.equal(request.result.scan.phase, "completed");
+  assert.equal(request.result.scan.phase, "indexed");
   assert.equal(request.result.scan.progressPercent, 100);
   assert.equal(request.result.scan.processedFiles, VIDEO_COUNT);
 

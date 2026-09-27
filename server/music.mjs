@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { copyFile, mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseFile } from "music-metadata";
+import { validateDownloadSource } from "./downloads.mjs";
 
 const AUDIO_EXTENSIONS = new Set([
   ".mp3", ".aac", ".m4a", ".flac", ".wav", ".wave", ".aif", ".aiff", ".ogg", ".opus", ".ape", ".wv",
@@ -157,7 +158,7 @@ async function mapWithConcurrency(items, limit, mapper, onSettled = null) {
   return results;
 }
 
-async function walkAudioFiles(rootDirectory, depth = 0, output = [], status = { complete: true, errors: [], truncated: false }) {
+async function walkAudioFiles(rootDirectory, depth = 0, output = [], status = { complete: true, errors: [], truncated: false }, shouldHidePath = () => false) {
   if (depth > MAX_DEPTH || output.length >= MAX_TRACKS) {
     status.complete = false;
     status.truncated = true;
@@ -174,7 +175,8 @@ async function walkAudioFiles(rootDirectory, depth = 0, output = [], status = { 
   for (const entry of entries) {
     if (entry.name.startsWith(".")) continue;
     const fullPath = path.join(rootDirectory, entry.name);
-    if (entry.isDirectory()) await walkAudioFiles(fullPath, depth + 1, output, status);
+    if (shouldHidePath(fullPath)) continue;
+    if (entry.isDirectory()) await walkAudioFiles(fullPath, depth + 1, output, status, shouldHidePath);
     else if (entry.isFile() && AUDIO_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) output.push(fullPath);
     if (output.length >= MAX_TRACKS) {
       status.complete = false;
@@ -220,6 +222,9 @@ export function createMusicService({
   requireViewerAccess,
   canAccessFolderId,
   pathIsSameOrDescendant,
+  shouldHidePath = () => false,
+  decorateFolders = (_context, _kind, nodes) => nodes,
+  withDownloadSlot = (_request, _response, _context, operation) => operation(),
 }) {
   const coverCacheDirectory = path.join(cacheDirectory, "music-covers");
   const lyricsCacheDirectory = path.join(cacheDirectory, "music-lyrics");
@@ -274,6 +279,7 @@ export function createMusicService({
   }
 
   function canAccessTrack(context, track) {
+    if (shouldHidePath(track.path)) return false;
     if (context?.fullAccess) return true;
     return canAccessFolderId(context, accessFolderIdForTrack(track));
   }
@@ -291,6 +297,29 @@ export function createMusicService({
       return null;
     }
     return track;
+  }
+
+  function resolveOriginal(context, id) {
+    const track = appState.musicTracks.find((candidate) => candidate.id === id);
+    const library = track && libraryForTrack(track);
+    if (!track || !library || !canAccessTrack(context, track)) return null;
+    return { ...track, libraryPath: library.path, libraryName: library.name };
+  }
+
+  async function resolveRelated(context, track) {
+    const library = libraryForTrack(track);
+    if (!library || !canAccessTrack(context, track)) return { files: [], omittedCount: 0 };
+    // Reuse the exact sidecar and inherited-cover selection used during scan.
+    // Downloads always use these source paths, never generated cover/LRC caches.
+    const related = await Promise.all([findLyricsSidecar(track.path), findFolderCover(track.path, library.path)]);
+    const files = [];
+    const omittedKeys = [];
+    for (const source of related.filter(Boolean)) {
+      const candidate = { ...source, libraryId: library.id, libraryPath: library.path, libraryName: library.name };
+      if (!pathIsSameOrDescendant(source.path, library.path) || !canAccessTrack(context, candidate)) omittedKeys.push(path.resolve(source.path).toLowerCase());
+      else files.push(candidate);
+    }
+    return { files, omittedKeys, omittedCount: 0 };
   }
 
   function scanStatus() {
@@ -320,7 +349,7 @@ export function createMusicService({
     const directory = path.dirname(filePath);
     const wanted = `${path.basename(filePath, path.extname(filePath))}.lrc`.toLowerCase();
     const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
-    const entry = entries.find((item) => item.isFile() && item.name.toLowerCase() === wanted);
+    const entry = entries.find((item) => item.isFile() && item.name.toLowerCase() === wanted && !shouldHidePath(path.join(directory, item.name)));
     if (!entry) return null;
     const fullPath = path.join(directory, entry.name);
     const fileStat = await stat(fullPath).catch(() => null);
@@ -334,7 +363,7 @@ export function createMusicService({
     if (!pathIsSameOrDescendant(currentDirectory, rootDirectory)) currentDirectory = rootDirectory;
     while (pathIsSameOrDescendant(currentDirectory, rootDirectory)) {
       const entries = await readdir(currentDirectory, { withFileTypes: true }).catch(() => []);
-      const images = entries.filter((entry) => entry.isFile() && COVER_EXTENSIONS.has(path.extname(entry.name).toLowerCase()));
+      const images = entries.filter((entry) => entry.isFile() && COVER_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) && !shouldHidePath(path.join(currentDirectory, entry.name)));
       let selected = null;
       for (const name of COVER_NAMES) {
         selected = images.find((entry) => path.basename(entry.name, path.extname(entry.name)).toLowerCase() === name.toLowerCase());
@@ -545,7 +574,7 @@ export function createMusicService({
       const incompleteLibraries = [];
       for (const library of libraries) {
         const status = { complete: true, errors: [], truncated: false };
-        const found = await walkAudioFiles(library.path, 0, [], status);
+        const found = await walkAudioFiles(library.path, 0, [], status, shouldHidePath);
         if (!status.complete) incompleteLibraries.push({ library, status });
         for (const filePath of found) {
           const identity = await realpath(filePath).catch(() => path.resolve(filePath));
@@ -677,6 +706,7 @@ export function createMusicService({
       tags: track.tags || [],
       folderId: musicFolderId(track.libraryId, folderPathForTrack(track)),
       streamUrl: `/api/music/tracks/${track.id}/stream?variant=original`,
+      downloadUrl: `/api/music/tracks/${track.id}/download`,
       compatibleUrl: compatibleReady ? `/api/music/tracks/${track.id}/stream?variant=flac` : null,
       preferredMime: compatibleReady ? "audio/flac" : directPlayMime(track),
       coverUrls: track.coverPaths && Object.keys(track.coverPaths).length ? {
@@ -900,7 +930,7 @@ export function createMusicService({
       const context = requireViewerAccess(request, response);
       if (!context) return true;
       const tracks = accessibleTracks(context);
-      return sendJson(response, 200, { tracks: tracks.map((track) => publicTrack(track)), folders: folderNodes(tracks).map(({ path: _path, ...folder }) => folder), scan: scanStatus() }), true;
+      return sendJson(response, 200, { tracks: tracks.map((track) => publicTrack(track)), folders: decorateFolders(context, "music", folderNodes(tracks)).map(({ path: _path, ...folder }) => folder), scan: scanStatus() }), true;
     }
     if (request.method === "POST" && pathname === "/api/music/catalog/scan") {
       const context = requireViewerAccess(request, response);
@@ -950,6 +980,16 @@ export function createMusicService({
       if (scanContext) scanContext.cancelRequested = true;
       return sendJson(response, 200, { scan: scanStatus() }), true;
     }
+    if ((request.method === "GET" || request.method === "HEAD") && /^\/api\/music\/tracks\/[^/]+\/download$/.test(pathname)) {
+      const context = requireViewerAccess(request, response);
+      if (!context) return true;
+      const track = resolveOriginal(context, pathname.split("/")[4]);
+      if (!track) return sendJson(response, 404, { error: "找不到歌曲，或当前用户没有访问权限。" }), true;
+      try { await validateDownloadSource(track, shouldHidePath); }
+      catch { return sendJson(response, 404, { error: "原文件不存在或已不在授权目录中。" }), true; }
+      await withDownloadSlot(request, response, context, () => streamFile(request, response, track.path, false, { disposition: "attachment", fileName: track.fileName }));
+      return true;
+    }
     if ((request.method === "GET" || request.method === "HEAD") && /^\/api\/music\/tracks\/[^/]+\/stream$/.test(pathname)) {
       const trackId = pathname.split("/")[4];
       const track = authorizedTrack(request, response, trackId);
@@ -997,6 +1037,12 @@ export function createMusicService({
     queueAutomaticCompatibleCopies,
     cleanOrphanedCacheFiles,
     folderNodes,
+    folderId: musicFolderId,
+    libraryForItem: libraryForTrack,
+    canAccessTrack,
+    accessFolderIdForPath: (libraryId, filePath) => accessFolderIdForTrack({ libraryId, path: filePath }),
+    resolveOriginal,
+    resolveRelated,
     displayFolderSummaries,
     accessFolderSummaries,
     accessFolderAliases,

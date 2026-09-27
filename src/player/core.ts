@@ -1,5 +1,6 @@
 import Hls from "hls.js";
 import { LatestTaskQueue, type LatestTaskContext } from "./latest-task-queue.ts";
+import { SubtitlePreparationController, type SubtitlePreparation, type SubtitleResource } from "./subtitle-preparation.ts";
 
 export type MediaTrack = { id: string; index: number; type: string; codec: string; codecString: string; profile: string; level: number;
   width: number; height: number; frameRate: number; bitRate: number; bitDepth: number; channels: number; sampleRate: number;
@@ -8,13 +9,15 @@ export function audioTrackLabel(track: MediaTrack, ordinal: number) {
   return [track.title, track.language === "und" ? "未知语言" : track.language, track.codec.toUpperCase(),
     track.channels ? `${track.channels} 声道` : "", `轨道 ${ordinal + 1}`, track.default ? "默认" : "", track.forced ? "强制" : ""].filter(Boolean).join(" · ");
 }
-export type MediaInfo = { mediaId: string; version: number; sourceSignature: string; container: string; duration: number; startTime: number; bitRate: number; tracks: MediaTrack[] };
+export type MediaInfo = { mediaId: string; version: number; sourceSignature: string; sourceVersion?: string; subtitles?: SubtitleResource[]; container: string; duration: number; startTime: number; bitRate: number; tracks: MediaTrack[] };
 type Capabilities = { mse: boolean; nativeHls: boolean; h264: boolean; aac: boolean; direct: Record<string, boolean>; tracks: Record<string, { mse: boolean; file: boolean; smooth?: boolean; powerEfficient?: boolean }> };
 export type PlaybackState = { mediaId: string; currentTime: number; duration: number; paused: boolean; seeking: boolean; buffering: boolean;
   volume: number; muted: boolean; playbackRate: number; tracks: MediaTrack[]; audioTrackId: string | null;
   buffered: [number, number][]; seekable: [number, number][]; strategy: string; transport: string; timeOffset: number;
-  generation: number; error: string; errorCode: string; autoplayBlocked: boolean; firstFrameMs: number | null; lastSeekMs: number | null };
+  generation: number; error: string; errorCode: string; autoplayBlocked: boolean; firstFrameMs: number | null; lastSeekMs: number | null;
+  subtitleTracks?: SubtitleResource[]; subtitlePreparation?: SubtitlePreparation };
 type Session = { sessionId: string; generation: number; strategy: string; transport: string; duration: number; timeOffset: number; sourceStart: number; readyEnd: number;
+  sourceVersion?: string; subtitleTracks?: SubtitleResource[]; subtitle?: SubtitlePreparation;
   requestedTime: number; url: string; eof: boolean; state: string; error: { code: string; message: string } | null;
   heartbeatSeconds: number; buffer: { aheadSeconds: number; backBufferSeconds: number; maxBufferBytes: number };
   plan: { audio: { track: MediaTrack } | null; video: { track: MediaTrack }; fallbackLevel: number } };
@@ -96,6 +99,7 @@ export class PlaybackCore extends EventTarget {
   private desiredAudioTrackId: string | null = null;
   private pendingSeek = false;
   private readonly sessionUpdates: LatestTaskQueue<SessionUpdate>;
+  private readonly subtitles: SubtitlePreparationController;
   private state: PlaybackState = { mediaId: "", currentTime: 0, duration: 0, paused: true, seeking: false, buffering: false,
     volume: 1, muted: false, playbackRate: 1, tracks: [], audioTrackId: null, buffered: [], seekable: [], strategy: "", transport: "", timeOffset: 0,
     generation: 0, error: "", errorCode: "", autoplayBlocked: false, firstFrameMs: null, lastSeekMs: null };
@@ -103,6 +107,7 @@ export class PlaybackCore extends EventTarget {
   constructor(video: HTMLVideoElement) {
     super(); this.video = video; video.controls = false; video.playsInline = true;
     this.sessionUpdates = new LatestTaskQueue((update, context) => this.applySessionUpdate(update, context));
+    this.subtitles = new SubtitlePreparationController(api, subtitlePreparation => this.emit("subtitlechange", { subtitlePreparation }));
     for (const name of ["loadedmetadata", "durationchange", "play", "playing", "pause", "seeking", "seeked", "timeupdate", "ratechange", "volumechange", "waiting", "progress", "ended", "error"]) {
       const fn = () => this.onMediaEvent(name); video.addEventListener(name, fn); this.eventHandlers.push([name, fn]);
     }
@@ -147,7 +152,8 @@ export class PlaybackCore extends EventTarget {
     if (event === "seeked" && this.seekStarted) { patch.lastSeekMs = Math.round(performance.now() - this.seekStarted); this.seekStarted = 0; }
     this.emit(event, patch);
   }
-  async load(mediaId: string, options: { startTime?: number; autoplay?: boolean } = {}) {
+  async load(mediaId: string, options: { startTime?: number; autoplay?: boolean; retryProbe?: boolean } = {}) {
+    if (mediaId !== this.state.mediaId) this.subtitles.select(null);
     this.mediaInfo = null; this.capabilities = null;
     this.sessionUpdates.cancel(); this.pendingSeek = false; this.desiredAudioTrackId = null;
     this.sequence++; this.abort.abort(); this.abort = new AbortController();
@@ -155,11 +161,11 @@ export class PlaybackCore extends EventTarget {
     this.intent = options.autoplay !== false; this.fallbackLevel = 0; this.nativeFallback = false; this.ended = false; this.reloadAttempts = 0; this.startedAt = performance.now();
     this.emit("loading", { mediaId, currentTime: options.startTime || 0, duration: 0, tracks: [], error: "", errorCode: "", buffering: true, firstFrameMs: null, autoplayBlocked: false });
     try {
-      const info = await api<MediaInfo>(`/api/media/${mediaId}/info`, undefined, "GET", this.abort.signal);
+      const info = await api<MediaInfo>(`/api/media/${mediaId}/info${options.retryProbe ? "?retry=1" : ""}`, undefined, "GET", this.abort.signal);
       const capabilities = await detectCapabilities(this.video, info);
       if (sequence !== this.sequence || this.disposed) return;
       this.mediaInfo = info; this.capabilities = capabilities;
-      this.emit("loadedmetadata", { duration: info.duration, tracks: info.tracks });
+      this.emit("loadedmetadata", { duration: info.duration, tracks: info.tracks, subtitleTracks: info.subtitles });
       await this.openSession(options.startTime || 0);
     } catch (error) { if (sequence === this.sequence && !this.disposed) this.fail(error); }
   }
@@ -170,6 +176,7 @@ export class PlaybackCore extends EventTarget {
     this.video.pause(); this.video.removeAttribute("src"); this.video.load();
   }
   private releaseSession() {
+    this.subtitles.unbind();
     // keepalive keeps the release alive while the page is unloading; without it
     // the browser cancels the request and the server only frees the session when
     // the lease expires.
@@ -187,8 +194,9 @@ export class PlaybackCore extends EventTarget {
   private attachSession(session: Session, target: number, sequence: number) {
     if (sequence !== this.sequence || this.disposed) return;
     this.session = session; this.desiredAudioTrackId = session.plan.audio?.track.id || null;
+    this.subtitles.bind(session.sessionId, session.sourceVersion || this.mediaInfo?.sourceVersion || this.mediaInfo?.sourceSignature || "");
     this.emit("strategychange", { strategy: session.strategy, transport: session.transport, timeOffset: session.timeOffset, generation: session.generation,
-      audioTrackId: this.desiredAudioTrackId });
+      audioTrackId: this.desiredAudioTrackId, subtitleTracks: session.subtitleTracks || this.state.subtitleTracks });
     const start = Math.max(0, target - session.timeOffset);
     const onReady = () => {
       if (!this.isCurrentSession(session, sequence)) return;
@@ -399,7 +407,7 @@ export class PlaybackCore extends EventTarget {
   }
   private async retryPlayback() {
     if (!this.mediaInfo || !this.capabilities) {
-      await this.load(this.state.mediaId, { startTime: this.state.currentTime, autoplay: this.intent });
+      await this.load(this.state.mediaId, { startTime: this.state.currentTime, autoplay: this.intent, retryProbe: true });
       return;
     }
     this.networkRetry = 0; this.sessionUpdates.cancel(); this.pendingSeek = false;
@@ -441,12 +449,13 @@ export class PlaybackCore extends EventTarget {
     const target = this.currentTime;
     await this.queueSessionUpdate(target, trackId, false);
   }
+  selectSubtitle(trackId: string | null, retry = false) { this.subtitles.select(trackId, retry); }
   private pageHide = () => {
     this.sessionUpdates.cancel(); this.pendingSeek = false; this.sequence++; this.abort.abort(); this.releaseTransport();
   };
   private onOnline = () => { if (this.state.errorCode === "NETWORK_ERROR") void this.retry(); };
   async destroy() {
-    this.disposed = true; this.sessionUpdates.dispose(); this.pendingSeek = false; this.sequence++; this.abort.abort(); this.releaseTransport(); this.listeners.clear();
+    this.disposed = true; this.subtitles.dispose(); this.sessionUpdates.dispose(); this.pendingSeek = false; this.sequence++; this.abort.abort(); this.releaseTransport(); this.listeners.clear();
     for (const [event, handler] of this.eventHandlers) this.video.removeEventListener(event, handler);
     window.removeEventListener("pagehide", this.pageHide); window.removeEventListener("online", this.onOnline);
   }

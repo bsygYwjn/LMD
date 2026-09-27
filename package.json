@@ -36,8 +36,10 @@
     "test:playback-recovery": "node server/playback-boundaries.test.mjs && node server/player-recovery.test.mjs && node server/playback-corrupt-media.test.mjs"
   },
   "dependencies": {
+    "@noble/hashes": "^2.4.0",
     "music-metadata": "11.12.3",
-    "qrcode": "1.5.4"
+    "qrcode": "1.5.4",
+    "yazl": "^3.3.1"
   },
   "devDependencies": {
     "@tanstack/react-virtual": "3.13.12",

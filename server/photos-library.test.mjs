@@ -72,7 +72,7 @@ await mkdir(brokenLibrary, { recursive: true });
 for (const extension of formats) {
   const destination = extension === "tiff" ? nestedLibrary : galleryFolder;
   const content = extension === "svg"
-    ? Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30"><rect width="40" height="30" fill="#64d2ff"/></svg>')
+    ? Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30" onload="window.__lmdSvgExecuted=true"><script>window.__lmdSvgExecuted=true</script><image href="/api/health" width="1" height="1"/><rect width="40" height="30" fill="#64d2ff"/></svg>')
     : pixel;
   await writeFile(path.join(destination, `样例.${extension}`), content);
 }
@@ -138,6 +138,19 @@ try {
 
   const jpg = request.result.items.find((item) => item.extension === "JPG");
   const tiff = request.result.items.find((item) => item.extension === "TIFF");
+  const svg = request.result.items.find((item) => item.extension === "SVG");
+  for (const svgUrl of [`/api/photos/items/${svg.id}/file`, `/api/photos/items/${svg.id}/preview`, `/api/photos/items/${svg.id}/thumbnail?size=512`]) {
+    const svgResponse = await fetch(`${lanBaseUrl}${svgUrl}`);
+    assert.equal(svgResponse.status, 200);
+    if (svgResponse.headers.get("content-type")?.includes("svg")) {
+      const csp = svgResponse.headers.get("content-security-policy") || "";
+      assert.match(csp, /(?:^|;)\s*sandbox(?:;|$)/, "direct SVG documents must have an opaque sandboxed origin");
+      assert.match(csp, /script-src 'none'/, "uploaded scripts must not execute");
+      assert.match(csp, /default-src 'none'/, "SVG external references must be isolated");
+      assert.doesNotMatch(csp, /allow-scripts|allow-same-origin/);
+    }
+    await svgResponse.arrayBuffer();
+  }
   assert.ok(tiff.previewUrl, serverErrors || "TIFF 应生成浏览器兼容预览");
   let fileResponse = await fetch(`${lanBaseUrl}${jpg.downloadUrl}`, { method: "HEAD" });
   assert.equal(fileResponse.status, 200);
@@ -173,7 +186,7 @@ try {
   await jsonRequest(localBaseUrl, `/api/photos/libraries/${brokenLibraryId}`, { method: "DELETE" });
 
   const storedState = JSON.parse(await readFile(path.join(dataDirectory, "state.json"), "utf8"));
-  assert.equal(storedState.version, 11);
+  assert.equal(storedState.version, 12);
   assert.equal(storedState.photoItems.length, formats.length);
 
   const overview = (await jsonRequest(localBaseUrl, "/api/overview?compact=1")).result;

@@ -91,7 +91,11 @@ const libraryDirectory = path.join(temporaryRoot, "FontPackLibrary");
 const fontDirectory = path.join(libraryDirectory, "Fonts", "SeriesFonts");
 const expectedFont = testFont();
 await mkdir(fontDirectory, { recursive: true });
-await writeFile(path.join(libraryDirectory, "episode.mp4"), Buffer.from("test-video"));
+await new Promise((resolve, reject) => {
+  const ffmpeg = process.env.LMD_FFMPEG || path.join(PROJECT_DIR, 'tools', 'ffmpeg', 'bin', process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
+  const child = spawn(ffmpeg, ['-v', 'error', '-f', 'lavfi', '-i', 'color=size=64x64:rate=1:duration=2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', path.join(libraryDirectory, 'episode.mp4')], { windowsHide: true });
+  let errors = ''; child.stdout.resume(); child.stderr.on('data', chunk => { errors += chunk; }); child.once('error', reject); child.once('close', code => code === 0 ? resolve() : reject(new Error(errors)));
+});
 await writeFile(path.join(libraryDirectory, "episode.ass"), Buffer.from("[Script Info]\nScriptType: v4.00+\n"));
 await writeFile(path.join(fontDirectory, "series-font.ttf"), expectedFont);
 
@@ -123,11 +127,27 @@ try {
 
   const catalog = await (await fetch(`${baseUrl}/api/catalog`)).json();
   assert.equal(catalog.media.length, 1);
-  assert.deepEqual(catalog.media[0].fonts.map((font) => font.name), ["series-font.ttf"]);
-  assert.deepEqual(catalog.media[0].fonts[0].aliases, ["Series Font", "Series Font Regular", "SeriesFont-Regular"]);
-  const fontResponse = await fetch(`${baseUrl}${catalog.media[0].fonts[0].url}`);
+  assert.deepEqual(catalog.media[0].fonts, [], '基础扫描不读取字体包或解析字体');
+  const mediaId = catalog.media[0].id;
+  const info = (await jsonRequest(baseUrl, `/api/media/${mediaId}/info`)).result;
+  assert.deepEqual(info.fonts, [], '浏览详情不准备字体');
+  const created = await jsonRequest(baseUrl, `/api/media/${mediaId}/playback-sessions`, { method: 'POST', body: JSON.stringify({ capabilities: { direct: { '0:none': true } } }) });
+  assert.equal(created.response.status, 201, created.result.error); assert.equal(created.result.subtitle.state, 'off');
+  const endpoint = `/api/playback-sessions/${created.result.sessionId}`;
+  const selected = await jsonRequest(baseUrl, endpoint, { method: 'PATCH', body: JSON.stringify({ subtitleTrackId: info.subtitles[0].id, subtitleSelectionGeneration: 1 }) });
+  assert.equal(selected.response.status, 200, selected.result.error);
+  let prepared = selected.result.subtitle;
+  for (let i = 0; prepared.state !== 'ready' && i < 100; i++) {
+    assert.notEqual(prepared.state, 'failed', JSON.stringify(prepared.error));
+    await new Promise(resolve => setTimeout(resolve, 50)); prepared = (await jsonRequest(baseUrl, endpoint)).result.subtitle;
+  }
+  assert.equal(prepared.state, 'ready');
+  assert.deepEqual(prepared.fonts.map((font) => font.name), ["series-font.ttf"]);
+  assert.deepEqual(prepared.fonts[0].aliases, ["Series Font", "Series Font Regular", "SeriesFont-Regular"]);
+  const fontResponse = await fetch(`${baseUrl}${prepared.fonts[0].url}`);
   assert.equal(fontResponse.status, 200);
   assert.deepEqual(Buffer.from(await fontResponse.arrayBuffer()), expectedFont);
+  await jsonRequest(baseUrl, endpoint, { method: 'DELETE' });
   console.log("font pack directory test passed");
 } finally {
   await fetch(`${baseUrl}/api/service/stop`, { method: "POST" }).catch(() => {});

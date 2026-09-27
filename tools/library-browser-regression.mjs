@@ -20,9 +20,11 @@ const documents = ["TXT", "EPUB", "PDF"].map(extension => ({ id: extension.toLow
 const jsonRoutes = new Map([
   ["/api/auth/status", { enabled: false, authenticated: true, user: null }],
   ["/api/catalog", { media: [], folders: [], groups: [], scan }],
+  ["/api/video/scans/current", { taskId: null, scan }],
   ["/api/photos/catalog", { items: photos, folders: [folder("photos", photos.length)], scan }],
   ["/api/music/catalog", { tracks, folders: [{ ...folder("music", 2), kind: "music" }], scan }],
   ["/api/reading/catalog", { items: documents, folders: [{ ...folder("reading", 3), kind: "reading", ebookCount: 3, spreadsheetCount: 0 }], scan }],
+  ["/api/files/catalog", { items: [{ id: 'file1', fileName: '共享说明.txt', title: '共享说明.txt', size: 1234, modifiedAt: '2026-09-26', folderId: 'files', downloadUrl: '/fixture/book.txt' }], folders: [{ ...folder('files', 1), kind: 'files' }], scan }],
 ]);
 
 function zip(files) {
@@ -104,10 +106,15 @@ try {
   const wait = expression => session.waitFor(expression);
 
   await go("");
-  await wait("document.querySelectorAll('.appbar-nav button').length === 4");
-  assert.deepEqual(await session.evaluate("[...document.querySelectorAll('.appbar-nav button')].map(button => button.textContent)"), ["视频", "音乐", "电子书", "图片"]);
+  await wait("document.querySelectorAll('.appbar-nav button').length === 5");
+  assert.deepEqual(await session.evaluate("[...document.querySelectorAll('.appbar-nav button')].map(button => button.textContent)"), ["视频", "音乐", "电子书", "图片", "其他文件"]);
   assert.equal(await session.evaluate("document.querySelector('.appbar-nav .is-active').textContent"), "视频");
-  console.log("PASS library: video home and all four media navigation entries render");
+  console.log("PASS library: video home and all five navigation entries render");
+  await go('?section=files&folder=files');
+  await wait("document.body.textContent.includes('共享说明.txt')");
+  await session.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  assert.ok(await session.evaluate("document.documentElement.scrollWidth <= innerWidth + 1"), 'five navigation entries and file rows fit phone width');
+  await session.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
 
   await go("?section=photos&folder=photos");
   await wait("document.querySelectorAll('.ph-item').length === 80");
@@ -147,7 +154,7 @@ try {
   await go("?section=music&folder=music");
   await wait("document.querySelectorAll('.track-row').length === 2");
   const beforeOpen = await session.evaluate("history.length");
-  await click(".track-row");
+  await click(".track-row .track-main");
   await wait("new URL(location.href).searchParams.get('track') === 'm1'");
   assert.equal(await session.evaluate("history.length"), beforeOpen + 1, "explicit track opens must push history");
   await click('[aria-label="下一首"]');

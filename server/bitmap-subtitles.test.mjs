@@ -2,11 +2,12 @@
 // window-bounded FFmpeg work, signed cache URLs, cancellation and cooldown.
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createBitmapSubtitleService, parseFrameIndex, BITMAP_SUBTITLE_FORMATS } from "./bitmap-subtitles.mjs";
 import { cropTransparentRgbaPng, decodeRgbaPng, encodeRgbaPng } from "./png-alpha-crop.mjs";
+import { createMediaTaskScheduler } from './media-tasks.mjs';
 
 function rgbaFixture() {
   const pixels = Buffer.alloc(4 * 3 * 4);
@@ -27,7 +28,7 @@ function response() {
     end(body) { this.ended = true; this.body = body ?? null; return this; } };
 }
 
-export function createHarness({ frames = [], fail = null, root, customRunCommand = null } = {}) {
+export function createHarness({ frames = [], fail = null, root, customRunCommand = null, scheduler } = {}) {
   let runCount = 0;
   const invocations = [];
   const runCommand = customRunCommand || (async (_binary, args) => {
@@ -39,8 +40,10 @@ export function createHarness({ frames = [], fail = null, root, customRunCommand
     return { stdout: "", stderr: showinfo(frames) };
   });
   const requests = [];
-  const service = createBitmapSubtitleService({ cacheDirectory: root, getMediaTools: () => ({ available: true, ffmpeg: "ffmpeg" }), runCommand });
+  const service = createBitmapSubtitleService({ cacheDirectory: root, getMediaTools: () => ({ available: true, ffmpeg: "ffmpeg" }), runCommand, scheduler });
   const media = { id: "media-1", path: path.join(root, "movie.mkv"), size: 100, modifiedAt: "2024-01-01T00:00:00.000Z" };
+  mkdirSync(root, { recursive: true }); writeFileSync(media.path, Buffer.alloc(media.size));
+  media.modifiedAt = statSync(media.path).mtime.toISOString();
   const metadata = { duration: 360, tracks: [
     { index: 2, type: "subtitle", codec: "hdmv_pgs_subtitle", text: false, width: 4, height: 3 },
     { index: 3, type: "subtitle", codec: "subrip", text: true },
@@ -124,6 +127,7 @@ try {
 
     const oldImageUrl = image;
     harness.media.size = 101;
+    writeFileSync(harness.media.path, Buffer.alloc(101)); harness.media.modifiedAt = statSync(harness.media.path).mtime.toISOString();
     await harness.service.handleRequest({ method: "GET" }, response(), url, url.pathname, harness.deps);
     const replacementPayload = harness.requests.at(-1).payload;
     assert.notEqual(replacementPayload.sourceSignature, payload.sourceSignature);
@@ -168,6 +172,67 @@ try {
     assert.equal(killed, true, "远距离 Seek 取消旧请求后应终止无人使用的 FFmpeg");
     await harness.service.stop();
     console.log("PASS 请求取消会终止旧窗口渲染");
+  }
+  {
+    let release, signalStarted;
+    const gate = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { signalStarted = resolve; });
+    const harness = createHarness({ root: path.join(base, 'source-race'), customRunCommand: async () => { signalStarted(); await gate; return { stdout: '', stderr: '' }; } });
+    const url = new URL('http://localhost/api/media/media-1/bitmap-subtitles/2?start=150&duration=35');
+    const pending = harness.service.handleRequest({ method: 'GET' }, response(), url, url.pathname, harness.deps);
+    const rejected = assert.rejects(pending, { code: 'SOURCE_CHANGED' });
+    await started; writeFileSync(harness.media.path, Buffer.alloc(150)); release(); await rejected;
+    assert.equal(harness.requests.length, 0, '被替换源的视频不能发布旧窗口');
+    await harness.service.stop();
+    console.log('PASS 位图窗口提交前重新验证源版本');
+  }
+  {
+    const scheduler = createMediaTaskScheduler({ globalLimit: 1 });
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const active = scheduler.schedule({ key: 'other-video-read', run: () => gate });
+    const harness = createHarness({ root: path.join(base, 'queued-cancel'), scheduler });
+    const request = new EventEmitter(); request.method = 'GET';
+    const res = Object.assign(new EventEmitter(), response());
+    const url = new URL('http://localhost/api/media/media-1/bitmap-subtitles/2?start=150&duration=35');
+    const pending = harness.service.handleRequest(request, res, url, url.pathname, harness.deps);
+    const rejected = assert.rejects(pending, error => error.name === 'AbortError');
+    for (let i = 0; i < 100 && !scheduler.snapshot().queued; i++) await new Promise(resolve => setTimeout(resolve, 1));
+    assert.equal(scheduler.snapshot().queued, 1);
+    res.emit('close'); await rejected;
+    assert.equal(scheduler.snapshot().queued, 0);
+    release(); await active; await harness.service.stop(); await scheduler.close();
+    assert.equal(harness.runCount(), 0, '取消排队窗口不得稍后启动FFmpeg');
+    console.log('PASS 位图窗口共用磁盘预算，关闭排队请求不启动工具');
+  }
+  {
+    const harness = createHarness({ root: path.join(base, 'png-access-race'), frames: [{ n: 0, time: 1 }] });
+    const window = new URL('http://localhost/api/media/media-1/bitmap-subtitles/2?start=0&duration=10');
+    await harness.service.handleRequest({ method: 'GET' }, response(), window, window.pathname, harness.deps);
+    const image = new URL('http://localhost' + harness.requests.at(-1).payload.cues[0].url);
+    let allowed = true;
+    harness.deps.authorizedMediaForRequest = (_request, res) => { if (allowed) return harness.media; res.statusCode = 403; res.headersSent = true; return null; };
+    harness.deps.playbackInfo = async () => { allowed = false; return harness.metadata; };
+    const imageResponse = response();
+    await harness.service.handleRequest({ method: 'GET' }, imageResponse, image, image.pathname, harness.deps);
+    assert.equal(imageResponse.statusCode, 403); assert.equal(harness.requests.some(item => item.file), false, '探测等待期间撤权后不能发送已缓存PNG');
+    await harness.service.stop(); console.log('PASS 位图PNG在探测等待后重新检查访问权限');
+  }
+  {
+    const scheduler = createMediaTaskScheduler({ globalLimit: 1 }); let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const active = scheduler.schedule({ key: 'holding-device', run: () => gate });
+    const harness = createHarness({ root: path.join(base, 'queued-identity-race'), scheduler });
+    const url = new URL('http://localhost/api/media/media-1/bitmap-subtitles/2?start=150&duration=35');
+    const pending = harness.service.handleRequest({ method: 'GET' }, response(), url, url.pathname, harness.deps);
+    const rejected = assert.rejects(pending, { code: 'SOURCE_CHANGED' });
+    for (let i = 0; i < 100 && !scheduler.snapshot().queued; i++) await new Promise(resolve => setTimeout(resolve, 1));
+    assert.equal(scheduler.snapshot().queued, 1);
+    const replacement = path.join(base, 'different-source.mkv'); writeFileSync(replacement, Buffer.alloc(harness.media.size));
+    utimesSync(replacement, new Date(harness.media.modifiedAt), new Date(harness.media.modifiedAt));
+    assert.equal(statSync(replacement).mtime.toISOString(), harness.media.modifiedAt);
+    harness.media.path = replacement; release(); await active; await rejected;
+    assert.equal(harness.runCount(), 0, '相同size/mtime的新路径不得在出队时重设信任基准');
+    await harness.service.stop(); await scheduler.close(); console.log('PASS 位图排队期间源路径替换在启动FFmpeg前被拒绝');
   }
   {
     assert.ok(BITMAP_SUBTITLE_FORMATS.has("PGS") && BITMAP_SUBTITLE_FORMATS.has("VOBSUB"));

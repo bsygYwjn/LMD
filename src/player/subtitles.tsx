@@ -7,7 +7,7 @@ import { PlaybackCore, api } from "./core";
 import { assToWebVtt } from "./subtitle-text";
 import { assRendererFailureMessage, bitmapPaintPlan, type BitmapCue } from "./subtitle-rendering";
 
-export type Subtitle = { id: string; name: string; format: string; language: string; url: string; size?: number; modifiedAt?: string };
+export type Subtitle = { id: string; name: string; format: string; language: string; url: string | null; default?: boolean; state?: string; size?: number; modifiedAt?: string };
 export type FontAsset = { id: string; name: string; url: string; aliases?: string[]; modifiedAt?: string; size?: number };
 type Cue = { start: number; end: number; text: string };
 type BitmapWindow = { cues: BitmapCue[]; canvas?: { width: number; height: number }; width: number; height: number; total: number };
@@ -71,7 +71,7 @@ export function SubtitleOverlay({ core, subtitle, fonts, delay, mode, fallbackRe
     };
 
     void (async () => {
-      if (!subtitle) return;
+      if (!subtitle?.url) return;
       try {
         if (["PGS", "VOBSUB", "DVB", "DVD_SUBTITLE", "HDMV_PGS_SUBTITLE", "DVB_SUBTITLE"].includes(subtitle.format.toUpperCase())) {
           const windows = new Map<number, BitmapWindow>(), pictures = new Map<string, HTMLImageElement>();
@@ -187,6 +187,7 @@ export function SubtitleOverlay({ core, subtitle, fonts, delay, mode, fallbackRe
             if (active) await worker.resize(true, core.video.videoWidth || core.video.clientWidth, core.video.videoHeight || core.video.clientHeight);
           } catch (error) {
             if (!active || (error as Error).name === "AbortError") return;
+            console.warn("ASS renderer failed:", error);
             unsubscribe(); unsubscribe = () => {};
             stopAssRenderer(worker);
             worker = null; renderer.current = null;

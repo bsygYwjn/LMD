@@ -12,12 +12,20 @@ import { createLabelService } from "./labels.mjs";
 import { createMusicService } from "./music.mjs";
 import { createReadingService } from "./reading.mjs";
 import { createPhotoService } from "./photos.mjs";
+import { createFileService } from "./files.mjs";
+import { createDownloadService, validateDownloadSource } from "./downloads.mjs";
+import { createUploadService } from "./uploads.mjs";
+import { createTransferDirectoryService, uploadFormatSupported } from "./transfer-directories.mjs";
+import { createUploadIndexer } from "./upload-indexing.mjs";
 import { detectedEpisodeNumber, quickSelectionsForFolder } from "./video-selection.mjs";
 import { createPlaybackService } from "./playback.mjs";
 import { createDanmakuService } from "./danmaku.mjs";
 import { createPlayerTestService } from "./player-test.mjs";
 import { createBitmapSubtitleService } from "./bitmap-subtitles.mjs";
 import { METADATA_VERSION, normalizeProbe } from "./playback-planner.mjs";
+import { discoverVideos, createVideoChangeMonitor } from "./video-discovery.mjs";
+import { createMediaTaskScheduler } from "./media-tasks.mjs";
+import { createVideoResourceService, describeVideoResources, publicVideoResource, videoSourceVersion } from "./video-resources.mjs";
 
 // 这台电脑既是“视频硬盘”，也是局域网服务器。这个文件负责全部本地 API。
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -28,7 +36,7 @@ const SUBTITLE_CACHE_DIR = path.join(CACHE_DIR, "subtitles");
 const FONT_CACHE_DIR = path.join(CACHE_DIR, "fonts");
 const THUMBNAIL_CACHE_DIR = path.join(CACHE_DIR, "thumbnails");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
-const WEB_DIR = path.join(PROJECT_DIR, "dist");
+const WEB_DIR = process.env.LMD_WEB_DIR ? path.resolve(process.env.LMD_WEB_DIR) : path.join(PROJECT_DIR, "dist");
 const PORT = Number(process.env.LMD_PORT || process.env.LANTERN_PORT || 8096);
 const HOST = process.env.LMD_HOST || "0.0.0.0";
 const AUTO_SCAN_MIN_INTERVAL_SECONDS = 15;
@@ -38,11 +46,11 @@ const STANDARD_SCAN_CONCURRENCY = 3;
 const LOGICAL_PROCESSOR_COUNT = Math.max(1, availableParallelism());
 const TURBO_SCAN_CONCURRENCY = Number(process.env.LMD_TURBO_SCAN_CONCURRENCY) > 0
   ? Math.max(STANDARD_SCAN_CONCURRENCY, Math.round(Number(process.env.LMD_TURBO_SCAN_CONCURRENCY)))
-  : Math.min(256, Math.max(32, LOGICAL_PROCESSOR_COUNT * 8));
+  : 8;
 const STANDARD_SCAN_MEDIA_TOOL_CONCURRENCY = STANDARD_SCAN_CONCURRENCY;
 const TURBO_SCAN_MEDIA_TOOL_CONCURRENCY = Number(process.env.LMD_TURBO_SCAN_MEDIA_TOOL_CONCURRENCY) > 0
   ? Math.max(STANDARD_SCAN_MEDIA_TOOL_CONCURRENCY, Math.round(Number(process.env.LMD_TURBO_SCAN_MEDIA_TOOL_CONCURRENCY)))
-  : Math.min(32, Math.max(8, LOGICAL_PROCESSOR_COUNT));
+  : 2;
 const STANDARD_REMUX_CONCURRENCY = 1;
 const ACCELERATED_REMUX_CONCURRENCY = 3;
 const REMUX_ACCELERATION_DURATION_MS = process.env.NODE_ENV === "test" && Number(process.env.LMD_REMUX_ACCELERATION_DURATION_MS) > 0
@@ -65,6 +73,7 @@ const STARTUP_DIRECTORY = process.env.LMD_STARTUP_DIR || path.join(process.env.A
 const AUTOSTART_FILE = path.join(STARTUP_DIRECTORY, "LMD-开机自启.vbs");
 const TRAY_LAUNCHER = path.join(PROJECT_DIR, "启动LMD.vbs");
 const trackedChildProcesses = new Set();
+const mediaTaskScheduler = createMediaTaskScheduler();
 let sharingServiceIsStopping = false;
 const scryptAsync = promisify(scryptCallback);
 
@@ -123,7 +132,7 @@ function defaultAccessCategories() {
   return ["全年龄", "R-18"].map((name) => ({ id: randomUUID(), name, folderIds: [], createdAt: now, updatedAt: now }));
 }
 
-const STATE_VERSION = 11;
+const STATE_VERSION = 12;
 
 function defaultState() {
   return {
@@ -136,6 +145,9 @@ function defaultState() {
     readingItems: [],
     photoLibraries: [],
     photoItems: [],
+    fileLibraries: [],
+    fileItems: [],
+    fileDirectories: [],
     jobs: [],
     displayGroups: [],
     accessControl: {
@@ -151,6 +163,7 @@ function defaultState() {
       autoPrepareCompatibleCopies: true,
       autoScanEnabled: true,
       autoScanIntervalSeconds: 30,
+      uploadMaxFileBytes: 100 * 1024 ** 3,
       remuxAccelerationExpiresAt: null,
     },
   };
@@ -183,6 +196,8 @@ async function loadState() {
   const now = Date.now();
   return {
     version: STATE_VERSION,
+    catalogRevision: Number(stored.catalogRevision) || 0,
+    videoScan: stored.videoScan?.phase && ["discovering","indexing","cancelling"].includes(stored.videoScan.phase) ? { ...stored.videoScan, phase: "interrupted" } : stored.videoScan,
     libraries: Array.isArray(stored.libraries) ? stored.libraries : defaults.libraries,
     media: Array.isArray(stored.media) ? stored.media : defaults.media,
     musicLibraries: Array.isArray(stored.musicLibraries) ? stored.musicLibraries : defaults.musicLibraries,
@@ -191,10 +206,14 @@ async function loadState() {
     readingItems: Array.isArray(stored.readingItems) ? stored.readingItems : defaults.readingItems,
     photoLibraries: Array.isArray(stored.photoLibraries) ? stored.photoLibraries : defaults.photoLibraries,
     photoItems: Array.isArray(stored.photoItems) ? stored.photoItems : defaults.photoItems,
+    fileLibraries: Array.isArray(stored.fileLibraries) ? stored.fileLibraries : [],
+    fileItems: Array.isArray(stored.fileItems) ? stored.fileItems : [],
+    fileDirectories: Array.isArray(stored.fileDirectories) ? stored.fileDirectories : [],
     jobs: Array.isArray(stored.jobs) ? stored.jobs : defaults.jobs,
     displayGroups: Array.isArray(stored.displayGroups) ? stored.displayGroups : defaults.displayGroups,
     accessControl: {
       enabled: Boolean(storedAccessControl.enabled),
+      folderIdVersion: Number(storedAccessControl.folderIdVersion) || 0,
       users: Array.isArray(storedAccessControl.users) ? storedAccessControl.users : defaults.accessControl.users,
       sessions: Array.isArray(storedAccessControl.sessions)
         ? storedAccessControl.sessions.filter((session) => Date.parse(session.expiresAt || "") > now)
@@ -221,6 +240,13 @@ const labelService = await createLabelService({ directory: DATA_DIR, getState: (
 let musicService = null;
 let readingService = null;
 let photoService = null;
+let fileService = null;
+let uploadService = null;
+let directoryService = null;
+let downloadService = null;
+function shouldHideTransferPath(filePath) {
+  return String(filePath).split(/[\\/]/).some(segment => segment.toLowerCase() === '.lmd-uploads') || Boolean(uploadService?.isExcludedPath(filePath));
+}
 
 // A queued/running FFmpeg process cannot survive a server restart. Mark old
 // records clearly instead of leaving the management page stuck at “processing”.
@@ -233,6 +259,7 @@ for (const job of appState.jobs) {
 trimJobHistory();
 
 for (const user of appState.accessControl.users) {
+  user.canUpload = user.canUpload === true;
   user.categoryIds = [...new Set(Array.isArray(user.categoryIds) ? user.categoryIds.map(String) : [])];
   user.folderIds = [...new Set(Array.isArray(user.folderIds) ? user.folderIds.map(String) : [])];
 }
@@ -249,6 +276,8 @@ for (const category of appState.accessControl.categories) {
 let stateSaveScheduled = false;
 let stateSaveInFlight = null;
 let stateSaveDirty = false;
+let stateDirtyGeneration = 0;
+const stateSaveMetrics = { dirtyGeneration: 0, persistedGeneration: 0, saves: 0, serializedBytes: 0, serializationMs: 0, maxSerializationMs: 0, writeMs: 0, maxWriteMs: 0 };
 const STATE_REPLACE_RETRY_DELAYS_MS = [40, 80, 160, 320, 640, 1000];
 
 async function replaceStateFile(temporaryFile) {
@@ -271,14 +300,13 @@ async function replaceStateFile(temporaryFile) {
   }
 }
 
-// 状态持久化采用合并写：同 tick 内的多次 saveState 合并为一次磁盘写入，
-// 序列化在写入队列内执行（大媒体库不再阻塞调用方的事件循环）；写盘期间
-// 产生的新保存请求会触发下一轮写入，始终落盘最新状态，调用方 await 返回
-// 的 promise 保证本次修改已保存。Windows 杀毒软件或索引服务可能短暂占用
-// state.json，因此替换文件会有限重试；即使最终失败也必须复位队列，让后续
-// 保存可以重新开始，不能永久复用一个已拒绝的 promise。
+// 同 tick 的保存合并为一次原子替换。同步 JSON 序列化仍会占用事件循环，
+// 因而使用紧凑 JSON 并记录序列化/写入耗时；是否拆存储由实际规模决定。
+// 每个快照只确认自己覆盖的 dirty generation；写盘期间的新修改继续保存。
+// Windows 文件锁有限重试，失败后必须复位队列以允许后续重试。
 function saveState() {
   stateSaveDirty = true;
+  stateSaveMetrics.dirtyGeneration = ++stateDirtyGeneration;
   if (stateSaveScheduled) return stateSaveInFlight;
   stateSaveScheduled = true;
   const saveOperation = Promise.resolve()
@@ -287,9 +315,19 @@ function saveState() {
         if (!stateSaveDirty) return;
         stateSaveDirty = false;
         const temporaryFile = `${STATE_FILE}.tmp`;
-        const snapshot = JSON.stringify(appState, null, 2);
+        const generation = stateDirtyGeneration, serializationStart = performance.now();
+        const snapshot = JSON.stringify(appState);
+        const serializationMs = performance.now() - serializationStart;
+        stateSaveMetrics.serializationMs = serializationMs;
+        stateSaveMetrics.maxSerializationMs = Math.max(stateSaveMetrics.maxSerializationMs, serializationMs);
+        stateSaveMetrics.serializedBytes = Buffer.byteLength(snapshot);
+        const writeStart = performance.now();
         await writeFile(temporaryFile, snapshot, "utf8");
         await replaceStateFile(temporaryFile);
+        stateSaveMetrics.persistedGeneration = generation;
+        stateSaveMetrics.saves += 1;
+        stateSaveMetrics.writeMs = performance.now() - writeStart;
+        stateSaveMetrics.maxWriteMs = Math.max(stateSaveMetrics.maxWriteMs, stateSaveMetrics.writeMs);
       }
     });
   stateSaveInFlight = saveOperation.finally(() => {
@@ -383,6 +421,7 @@ function publicAccessUser(user) {
     id: user.id,
     categoryIds: Array.isArray(user.categoryIds) ? user.categoryIds : [],
     enabled: user.enabled !== false,
+    canUpload: user.canUpload === true,
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,
     lastLoginAt: user.lastLoginAt || null,
@@ -429,7 +468,7 @@ function accessSessionCookie(token, maxAge = ACCESS_SESSION_TTL_SECONDS) {
 }
 
 function accessContextForRequest(request) {
-  if (!appState.accessControl.enabled) return { fullAccess: true, mode: "simple", user: null };
+  if (!appState.accessControl.enabled) return { fullAccess: true, mode: "simple", user: null, localAdmin: isLoopbackRequest(request) && hasTrustedLocalHost(request) };
   if (isLoopbackRequest(request)) return { fullAccess: true, mode: "protected", user: null, localAdmin: true };
   if (!isLanRequest(request)) return null;
   const token = parseCookies(request)[ACCESS_SESSION_COOKIE];
@@ -483,6 +522,17 @@ function authorizedMediaForRequest(request, response, mediaId) {
     return null;
   }
   return media;
+}
+
+async function validateCurrentVideoSource(media) {
+  const current = appState.media.find(item => item.id === media.id);
+  const library = current && appState.libraries.find(item => item.id === current.libraryId);
+  if (!current || !library) throw Object.assign(new Error('视频已从媒体库移除。'), { code: 'SOURCE_CHANGED', statusCode: 409 });
+  const [actual, root, source] = await Promise.all([realpath(current.path).catch(() => null), realpath(library.path).catch(() => null), stat(current.path).catch(() => null)]);
+  if (!actual || !root || !source?.isFile() || !pathIsSameOrDescendant(actual, root)
+    || (current.sourceIdentity && path.resolve(actual).toLowerCase() !== path.resolve(current.sourceIdentity).toLowerCase()))
+    throw Object.assign(new Error('视频的实际位置已变化，请重新扫描。'), { code: 'SOURCE_CHANGED', statusCode: 409 });
+  return { current, actual, root, source, version: source.size + ':' + source.mtime.toISOString() };
 }
 
 const loginFailures = new Map();
@@ -555,7 +605,7 @@ function recordGlobalLoginFailure() {
 }
 
 function sameOriginMutation(request) {
-  if (!["POST", "PATCH", "DELETE"].includes(request.method || "")) return true;
+  if (!["PUT", "POST", "PATCH", "DELETE"].includes(request.method || "")) return true;
   const origin = request.headers.origin;
   if (!origin) return true;
   try {
@@ -683,22 +733,28 @@ async function readJson(request) {
 
 function runCommand(executable, args, timeoutMs = 15000, options = {}) {
   return new Promise((resolve, reject) => {
-    const { onChild = null, ...spawnOptions } = options;
+    const { onChild = null, signal = null, ...spawnOptions } = options;
+    if (signal?.aborted) return reject(signal.reason || new Error("资源请求已取消"));
     const child = spawnTracked(executable, args, { windowsHide: true, ...spawnOptions });
     onChild?.(child);
     const stdout = [];
     const stderr = [];
     let settled = false;
     let timedOut = false;
+    let aborted = false;
+    let forceTimer;
+    const terminate = () => { child.kill(); forceTimer ||= setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000); forceTimer.unref?.(); };
+    const abort = () => { aborted = true; terminate(); };
+    signal?.addEventListener("abort", abort, { once: true });
     const finish = (callback, value) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearTimeout(timer); clearTimeout(forceTimer); signal?.removeEventListener("abort", abort);
       callback(value);
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      terminate();
     }, timeoutMs);
     child.stdout.on("data", (chunk) => stdout.push(chunk));
     child.stderr.on("data", (chunk) => stderr.push(chunk));
@@ -706,11 +762,22 @@ function runCommand(executable, args, timeoutMs = 15000, options = {}) {
       finish(reject, error);
     });
     child.on("close", (code) => {
+      if (aborted) return finish(reject, signal.reason || Object.assign(new Error("资源请求已取消"), { code: "TASK_CANCELLED" }));
       if (timedOut) return finish(reject, new Error(`${path.basename(executable)} 运行超时`));
       if (code === 0) return finish(resolve, { stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") });
       return finish(reject, new Error(Buffer.concat(stderr).toString("utf8").trim() || `${path.basename(executable)} 退出码 ${code}`));
     });
   });
+}
+
+// Other libraries share the physical read budget at the actual tool boundary.
+// They retain their own cancellation ownership and do not nest this scheduler.
+function backgroundScheduledCommand(executable, args, timeoutMs, options = {}) {
+  const inputIndex = args.indexOf('-i');
+  const sourcePath = inputIndex >= 0 ? args[inputIndex + 1] : args.find(argument => typeof argument === 'string' && path.isAbsolute(argument));
+  if (!sourcePath || !path.isAbsolute(sourcePath)) return runCommand(executable, args, timeoutMs, options);
+  return mediaTaskScheduler.schedule({ key: 'background:' + randomUUID(), sourcePath, kind: 'background-media', priority: 60, signal: options.signal,
+    run: ({ signal }) => runCommand(executable, args, timeoutMs, { ...options, signal }) });
 }
 
 // FFmpeg 本地安装目录。默认放在项目 tools/ffmpeg 下；测试或特殊部署可通过
@@ -1083,6 +1150,7 @@ async function walkDirectory(rootDirectory, depth = 0, output = [], status = { c
   for (const entry of entries) {
     if (entry.name.startsWith(".")) continue;
     const fullPath = path.join(rootDirectory, entry.name);
+    if (shouldHideTransferPath(fullPath)) continue;
     if (entry.isDirectory()) await walkDirectory(fullPath, depth + 1, output, status, onVideoFound);
     else if (entry.isFile() && VIDEO_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
       output.push(fullPath);
@@ -1346,6 +1414,7 @@ async function indexFontPackDirectory(fontDirectory, depth = 0) {
   for (const entry of entries) {
     if (entry.name.startsWith(".")) continue;
     const fullPath = path.join(fontDirectory, entry.name);
+    if (shouldHideTransferPath(fullPath)) continue;
     const extension = path.extname(entry.name).toLowerCase();
     if (entry.isFile() && FONT_EXTENSIONS.has(extension)) {
       fontEntries.push(indexedFontEntry(fullPath, entry.name));
@@ -1359,7 +1428,7 @@ async function indexFontPackDirectory(fontDirectory, depth = 0) {
   return fontEntries;
 }
 
-async function findSidecarFiles(videoPath, directoryEntryCache = null) {
+async function findSidecarFiles(videoPath, directoryEntryCache = null, { prepareFonts = true } = {}) {
   const directory = path.dirname(videoPath);
   const videoStem = path.basename(videoPath, path.extname(videoPath)).toLowerCase();
   const directoryKey = process.platform === "win32" ? path.resolve(directory).toLowerCase() : path.resolve(directory);
@@ -1372,6 +1441,7 @@ async function findSidecarFiles(videoPath, directoryEntryCache = null) {
       let siblingVideoCount = 0;
       for (const entry of entries) {
         if (!entry.isFile()) continue;
+        if (shouldHideTransferPath(path.join(directory, entry.name))) continue;
         const extension = path.extname(entry.name).toLowerCase();
         const indexedEntry = {
           name: entry.name,
@@ -1395,17 +1465,18 @@ async function findSidecarFiles(videoPath, directoryEntryCache = null) {
         }
       }
       const fontPackDirectories = entries
-        .filter((entry) => entry.isDirectory() && FONT_PACK_DIRECTORY_PATTERN.test(entry.name))
+        .filter((entry) => entry.isDirectory() && FONT_PACK_DIRECTORY_PATTERN.test(entry.name) && !shouldHideTransferPath(path.join(directory, entry.name)))
         .map((entry) => path.join(directory, entry.name));
       const rootFontArchives = entries
         .filter((entry) => entry.isFile()
           && FONT_ARCHIVE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
+          && !shouldHideTransferPath(path.join(directory, entry.name))
           && FONT_ARCHIVE_NAME_PATTERN.test(path.basename(entry.name, path.extname(entry.name))))
         .map((entry) => path.join(directory, entry.name));
-      const discoveredFontEntries = await Promise.all([
+      const discoveredFontEntries = prepareFonts ? await Promise.all([
         ...fontPackDirectories.map((fontDirectory) => indexFontPackDirectory(fontDirectory)),
         ...rootFontArchives.map((archivePath) => extractFontArchive(archivePath)),
-      ]);
+      ]) : [];
       const knownFontPaths = new Set(fontEntries.map((entry) => path.resolve(entry.fullPath).toLowerCase()));
       for (const entry of discoveredFontEntries.flat()) {
         const fontPathKey = path.resolve(entry.fullPath).toLowerCase();
@@ -1459,7 +1530,7 @@ async function findSidecarFiles(videoPath, directoryEntryCache = null) {
       path: entry.fullPath,
       size: fileStat.size,
       modifiedAt: fileStat.mtime.toISOString(),
-      aliases: await readEntryAliases(entry, fileStat),
+      aliases: prepareFonts ? await readEntryAliases(entry, fileStat) : [],
     });
   }
   subtitles.sort((left, right) => left.name.localeCompare(right.name, "zh-CN", { numeric: true, sensitivity: "base" }));
@@ -1481,7 +1552,23 @@ function parseBitDepth(pixelFormat = "") {
   return match ? Number(match[1]) : 8;
 }
 
-async function probeVideo(filePath, executeCommand = runCommand) {
+async function probeVideo(filePath, executeCommand = runCommand, { signal } = {}) {
+  const before = await stat(filePath);
+  const canonicalPath = await realpath(filePath);
+  const signature = before.size + ':' + before.mtime.toISOString();
+  return mediaTaskScheduler.schedule({ key: 'probe:' + stableId(canonicalPath) + ':' + signature + ':v' + METADATA_VERSION,
+    sourcePath: canonicalPath, kind: 'probe', priority: 10, signal,
+    run: async ({ signal }) => {
+      const result = await probeVideoUnscheduled(filePath, (executable, args, timeoutMs, options = {}) => executeCommand(executable, args, timeoutMs, { ...options, signal }));
+      signal.throwIfAborted();
+      const after = await stat(filePath);
+      if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) throw Object.assign(new Error('视频文件已变化，请重试。'), { code: 'SOURCE_CHANGED', statusCode: 409 });
+      return result;
+    },
+  });
+}
+
+async function probeVideoUnscheduled(filePath, executeCommand = runCommand) {
   if (!mediaTools.available) return {};
   try {
     const args = [
@@ -1501,6 +1588,8 @@ async function probeVideo(filePath, executeCommand = runCommand) {
       extension: EMBEDDED_SUBTITLE_CODECS.get(stream.codec_name).extension,
       language: stream.tags?.language || "",
       title: stream.tags?.title || "",
+      default: Boolean(stream.disposition?.default),
+      forced: Boolean(stream.disposition?.forced),
     }));
     const embeddedFontStreams = (data.streams || []).filter((stream) => stream.codec_type === "attachment").map((stream) => ({
       index: stream.index,
@@ -1650,9 +1739,12 @@ async function extractEmbeddedAssets(filePath, mediaId, probe, sidecars, sourceS
 async function ensureVideoThumbnail(filePath, mediaId, durationSeconds = 0, existingPath = null, sourceSignature = "", sourceModifiedAt = 0, allowLegacyCache = true, executeCommand = runCommand) {
   const legacyPath = path.join(THUMBNAIL_CACHE_DIR, `${mediaId}.jpg`);
   const outputPath = path.join(THUMBNAIL_CACHE_DIR, `${mediaId}${sourceSignature ? `-${sourceSignature}` : ""}.jpg`);
-  const existingFile = existingPath && await usableCacheFile(existingPath, { signatureBound: true });
+  // The caller may have just re-probed a replaced source while still retaining
+  // its old thumbnail field. Only this version's exact filename is reusable.
+  const existingFile = existingPath && path.resolve(existingPath) === path.resolve(outputPath) && await usableCacheFile(existingPath, { signatureBound: true });
   if (existingFile) return existingFile.path;
-  const cached = await reusableGeneratedCachePath(outputPath, legacyPath, { sourceModifiedAt, allowLegacyCache });
+  const cached = await reusableGeneratedCachePath(outputPath, legacyPath, { sourceModifiedAt,
+    allowLegacyCache: allowLegacyCache && (!existingPath || path.resolve(existingPath) === path.resolve(legacyPath)) });
   if (cached) return cached.path;
   if (!mediaTools.available) return null;
 
@@ -1780,6 +1872,11 @@ let lastScanStartedAt = null;
 let lastScanCompletedAt = null;
 let lastScanError = null;
 let libraryRevision = 0;
+let catalogRevision = Number(appState.catalogRevision) || 0;
+let nextAutoScanAt = Number(appState.settings.nextAutoScanAt) || 0;
+let lastFullVideoScanAt = 0;
+let videoChangeMonitor = null;
+const scanHistory = new Map();
 
 function assertLibraryRevision(expectedRevision) {
   if (libraryRevision === expectedRevision) return;
@@ -1803,7 +1900,7 @@ function normalizedScanMode(value = "standard") {
 }
 
 function scanCancellationError() {
-  const error = new Error("本次最高性能扫描已手动停止");
+  const error = new Error("本次视频扫描已手动停止");
   error.code = "SCAN_CANCELLED";
   return error;
 }
@@ -1839,6 +1936,10 @@ function createScanContext(mode, libraries, scanLibraryRevision) {
     id: randomUUID(),
     mode,
     phase: "discovering",
+    indexedFiles: 0,
+    failedFiles: 0,
+    incompleteLibraries: 0,
+    metrics: { firstPublishedMs: null, publishCount: 0, saveMs: 0, discoveryMs: 0 },
     progressPercent: null,
     discoveredFiles: 0,
     processedFiles: 0,
@@ -1855,31 +1956,35 @@ function createScanContext(mode, libraries, scanLibraryRevision) {
   };
 }
 
-async function stopTurboScan() {
-  let stopped = false;
-  if (pendingScanMode === "turbo") {
-    pendingScanMode = null;
-    stopped = true;
+async function stopTurboScan({ wait = true, taskId = null } = {}) {
+  pendingScanMode = null;
+  const context = activeScanContext, scanPromise = activeScan;
+  if (taskId && context?.id !== taskId) return { stopped: false, scan: catalogScanStatus() };
+  if (!scanPromise || !context) return { stopped: false, scan: catalogScanStatus() };
+  context.cancelRequested = true; context.phase = "cancelling";
+  nextAutoScanAt = Date.now() + Math.max(60000, normalizedAutoScanIntervalSeconds() * 1000);
+  appState.settings.nextAutoScanAt = nextAutoScanAt;
+  if (wait) { try { await scanPromise; } catch {}
+    while (activeScan === scanPromise) await new Promise(resolve => setImmediate(resolve));
   }
-  const context = activeScanContext;
-  const scanPromise = activeScan;
-  if (scanPromise && context?.mode === "turbo") {
-    stopped = true;
-    context.cancelRequested = true;
-    context.phase = "cancelling";
-    context.cancelActiveMediaTools?.();
-    try { await scanPromise; }
-    catch { /* scanLibraries 会把用户取消转换成正常的 cancelled 状态。 */ }
-    while (activeScan === scanPromise) await new Promise((resolve) => setImmediate(resolve));
-  }
-  return { stopped, scan: catalogScanStatus() };
+  return { stopped: true, scan: catalogScanStatus() };
 }
 
-function catalogScanStatus() {
-  const context = activeScanContext || lastScanContext;
+function catalogScanStatus(selected = null) {
+  const context = selected || activeScanContext || lastScanContext;
   return {
+    protocolVersion: 2,
+    completion: "indexed",
+    catalogRevision,
+    indexedFiles: context?.indexedFiles || 0,
+    failedFiles: context?.failedFiles || 0,
+    incompleteLibraries: context?.incompleteLibraries || 0,
+    canCancel: Boolean(activeScan && context === activeScanContext && !context?.cancelRequested),
+    nextAutoScanAt: appState.settings.autoScanEnabled && nextAutoScanAt ? new Date(nextAutoScanAt).toISOString() : null,
+    scope: context?.scope || "full",
+    metrics: context?.metrics || null,
     enabled: Boolean(appState.settings.autoScanEnabled),
-    scanning: Boolean(activeScan),
+    scanning: Boolean(activeScan && (!selected || selected === activeScanContext)),
     intervalSeconds: normalizedAutoScanIntervalSeconds(),
     lastStartedAt: lastScanStartedAt,
     lastCompletedAt: lastScanCompletedAt,
@@ -1899,392 +2004,234 @@ function catalogScanStatus() {
   };
 }
 
-async function scanLibraries({ mode: requestedMode = "standard" } = {}) {
+function catalogRevisionFor(context) {
+  if (context?.fullAccess) return String(catalogRevision);
+  return stableId(accessibleMedia(context).map(media => [media.id, media.entryRevision || 0, media.metadata?.state || '', media.thumbnailPath || '', media.libraryId].join(':')).sort().join('|'));
+}
+function viewerScanStatus(context, selected = null) {
+  const state = catalogScanStatus(selected);
+  if (context?.localAdmin) return state;
+  const visible = accessibleMedia(context);
+  return { ...state, catalogRevision: catalogRevisionFor(context), discoveredFiles: visible.length, indexedFiles: visible.length,
+    processedFiles: visible.length, totalFiles: visible.length, processedLibraries: 0, totalLibraries: 0,
+    failedFiles: 0, incompleteLibraries: 0, metrics: null, lastError: state.lastError ? '部分目录暂不可读。' : null,
+    canCancel: false, maxParallelFiles: 0, maxParallelMediaTools: 0 };
+}
+
+async function scanLibraries({ mode: requestedMode = "standard", scopes = null, trigger = "manual" } = {}) {
   const mode = normalizedScanMode(requestedMode);
   if (sharingServiceIsStopping) throw new Error("共享服务正在关闭，已取消媒体扫描");
   if (activeScan) {
-    if (mode === "turbo" && activeScanContext?.libraryRevision !== libraryRevision) {
-      pendingScanMode = "turbo";
-      const previousScan = activeScan;
-      try { await previousScan; }
-      catch { /* 旧扫描失败或目录已变化时，仍继续执行用户请求的急速扫描。 */ }
-      return scanLibraries({ mode: "turbo" });
-    }
-    if (mode === "turbo" && activeScanContext?.mode !== "turbo") {
-      activeScanContext.mode = "turbo";
+    if (mode === "turbo" && activeScanContext) {
+      activeScanContext.mode = mode;
       activeScanContext.maxParallelFiles = TURBO_SCAN_CONCURRENCY;
-      activeScanContext.maxParallelMediaTools = TURBO_SCAN_MEDIA_TOOL_CONCURRENCY;
-      activeScanContext.increaseConcurrency?.(TURBO_SCAN_CONCURRENCY);
-      activeScanContext.increaseMediaToolConcurrency?.(TURBO_SCAN_MEDIA_TOOL_CONCURRENCY);
-      pendingScanMode = null;
-      return activeScan;
     }
     return activeScan;
   }
-  if (mode === pendingScanMode) pendingScanMode = null;
   const scanLibraryRevision = libraryRevision;
-  const scanLibrariesSnapshot = appState.libraries.map((library) => ({ ...library }));
-  const scanContext = createScanContext(mode, scanLibrariesSnapshot, scanLibraryRevision);
-  activeScanContext = scanContext;
-  lastScanContext = scanContext;
-  lastScanStartedAt = scanContext.startedAt;
-  lastScanError = null;
-  let rejectScanCancellation;
-  const scanCancellationPromise = new Promise((_, reject) => { rejectScanCancellation = reject; });
-  // scanWorkPromise 内部发布的媒体索引；提升到函数级作用域，供取消/失败
-  // 路径在 Promise.race 抢先 reject 后仍能物化已发布媒体。
-  let scanPublishedMediaById = null;
-  const scanWorkPromise = (async () => {
-    const sidecarDirectoryCache = new Map();
-    const scanChildProcesses = new Set();
-    const limitMediaToolTask = createResizableTaskLimiter(scanContext.maxParallelMediaTools);
-    scanContext.increaseMediaToolConcurrency = (limit) => limitMediaToolTask.increaseTo(limit);
-    scanContext.cancelActiveMediaTools = () => {
-      rejectScanCancellation(scanCancellationError());
-      for (const child of scanChildProcesses) {
-        try { child.kill(); }
-        catch { /* 子进程可能已经自行退出。 */ }
-      }
-    };
-    const assertScanNotCancelled = () => {
-      if (scanContext.cancelRequested) throw scanCancellationError();
-    };
-    const runScanMediaCommand = (executable, args, timeoutMs, options = {}) => limitMediaToolTask(() => {
-      assertScanNotCancelled();
-      return runCommand(executable, args, timeoutMs, {
-        ...options,
-        onChild: (child) => {
-          scanChildProcesses.add(child);
-          const forgetChild = () => scanChildProcesses.delete(child);
-          child.once("close", forgetChild);
-          child.once("error", forgetChild);
-        },
-      });
-    });
-    const oldMedia = new Map(appState.media.map((item) => [item.id, item]));
-    const oldMediaByPath = new Map(appState.media.map((item) => [path.resolve(item.path).toLowerCase(), item]));
-    const libraryOrderById = new Map(scanLibrariesSnapshot.map((library, index) => [library.id, index]));
-    const filesByPath = new Map();
-    const incompleteLibraries = [];
-    for (const library of scanLibrariesSnapshot) {
-      const walkStatus = { complete: true, errors: [], truncated: false };
-      const found = await walkDirectory(library.path, 0, [], walkStatus, () => {
-        assertScanNotCancelled();
-        scanContext.discoveredFiles += 1;
-      });
-      assertScanNotCancelled();
-      if (!walkStatus.complete) incompleteLibraries.push({ library, ...walkStatus });
-      assertScanNotCancelled();
-      assertLibraryRevision(scanLibraryRevision);
-      const candidates = await mapWithConcurrency(found, scanContext.maxParallelFiles, async (filePath) => {
-        assertScanNotCancelled();
-        const resolvedFilePath = path.resolve(filePath);
-        const previousMediaAtPath = oldMediaByPath.get(resolvedFilePath.toLowerCase());
-        const identityPath = await realpath(resolvedFilePath).catch(() => null);
-        assertScanNotCancelled();
-        assertLibraryRevision(scanLibraryRevision);
-        const owner = mostSpecificLibraryForPath(resolvedFilePath, scanLibrariesSnapshot) || library;
-        const legacyId = stableId(resolvedFilePath);
-        const identityId = identityPath ? stableId(identityPath) : (previousMediaAtPath?.id || legacyId);
-        const previousMedia = oldMedia.get(identityId) || oldMedia.get(legacyId) || previousMediaAtPath;
-        return {
-          filePath: resolvedFilePath,
-          identityId,
-          legacyId,
-          libraryId: owner.id,
-          wasPreviousOwner: previousMedia?.libraryId === owner.id,
-          libraryOrder: libraryOrderById.get(owner.id) ?? Number.MAX_SAFE_INTEGER,
-        };
-      });
-      assertScanNotCancelled();
-      assertLibraryRevision(scanLibraryRevision);
-      for (const candidate of candidates) {
-        const key = candidate.identityId;
-        const current = filesByPath.get(key);
-        const legacyIds = current?.legacyIds || new Set();
-        legacyIds.add(candidate.legacyId);
-        candidate.legacyIds = legacyIds;
-        const candidateIsPreferred = !current
-          || (candidate.wasPreviousOwner && !current.wasPreviousOwner)
-          || (candidate.wasPreviousOwner === current.wasPreviousOwner && candidate.libraryOrder < current.libraryOrder)
-          || (candidate.wasPreviousOwner === current.wasPreviousOwner && candidate.libraryOrder === current.libraryOrder && candidate.filePath.localeCompare(current.filePath) < 0);
-        if (candidateIsPreferred) filesByPath.set(key, candidate);
-      }
-      scanContext.processedLibraries += 1;
-    }
-    assertScanNotCancelled();
+  const libraries = appState.libraries.map(library => ({ ...library }));
+  const scanContext = createScanContext(mode, libraries, scanLibraryRevision);
+  scanContext.scope = scopes?.length ? "incremental" : "full";
+  scanContext.trigger = trigger;
+  activeScanContext = lastScanContext = scanContext;
+  scanHistory.set(scanContext.id, scanContext);
+  while (scanHistory.size > 20) scanHistory.delete(scanHistory.keys().next().value);
+  lastScanStartedAt = scanContext.startedAt; lastScanError = null;
+  const started = Date.now(), seenIds = new Set(), published = new Map(appState.media.map(media => [media.id, media]));
+  const oldMedia = new Map(appState.media.map(media => [media.id, media]));
+  const authoritativeMedia = new Map(appState.media.map(media => [media.id, media]));
+  const oldByPath = new Map(appState.media.map(media => [path.resolve(media.path).toLowerCase(), media]));
+  const pending = new Set(), reports = [], directoryCache = new Map();
+  let changed = false, publishPromise = null, publishFailure = null, timer = null;
+  const assertCurrent = () => {
+    if (scanContext.cancelRequested) throw scanCancellationError();
+    if (sharingServiceIsStopping) throw Object.assign(new Error("服务正在停止"), { code: "SERVICE_STOPPING" });
     assertLibraryRevision(scanLibraryRevision);
-    const files = [...filesByPath.values()];
-    scanContext.phase = "processing";
-    scanContext.totalFiles = files.length;
-    scanContext.progressPercent = files.length ? 0 : 95;
-
-    const scanSession = { cancelled: false, firstError: null };
-    const publishedMediaById = new Map(appState.media.map((media) => [media.id, media]));
-    scanPublishedMediaById = publishedMediaById;
-    let publishedSinceCheckpoint = 0;
-    let lastCheckpointAt = Date.now();
-    const assertCurrentScan = () => {
-      assertScanNotCancelled();
-      if (scanSession.cancelled) throw scanSession.firstError || new Error("媒体扫描已取消");
-      if (sharingServiceIsStopping) throw new Error("共享服务正在关闭，已取消媒体扫描");
-      assertLibraryRevision(scanLibraryRevision);
-    };
-    const publishScannedMedia = async (media, migratedFromIds) => {
-      assertCurrentScan();
-      if (!appState.libraries.some((library) => library.id === media.libraryId)) {
-        const error = new Error("视频目录已在扫描期间被删除，本次旧扫描结果已丢弃，请重新扫描。");
-        error.code = "LIBRARY_CHANGED_DURING_SCAN";
-        throw error;
-      }
-      for (const oldMediaId of migratedFromIds) publishedMediaById.delete(oldMediaId);
-      publishedMediaById.set(media.id, media);
-      for (const oldMediaId of migratedFromIds) {
-        const oldMediaItem = oldMedia.get(oldMediaId);
-        for (const job of appState.jobs) {
-          if (job.mediaId !== oldMediaId) continue;
-          if (oldMediaItem && job.sourceSignature === mediaSourceSignature(oldMediaItem)) {
-            job.sourceSignature = mediaSourceSignature(media);
-          }
-          job.mediaId = media.id;
-        }
-        const task = remuxTasksByMediaId.get(oldMediaId);
-        if (task && !remuxTasksByMediaId.has(media.id)) {
-          remuxTasksByMediaId.delete(oldMediaId);
-          task.mediaId = media.id;
-          remuxTasksByMediaId.set(media.id, task);
-        }
-      }
-      publishedSinceCheckpoint += 1;
-      const checkpoint = scanCheckpointConfigForMode(scanContext.mode);
-      if (publishedSinceCheckpoint >= checkpoint.itemCount || Date.now() - lastCheckpointAt >= checkpoint.intervalMs) {
-        publishedSinceCheckpoint = 0;
-        lastCheckpointAt = Date.now();
-        // 只在 checkpoint 时物化一次数组，避免每个文件都全量重建（O(n²)）。
-        appState.media = [...publishedMediaById.values()];
-        await saveState();
-        assertCurrentScan();
-      }
-      return media;
-    };
-    const scanOneMedia = async ({ filePath, identityId: id, legacyId, legacyIds, libraryId }) => {
-      try {
-        assertCurrentScan();
-        if (TEST_SCAN_FILE_DELAY_MS) await new Promise((resolve) => setTimeout(resolve, TEST_SCAN_FILE_DELAY_MS));
-        assertCurrentScan();
-        const fileStat = await stat(filePath);
-        assertCurrentScan();
-        const modifiedAt = fileStat.mtime.toISOString();
-        const sourceSignature = mediaSourceSignature({ id, size: fileStat.size, modifiedAt });
-        const existing = oldMedia.get(id)
-          || oldMedia.get(legacyId)
-          || [...legacyIds].map((candidateId) => oldMedia.get(candidateId)).find(Boolean);
-        const migratedFromIds = new Set([...legacyIds].filter((candidateId) => candidateId !== id && oldMedia.has(candidateId)));
-        if (existing?.id !== undefined && existing.id !== id) migratedFromIds.add(existing.id);
-        const unchanged = existing && existing.size === fileStat.size && existing.modifiedAt === modifiedAt;
-        let scannedMedia;
-        if (unchanged) {
-          // Refresh metadata independently of file identity. Existing assets and
-          // legacy compatible copies remain valid during this lazy migration.
-          if (mediaTools.available && existing.playbackMetadata?.version !== METADATA_VERSION) {
-            const updatedProbe = await probeVideo(filePath, runScanMediaCommand);
-            if (updatedProbe.playbackMetadata) Object.assign(existing, updatedProbe);
-          }
-          // The record still describes this file on disk; refresh the identity
-          // fields from the current stat so the catalog can never advertise a
-          // stale size/mtime whose signature contradicts the file. Without this,
-          // in-place probe refreshes leave playback sessions failing the
-          // source-signature check for a file that never actually changed.
-          existing.size = fileStat.size;
-          existing.modifiedAt = modifiedAt;
-          const sidecarsPromise = findSidecarFiles(filePath, sidecarDirectoryCache);
-          const thumbnailPromise = ensureVideoThumbnail(filePath, id, existing.durationSeconds, existing.thumbnailPath, sourceSignature, fileStat.mtimeMs, true, runScanMediaCommand);
-          const sidecars = await sidecarsPromise;
-          assertCurrentScan();
-          const hasEmbeddedProbeMetadata = Array.isArray(existing.embeddedSubtitleStreams) && Array.isArray(existing.embeddedFontStreams);
-          const embeddedAssetsPromise = hasEmbeddedProbeMetadata
-            ? extractEmbeddedAssets(filePath, id, existing, sidecars, sourceSignature, fileStat.mtimeMs, true, runScanMediaCommand)
-            : Promise.resolve({
-                subtitles: [...sidecars.subtitles, ...(existing.subtitles || []).filter((item) => item.source === "embedded")],
-                fonts: [...sidecars.fonts, ...(existing.fonts || []).filter((item) => item.source === "embedded")],
-              });
-          const [embeddedAssets, thumbnailPath] = await Promise.all([embeddedAssetsPromise, thumbnailPromise]);
-          assertCurrentScan();
-          const mediaIdChanged = existing.id !== id;
-          const oldSourceSignature = mediaSourceSignature(existing);
-          const migratedRemuxFile = mediaIdChanged && existing.remuxPath
-            ? await stat(existing.remuxPath).catch(() => null)
-            : null;
-          assertCurrentScan();
-          const migratedRemuxMatchesSource = Boolean(
-            existing.remuxPath
-            && migratedRemuxFile?.isFile()
-            && migratedRemuxFile.size > 0
-            && existing.remuxVersion === COMPATIBLE_COPY_VERSION
-            && existing.remuxSourceSignature === oldSourceSignature,
-          );
-          scannedMedia = {
-            ...existing,
-            id,
-            libraryId,
-            title: path.basename(filePath, path.extname(filePath)),
-            fileName: path.basename(filePath),
-            path: filePath,
-            extension: path.extname(filePath).slice(1).toUpperCase(),
-            posterHue: Number.parseInt(id.slice(0, 4), 16) % 360,
-            remuxPath: !mediaIdChanged || migratedRemuxMatchesSource ? existing.remuxPath : null,
-            remuxVersion: !mediaIdChanged || migratedRemuxMatchesSource ? existing.remuxVersion : null,
-            remuxSourceSignature: !mediaIdChanged
-              ? existing.remuxSourceSignature
-              : (migratedRemuxMatchesSource ? sourceSignature : null),
-            thumbnailPath,
-            subtitles: embeddedAssets.subtitles,
-            fonts: embeddedAssets.fonts,
-          };
-        } else {
-          const probe = await probeVideo(filePath, runScanMediaCommand);
-          assertCurrentScan();
-          const allowLegacyCache = !existing;
-          const sidecarsPromise = findSidecarFiles(filePath, sidecarDirectoryCache);
-          const thumbnailPromise = ensureVideoThumbnail(filePath, id, probe.durationSeconds, null, sourceSignature, fileStat.mtimeMs, allowLegacyCache, runScanMediaCommand);
-          const [sidecars, thumbnailPath] = await Promise.all([
-            sidecarsPromise.then((sidecarFiles) => extractEmbeddedAssets(filePath, id, probe, sidecarFiles, sourceSignature, fileStat.mtimeMs, allowLegacyCache, runScanMediaCommand)),
-            thumbnailPromise,
-          ]);
-          assertCurrentScan();
-          const remuxMatchesSource = existing?.remuxSourceSignature === sourceSignature;
-          const nextMedia = {
-            id,
-            libraryId,
-            title: path.basename(filePath, path.extname(filePath)),
-            fileName: path.basename(filePath),
-            path: filePath,
-            extension: path.extname(filePath).slice(1).toUpperCase(),
-            size: fileStat.size,
-            modifiedAt,
-            tags: existing?.tags || [],
-            posterHue: Number.parseInt(id.slice(0, 4), 16) % 360,
-            remuxPath: remuxMatchesSource ? existing.remuxPath : null,
-            remuxVersion: remuxMatchesSource ? existing.remuxVersion : null,
-            remuxSourceSignature: remuxMatchesSource ? existing.remuxSourceSignature : null,
-            thumbnailPath,
-            subtitles: sidecars.subtitles,
-            fonts: sidecars.fonts,
-            ...probe,
-          };
-          scannedMedia = existing ? { ...existing, ...nextMedia } : nextMedia;
-        }
-        assertCurrentScan();
-        return await publishScannedMedia(scannedMedia, migratedFromIds);
-      } catch (error) {
-        if (!scanSession.firstError) scanSession.firstError = error;
-        scanSession.cancelled = true;
-        throw error;
-      }
-    };
-
-    const scanWorkerControl = {};
-    scanContext.increaseConcurrency = (limit) => scanWorkerControl.increaseTo?.(limit);
-    const scanned = await mapWithResizableConcurrency(files, scanContext.maxParallelFiles, scanOneMedia, () => {
-      scanContext.processedFiles += 1;
-      scanContext.progressPercent = scanContext.totalFiles
-        ? Math.min(95, Math.round(scanContext.processedFiles / scanContext.totalFiles * 95))
-        : 95;
-    }, scanWorkerControl);
-    delete scanContext.increaseConcurrency;
-    delete scanContext.increaseMediaToolConcurrency;
-    assertCurrentScan();
-    if (incompleteLibraries.length) {
-      await saveState();
-      assertCurrentScan();
-      const names = incompleteLibraries.map(({ library }) => library.name || library.path).join("、");
-      const error = new Error(`部分视频目录未能完整读取（${names}），已保留旧索引并发布本次成功识别的视频。`);
-      error.code = "SCAN_ENUMERATION_INCOMPLETE";
-      throw error;
+  };
+  const materialize = () => {
+    const live = new Map(appState.media.map(media => [media.id, media]));
+    // Manual edits and on-demand resource updates happen on the authoritative
+    // object. Do not replace those objects with stale copies from scan start.
+    for (const [id, item] of published) {
+      const current = live.get(id);
+      if (current && current !== item) published.set(id, { ...item, tags: current.tags, ...(current.modifiedAt === item.modifiedAt && current.size === item.size ? current : {}) });
     }
-    const scannedLibraryIds = new Set(scanLibrariesSnapshot.map((library) => library.id));
-    // The freshly published object wins over any older copy held by the live
-    // index or the scan checkpoint: it carries this scan's identity fields and
-    // receives every in-place refresh (playback probe, thumbnail) as well. Any
-    // other copy can describe older bytes and would make stored signatures
-    // contradict the file on disk.
-    const publishedForId = (id) => publishedMediaById.get(id) || liveMediaById.get(id) || null;
-    const unrelatedMedia = appState.media.filter((media) => !scannedLibraryIds.has(media.libraryId));
-    const finalMedia = [
-      ...unrelatedMedia,
-      ...scanned.map((media) => publishedForId(media.id) || media),
-    ];
-    const finalMediaIds = new Set(finalMedia.map((media) => media.id));
-    const prunedMedia = appState.media.filter((media) => scannedLibraryIds.has(media.libraryId) && !finalMediaIds.has(media.id));
-    appState.media = finalMedia;
-    scanContext.phase = "finalizing";
-    scanContext.progressPercent = 98;
+    materializePublishedMedia(published, libraries);
+  };
+  const flush = async (terminal = false) => {
+    if (publishPromise) await publishPromise;
+    if (!changed) return;
+    if (!terminal) assertCurrent();
+    changed = false; materialize();
+    catalogRevision += 1; appState.catalogRevision = catalogRevision;
+    scanContext.metrics.publishCount += 1;
+    scanContext.metrics.firstPublishedMs ??= Date.now() - started;
+    const savingAt = Date.now();
+    publishPromise = saveState();
+    try { await publishPromise; } finally { publishPromise = null; scanContext.metrics.saveMs += Date.now() - savingAt; }
+  };
+  const scanWork = (async () => {
+    // Canonical roots are resolved before publication, including aliases and
+    // nested libraries, to choose one stable owner before any viewer sees it.
+    const roots = await Promise.all(libraries.map(async library => ({ ...library, realRoot: await realpath(library.path).catch(() => null) })));
+    assertCurrent();
+    const scanScopes = (scopes?.length ? scopes : libraries.map(library => library.path)).map(scope => path.resolve(scope))
+      .filter(scope => libraries.some(library => pathIsSameOrDescendant(scope, library.path)))
+      .filter((scope, index, all) => !scopes?.length || !all.some((other, otherIndex) => otherIndex !== index && pathIsSameOrDescendant(scope, other) && (scope !== other || otherIndex < index)));
+    timer = setInterval(() => { if (!publishPromise && changed && !scanContext.cancelRequested) void flush().catch(error => { publishFailure = error; }); }, 250);
+    timer.unref();
+    const indexCandidate = async (candidatePath, report) => {
+      assertCurrent();
+      if (TEST_SCAN_FILE_DELAY_MS) await new Promise(resolve => setTimeout(resolve, TEST_SCAN_FILE_DELAY_MS));
+      assertCurrent();
+      let identityPath, fileStat;
+      try { [identityPath, fileStat] = await Promise.all([realpath(candidatePath), stat(candidatePath)]); }
+      catch (error) { report.complete = false; report.errors.push({ path: candidatePath, code: error.code || 'FILE_UNAVAILABLE' }); scanContext.failedFiles += 1; return; }
+      assertCurrent();
+      if (!fileStat.isFile() || shouldHideTransferPath(candidatePath)) return;
+      const id = stableId(identityPath);
+      const previousAtPath = oldByPath.get(path.resolve(candidatePath).toLowerCase());
+      const existing = oldMedia.get(id) || oldMedia.get(stableId(candidatePath)) || previousAtPath;
+      const owners = roots.filter(library => library.realRoot && pathIsSameOrDescendant(identityPath, library.realRoot));
+      owners.sort((a, b) => b.realRoot.length - a.realRoot.length || Number(b.id === existing?.libraryId) - Number(a.id === existing?.libraryId) || libraries.findIndex(library => library.id === a.id) - libraries.findIndex(library => library.id === b.id));
+      const owner = owners[0];
+      if (!owner) { report.complete = false; report.errors.push({ path: candidatePath, code: 'SOURCE_OUTSIDE_LIBRARY' }); return; }
+      if (seenIds.has(id)) return;
+      seenIds.add(id);
+      const filePath = path.join(owner.path, path.relative(owner.realRoot, identityPath));
+      const modifiedAt = fileStat.mtime.toISOString();
+      const unchanged = existing?.size === fileStat.size && existing?.modifiedAt === modifiedAt;
+      const sourceSignature = mediaSourceSignature({ id, size: fileStat.size, modifiedAt });
+      const sidecars = await findSidecarFiles(filePath, directoryCache, { prepareFonts: false });
+      assertCurrent();
+      const confirmedStat = await stat(filePath).catch(() => null);
+      assertCurrent();
+      if (!confirmedStat || confirmedStat.size !== fileStat.size || confirmedStat.mtimeMs !== fileStat.mtimeMs) {
+        report.complete = false; report.errors.push({ path: filePath, code: 'SOURCE_WRITING' });
+        scanContext.failedFiles += 1; videoChangeMonitor?.mark(path.dirname(filePath));
+        return;
+      }
+      let remuxPath = unchanged ? existing?.remuxPath : null;
+      if (existing?.id !== id && remuxPath) {
+        const cached = await stat(remuxPath).catch(() => null);
+        if (!cached?.isFile() || !cached.size || existing.remuxVersion !== COMPATIBLE_COPY_VERSION || existing.remuxSourceSignature !== mediaSourceSignature(existing)) remuxPath = null;
+      }
+      assertCurrent();
+      // Keep source-bound metadata only when bytes are unchanged. No FFmpeg,
+      // thumbnail generation, full subtitles or font extraction runs here.
+      const media = {
+        ...(existing || {}), id, libraryId: owner.id, path: filePath, sourceIdentity: identityPath,
+        title: existing?.title || path.basename(filePath, path.extname(filePath)), fileName: path.basename(filePath),
+        extension: path.extname(filePath).slice(1).toUpperCase(), size: fileStat.size, modifiedAt,
+        tags: existing?.tags || [], posterHue: Number.parseInt(id.slice(0, 4), 16) % 360,
+        availability: 'online', sourceVersion: videoSourceVersion({ size: fileStat.size, modifiedAt }), entryRevision: existing?.entryRevision || 0,
+        metadata: unchanged && existing?.playbackMetadata?.version === METADATA_VERSION ? { state: 'ready', version: METADATA_VERSION } : { state: 'unknown', version: METADATA_VERSION },
+        playbackMetadata: unchanged ? existing?.playbackMetadata : null,
+        thumbnailPath: unchanged ? existing?.thumbnailPath || null : null,
+        thumbnail: { state: unchanged && existing?.thumbnailPath ? 'ready' : 'unknown' },
+        remuxPath, remuxVersion: remuxPath ? existing.remuxVersion : null,
+        remuxSourceSignature: remuxPath ? sourceSignature : null,
+        embeddedSubtitleStreams: unchanged ? existing?.embeddedSubtitleStreams || [] : [],
+        embeddedFontStreams: unchanged ? existing?.embeddedFontStreams || [] : [],
+        subtitles: [...sidecars.subtitles, ...(unchanged ? (existing?.subtitles || []).filter(item => item.source === 'embedded') : [])],
+        fonts: [...sidecars.fonts.map(font => unchanged ? (existing?.fonts || []).find(old => old.id === font.id && old.size === font.size && old.modifiedAt === font.modifiedAt) || font : font), ...(unchanged ? (existing?.fonts || []).filter(item => item.source === 'embedded') : [])],
+      };
+      Object.assign(media, describeVideoResources(media));
+      if (!unchanged) for (const field of ['durationSeconds','container','width','height','videoCodec','videoProfile','audioCodec','pixelFormat','bitDepth','hdr','colorPrimaries','probeError']) media[field] = null;
+      if (existing?.id && existing.id !== id) {
+        published.delete(existing.id);
+        for (const job of appState.jobs) if (job.mediaId === existing.id) { if (job.sourceSignature === mediaSourceSignature(existing)) job.sourceSignature = sourceSignature; job.mediaId = id; }
+        const remux = remuxTasksByMediaId.get(existing.id);
+        if (remux && !remuxTasksByMediaId.has(id)) { remuxTasksByMediaId.delete(existing.id); remux.mediaId = id; remuxTasksByMediaId.set(id, remux); }
+      }
+      const sameRecord = existing && JSON.stringify(existing) === JSON.stringify(media);
+      if (!sameRecord) {
+        media.entryRevision += 1;
+        const authoritative = authoritativeMedia.get(id);
+        if (authoritative) { Object.assign(authoritative, media, { tags: authoritative.tags }); published.set(id, authoritative); }
+        else { published.set(id, media); authoritativeMedia.set(id, media); }
+        changed = true;
+      }
+      scanContext.indexedFiles += 1; scanContext.processedFiles += 1;
+      scanContext.totalFiles = scanContext.discoveredFiles;
+      if (scanContext.metrics.firstPublishedMs === null) await flush();
+    };
+    for (const scope of scanScopes) {
+      assertCurrent();
+      const report = { scope, complete: true, errors: [], truncated: false };
+      reports.push(report);
+      for await (const filePath of discoverVideos(scope, { extensions: VIDEO_EXTENSIONS, hidden: shouldHideTransferPath, assertCurrent, report })) {
+        assertCurrent(); if (publishFailure) throw publishFailure;
+        scanContext.discoveredFiles += 1; scanContext.totalFiles = scanContext.discoveredFiles;
+        const operation = indexCandidate(filePath, report).catch(error => { publishFailure ||= error; }).finally(() => pending.delete(operation));
+        pending.add(operation);
+        if (pending.size >= scanContext.maxParallelFiles) await Promise.race(pending);
+      }
+      scanContext.processedLibraries = Math.min(scanContext.totalLibraries, scanContext.processedLibraries + 1);
+    }
+    scanContext.metrics.discoveryMs = Date.now() - started;
+    scanContext.phase = 'indexing';
+    await Promise.all(pending); assertCurrent(); if (publishFailure) throw publishFailure;
+    await flush(); assertCurrent();
+    scanContext.processedLibraries = scanContext.totalLibraries;
+    scanContext.incompleteLibraries = reports.filter(report => !report.complete).length;
+    const beforeDeletion = [...appState.media], pruned = [];
+    let availabilityChanged = false;
+    // Confirm absence only in a fully enumerated scope. Offline roots, reparse
+    // failures, limits and files being replaced cannot turn into mass deletions.
+    for (const media of beforeDeletion) {
+      if (seenIds.has(media.id)) continue;
+      const relevant = reports.filter(report => pathIsSameOrDescendant(media.path, report.scope));
+      if (!relevant.length) continue;
+      if (relevant.some(report => !report.complete)) { if (media.availability !== 'offline') { media.availability = 'offline'; media.entryRevision = (media.entryRevision || 0) + 1; availabilityChanged = true; } continue; }
+      try { await stat(media.path); }
+      catch (error) { if (error.code === 'ENOENT') pruned.push(media); }
+      assertCurrent();
+    }
+    for (const media of pruned) published.delete(media.id);
+    materialize();
+    if (pruned.length || availabilityChanged) { catalogRevision += 1; appState.catalogRevision = catalogRevision; }
     try {
       testFinalScanSaveCount += 1;
-      if (TEST_FAIL_FINAL_SCAN_SAVE_NUMBER === testFinalScanSaveCount) {
-        throw new Error("测试触发：最终扫描状态保存失败");
-      }
-      await saveState();
-      assertCurrentScan();
+      if (TEST_FAIL_FINAL_SCAN_SAVE_NUMBER === testFinalScanSaveCount) throw new Error('测试触发：最终扫描状态保存失败');
+      if (pruned.length || availabilityChanged || scanContext.metrics.publishCount) await saveState();
+      assertCurrent();
     } catch (error) {
-      const liveLibraryIds = new Set(appState.libraries.map((library) => library.id));
-      const restoredMediaById = new Map(appState.media.map((media) => [media.id, media]));
-      for (const media of prunedMedia) {
-        if (liveLibraryIds.has(media.libraryId) && !restoredMediaById.has(media.id)) restoredMediaById.set(media.id, media);
-      }
-      appState.media = [...restoredMediaById.values()];
-      await saveState().catch((restoreError) => console.error(`恢复最终扫描前的旧索引失败：${restoreError.message}`));
-      throw error;
+      for (const media of pruned) if (appState.libraries.some(library => library.id === media.libraryId)) published.set(media.id, media);
+      materialize(); await saveState().catch(() => {}); throw error;
     }
-    await queueAutomaticCompatibleCopies().catch((error) => console.error(`扫描后准备兼容副本失败：${error.message}`));
-    await cleanOrphanedCacheFiles().catch((error) => console.error(`扫描后清理孤儿缓存失败：${error.message}`));
-    assertCurrentScan();
-    lastScanCompletedAt = new Date().toISOString();
-    scanContext.phase = "completed";
-    scanContext.progressPercent = 100;
-    scanContext.completedAt = lastScanCompletedAt;
+    if (!scopes?.length && !scanContext.incompleteLibraries) lastFullVideoScanAt = Date.now();
+    scanContext.phase = scanContext.incompleteLibraries ? 'partial' : 'indexed';
+    scanContext.progressPercent = scanContext.incompleteLibraries ? null : 100;
+    scanContext.error = scanContext.incompleteLibraries ? '部分视频目录暂不可读，已保留旧索引。' : null;
+    if (scanContext.incompleteLibraries) { const error = new Error(scanContext.error); error.code = 'SCAN_ENUMERATION_INCOMPLETE'; throw error; }
     return appState.media;
   })();
-  // 文件系统调用本身无法可靠中断。取消信号会立刻结束对外任务；仍在返回途中的
-  // 读取会在下一次状态断言处丢弃结果，不能再发布索引或启动媒体子进程。
-  const scanPromise = Promise.race([scanWorkPromise, scanCancellationPromise]);
-  activeScan = scanPromise;
-
-  try {
-    return await scanPromise;
-  } catch (error) {
-    if (error.code === "SCAN_CANCELLED" || scanContext.cancelRequested) {
-      lastScanError = null;
-      scanContext.phase = "cancelled";
-      scanContext.error = null;
-      scanContext.completedAt = new Date().toISOString();
-      // 把已发布但尚未到达 checkpoint 的媒体物化进索引，保证“已完成的媒体
-      // 信息已保留”的语义；不让 10MB 级索引的磁盘写入阻塞停止按钮。
-      if (scanPublishedMediaById) materializePublishedMedia(scanPublishedMediaById, scanLibrariesSnapshot);
-      // 保存仍按既有队列完成。
-      void saveState().catch((saveError) => {
-        lastScanError = saveError.message || "停止扫描时保存索引失败";
-        scanContext.phase = "failed";
-        scanContext.error = lastScanError;
-        scanContext.completedAt = new Date().toISOString();
-        console.error(`停止扫描时保存索引失败：${lastScanError}`);
-      });
-      return appState.media;
-    }
-    // 失败路径同样把已发布媒体物化，与取消路径保持一致的内存状态。
-    if (scanPublishedMediaById) materializePublishedMedia(scanPublishedMediaById, scanLibrariesSnapshot);
-    lastScanError = error.message || "扫描失败";
-    scanContext.phase = "failed";
-    scanContext.progressPercent ??= 0;
-    scanContext.error = lastScanError;
-    scanContext.completedAt = new Date().toISOString();
+  activeScan = scanWork;
+  try { return await scanWork; }
+  catch (error) {
+    await Promise.allSettled(pending);
+    if (publishPromise) await publishPromise.catch(() => {});
+    // Cancellation freezes the already-visible snapshot. Pending entries must
+    // never appear after the cancellation generation has advanced.
+    if (!scanContext.cancelRequested && !["SCAN_CANCELLED", "LIBRARY_CHANGED_DURING_SCAN"].includes(error.code)) materialize();
+    if (scanContext.cancelRequested || error.code === 'SCAN_CANCELLED') { scanContext.phase = 'cancelled'; scanContext.error = null; }
+    else { scanContext.phase = error.code === 'SCAN_ENUMERATION_INCOMPLETE' ? 'partial' : 'failed'; lastScanError = scanContext.error = error.message; }
+    try { await saveState(); } catch (saveError) { scanContext.phase = 'failed'; lastScanError = scanContext.error = saveError.message; }
+    if (scanContext.phase === 'cancelled') return appState.media;
     throw error;
   } finally {
-    delete scanContext.increaseConcurrency;
-    delete scanContext.increaseMediaToolConcurrency;
-    delete scanContext.cancelActiveMediaTools;
-    if (activeScan === scanPromise) activeScan = null;
-    if (activeScanContext === scanContext) activeScanContext = null;
+    clearInterval(timer);
+    scanContext.completedAt = lastScanCompletedAt = new Date().toISOString();
+    nextAutoScanAt = Math.max(nextAutoScanAt, Date.now() + normalizedAutoScanIntervalSeconds() * 1000);
+    appState.settings.nextAutoScanAt = nextAutoScanAt;
+    appState.videoScan = { id: scanContext.id, phase: scanContext.phase, completedAt: scanContext.completedAt };
+    try { await saveState(); }
+    catch (error) { lastScanError = scanContext.error = error.message; scanContext.phase = 'failed'; throw error; }
+    finally {
+      if (activeScan === scanWork) activeScan = null;
+      if (activeScanContext === scanContext) activeScanContext = null;
+    }
   }
 }
 
@@ -2292,8 +2239,9 @@ async function updateCatalogScanSettings(body) {
   if (typeof body.enabled !== "boolean") throw new Error("自动扫描开关参数无效。");
   appState.settings.autoScanEnabled = body.enabled;
   appState.settings.autoScanIntervalSeconds = normalizedAutoScanIntervalSeconds(body.intervalSeconds);
+  if (body.enabled) { nextAutoScanAt = 0; appState.settings.nextAutoScanAt = 0; }
   await saveState();
-  if (body.enabled && (appState.libraries.length || appState.musicLibraries.length || appState.readingLibraries.length || appState.photoLibraries.length)) {
+  if (body.enabled && (appState.libraries.length || appState.musicLibraries.length || appState.readingLibraries.length || appState.photoLibraries.length || appState.fileLibraries.length)) {
     queueMicrotask(() => runScheduledAutoScan(true).catch((error) => console.error(`观看端自动扫描失败：${error.message}`)));
   }
   return catalogScanStatus();
@@ -2386,6 +2334,10 @@ function pipeFileToResponse(response, filePath, options = {}) {
 }
 
 async function streamFile(request, response, filePath, trackPlayback = false, responseOptions = {}) {
+  if (shouldHideTransferPath(filePath)) return sendJson(response, 404, { error: "文件尚未发布。" });
+  if (path.extname(filePath).toLowerCase() === '.svg') {
+    response.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'");
+  }
   let fileStat;
   try {
     fileStat = await stat(filePath);
@@ -2798,8 +2750,11 @@ async function runRemuxJob({ job, mediaId, convertAudioToAac }) {
   trimJobHistory();
   await saveState();
 
-  await new Promise((resolve) => {
+  await mediaTaskScheduler.schedule({ key: `remux:${mediaId}:${sourceSignature}:${convertAudioToAac ? "aac" : "copy"}`, sourcePath, kind: "remux", priority: 60,
+    run: ({ signal }) => new Promise((resolve) => {
     const child = spawnTracked(mediaTools.ffmpeg, args, { windowsHide: true });
+    const abort = () => child.kill(); signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) child.kill();
     let progressBuffer = "";
     let errorBuffer = "";
     let spawnError = null;
@@ -2819,8 +2774,10 @@ async function runRemuxJob({ job, mediaId, convertAudioToAac }) {
     });
     child.once("error", (error) => { spawnError = error; });
     child.once("close", async (code) => {
+      signal.removeEventListener("abort", abort);
       let outputWasPublished = false;
       try {
+        signal.throwIfAborted();
         if (code !== 0) throw new Error(spawnError?.message || errorBuffer.split(/\r?\n/).filter(Boolean).slice(-2).join(" · ") || `FFmpeg 退出码 ${code}`);
         let currentMedia = await currentMediaForRemux(mediaId, sourcePath, sourceSignature);
         if (!currentMedia) throw new Error("处理期间源视频发生变化，未发布这个兼容副本");
@@ -2852,7 +2809,7 @@ async function runRemuxJob({ job, mediaId, convertAudioToAac }) {
       await saveState().catch((error) => console.error(`保存重封装任务状态失败：${error.message}`));
       resolve();
     });
-  });
+  }) });
 }
 
 function drainRemuxQueue() {
@@ -2954,7 +2911,7 @@ void activeCompatibleCopyCheck;
 // 十六进制媒体 id 前缀），绝不触碰其他文件；进行中的重封装任务临时文件
 // 也会跳过。
 async function cleanOrphanedCacheFiles() {
-  const livePaths = new Set();
+  const livePaths = new Set(videoResourceService.protectedPaths());
   for (const media of appState.media) {
     if (media.thumbnailPath) livePaths.add(path.resolve(media.thumbnailPath));
     if (media.remuxPath) livePaths.add(path.resolve(media.remuxPath));
@@ -2972,7 +2929,7 @@ async function cleanOrphanedCacheFiles() {
   const directories = new Set([
     THUMBNAIL_CACHE_DIR,
     SUBTITLE_CACHE_DIR,
-    FONT_CACHE_DIR,
+    // Font objects and migration copies are owned by videoResourceService.
     compatibleCopyDirectory(),
   ]);
   let removedFiles = 0;
@@ -3241,12 +3198,14 @@ function catalogFolderNodes(mediaItems, displayIndex = null) {
 }
 
 function accessFolderInventory() {
-  const folders = [
+  const folders = [...new Map([
+    ...(directoryService?.inventory() || []),
     ...videoAccessFolderSummaries(),
     ...(musicService?.accessFolderSummaries() || []),
     ...(readingService?.accessFolderSummaries() || []),
     ...(photoService?.accessFolderSummaries() || []),
-  ];
+    ...(fileService?.accessFolderSummaries() || []),
+  ].map(folder => [folder.id, folder])).values()];
   const availableIds = new Set(folders.map((folder) => folder.id));
   const aliases = new Map([...availableIds].map((id) => [id, new Set([id])]));
   const registerAliases = (pairs) => {
@@ -3260,12 +3219,14 @@ function accessFolderInventory() {
   registerAliases(musicService?.accessFolderAliases());
   registerAliases(readingService?.accessFolderAliases());
   registerAliases(photoService?.accessFolderAliases());
+  registerAliases(fileService?.accessFolderAliases());
   return { folders, availableIds, aliases };
 }
 
 function resolveAccessFolderIds(folderIds, inventory = accessFolderInventory()) {
   const resolved = new Set();
   for (const rawId of Array.isArray(folderIds) ? folderIds.map(String) : []) {
+    if (appState.accessControl.folderIdVersion >= 1 && inventory.availableIds.has(rawId)) { resolved.add(rawId); continue; }
     for (const folderId of inventory.aliases.get(rawId) || []) resolved.add(folderId);
   }
   return [...resolved].filter((id) => inventory.availableIds.has(id));
@@ -3351,21 +3312,25 @@ function publicMedia(item, includeLocalPath = false, displayIndex = null) {
   return {
     ...item,
     path: includeLocalPath ? item.path : undefined,
+    sourceIdentity: undefined,
     danmakuBindings: undefined,
+    videoResourceFailures: undefined,
     remuxPath: includeLocalPath ? item.remuxPath : undefined,
     thumbnailPath: includeLocalPath ? item.thumbnailPath : undefined,
     probeError: includeLocalPath ? item.probeError : undefined,
     embeddedSubtitleStreams: undefined,
     embeddedFontStreams: undefined,
     streamUrl: `/api/media/${item.id}/stream`,
+    downloadUrl: `/api/media/${item.id}/download`,
     remuxUrl: item.remuxPath ? `/api/media/${item.id}/stream?variant=remux` : null,
     thumbnailUrl: item.thumbnailPath ? `/api/media/${item.id}/thumbnail` : null,
     display: { ...mediaDisplayInfo(item, displayIndex), folderId: catalogFolderId(item.libraryId, folderPathForMedia(item)) },
     compatibility,
     compatibleCopyStatus,
     compatibleCopyProgress: activeJob?.progress ?? (item.remuxPath ? 100 : latestJob?.progress || 0),
-    subtitles: item.subtitles.map((subtitle) => ({ ...subtitle, path: undefined, url: `/api/media/${item.id}/subtitles/${subtitle.id}` })),
-    fonts: item.fonts.map((font) => ({ ...font, path: undefined, url: `/api/media/${item.id}/fonts/${font.id}` })),
+    subtitles: (item.subtitles || []).map(subtitle => publicVideoResource(item, subtitle)),
+    fonts: (item.fonts || []).map(font => publicVideoResource(item, font, 'fonts')),
+
   };
 }
 
@@ -3388,9 +3353,13 @@ async function serveStatic(response, pathname) {
   return true;
 }
 
+const mediaPrepareCounts = new Map();
+const videoResourceService = createVideoResourceService({ appState, cacheDirectory: CACHE_DIR, getMediaTools: () => mediaTools,
+  runCommand, saveState, readFontAliases, findSidecarFiles, scheduler: mediaTaskScheduler });
 const playbackService = createPlaybackService({
   appState, cacheDirectory: CACHE_DIR, getMediaTools: () => mediaTools, probeVideo,
-  saveState, spawnTracked, runCommand, authorizedMediaForRequest, accessContextForRequest,
+  scheduler: mediaTaskScheduler, resources: videoResourceService,
+  saveState: async () => { catalogRevision += 1; appState.catalogRevision = catalogRevision; await saveState(); }, spawnTracked, runCommand, authorizedMediaForRequest, accessContextForRequest,
   requireLocalManagement, readJson, sendJson, streamFile,
 });
 const danmakuService = createDanmakuService({ dataDirectory: DATA_DIR, appState, saveState,
@@ -3403,7 +3372,7 @@ const playerTestService = createPlayerTestService({ dataDirectory: DATA_DIR, app
 // Bitmap (PGS/VobSub/DVB) subtitles are decoded on demand through the media
 // tools; nothing is burned into the video.
 const bitmapSubtitleService = createBitmapSubtitleService({ cacheDirectory: CACHE_DIR,
-  getMediaTools: () => mediaTools, runCommand, requireLocalManagement });
+  getMediaTools: () => mediaTools, runCommand, scheduler: mediaTaskScheduler, requireLocalManagement });
 
 musicService = createMusicService({
   appState,
@@ -3412,7 +3381,7 @@ musicService = createMusicService({
   stableId,
   getMediaTools: () => mediaTools,
   getCompatibleCopyDirectory: compatibleCopyDirectory,
-  runCommand,
+  runCommand: backgroundScheduledCommand,
   streamFile,
   sendJson,
   readJson,
@@ -3420,6 +3389,9 @@ musicService = createMusicService({
   requireViewerAccess,
   canAccessFolderId,
   pathIsSameOrDescendant,
+  shouldHidePath: shouldHideTransferPath,
+  withDownloadSlot: (...args) => downloadService.withDownloadSlot(...args),
+  decorateFolders: (context, kind, nodes) => directoryService?.visibleNodes(context, kind, nodes) || nodes,
 });
 
 readingService = createReadingService({
@@ -3434,6 +3406,8 @@ readingService = createReadingService({
   requireViewerAccess,
   canAccessFolderId,
   pathIsSameOrDescendant,
+  shouldHidePath: shouldHideTransferPath,
+  decorateFolders: (context, kind, nodes) => directoryService?.visibleNodes(context, kind, nodes) || nodes,
 });
 
 photoService = createPhotoService({
@@ -3442,7 +3416,7 @@ photoService = createPhotoService({
   saveState,
   stableId,
   getMediaTools: () => mediaTools,
-  runCommand,
+  runCommand: backgroundScheduledCommand,
   streamFile,
   sendJson,
   readJson,
@@ -3450,7 +3424,98 @@ photoService = createPhotoService({
   requireViewerAccess,
   canAccessFolderId,
   pathIsSameOrDescendant,
+  shouldHidePath: shouldHideTransferPath,
+  decorateFolders: (context, kind, nodes) => directoryService?.visibleNodes(context, kind, nodes) || nodes,
 });
+
+fileService = createFileService({ appState, saveState, stableId, streamFile, sendJson, readJson, requireLocalManagement, requireViewerAccess,
+  canAccessFolderId, pathIsSameOrDescendant, shouldHidePath: shouldHideTransferPath,
+  withDownloadSlot: (...args) => downloadService.withDownloadSlot(...args),
+  decorateFolders: (context, kind, nodes) => directoryService?.visibleNodes(context, kind, nodes) || nodes });
+
+// Resolve old ancestor aliases before adding empty buckets. Thereafter an
+// existing canonical bucket ID is always exact, never expanded as an alias.
+if (appState.accessControl.folderIdVersion < 1) {
+  const inventory = accessFolderInventory();
+  for (const category of appState.accessControl.categories) category.folderIds = resolveAccessFolderIds(category.folderIds, inventory);
+  for (const user of appState.accessControl.users) user.folderIds = resolveAccessFolderIds(user.folderIds, inventory);
+  appState.accessControl.folderIdVersion = 1;
+  await saveState();
+}
+directoryService = createTransferDirectoryService({ getState: () => appState, stableId, contextForRequest: accessContextForRequest, saveState,
+  protectedPaths: [PROJECT_DIR, DATA_DIR, CACHE_DIR, compatibleCopyDirectory()], shouldHidePath: shouldHideTransferPath });
+void directoryService.refresh(true).catch(error => console.error(`目录快照刷新失败：${error.message}`));
+
+function originalVideo(context, id) {
+  const item = appState.media.find(media => media.id === id && canAccessMedia(context, media));
+  const library = item && videoLibraryForMedia(item);
+  return item && library ? { ...item, libraryName: library.name, libraryPath: library.path } : null;
+}
+async function relatedVideo(context, item) {
+  const library = videoLibraryForMedia(item);
+  const found = await findSidecarFiles(item.path);
+  const paths = new Set([...found.subtitles, ...found.fonts].map(file => file.path).filter(file => pathIsSameOrDescendant(file, library.path) && !pathIsSameOrDescendant(file, CACHE_DIR)));
+  // Font extraction caches are never archived. Include the original recognized
+  // font packages, preserving their directory relationship to the video.
+  const parent = path.dirname(item.path);
+  const visitFonts = async (directory, depth = 0) => {
+    if (depth > 3) return;
+    for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
+      if (entry.name.startsWith('.')) continue;
+      const fullPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visitFonts(fullPath, depth + 1);
+      else if (entry.isFile() && (FONT_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) || FONT_ARCHIVE_EXTENSIONS.has(path.extname(entry.name).toLowerCase()))) paths.add(fullPath);
+    }
+  };
+  for (const entry of await readdir(parent, { withFileTypes: true }).catch(() => [])) {
+    if (entry.isDirectory() && FONT_PACK_DIRECTORY_PATTERN.test(entry.name)) await visitFonts(path.join(parent, entry.name));
+    else if (entry.isFile() && FONT_ARCHIVE_EXTENSIONS.has(path.extname(entry.name).toLowerCase()) && FONT_ARCHIVE_NAME_PATTERN.test(path.basename(entry.name, path.extname(entry.name)))) paths.add(path.join(parent, entry.name));
+  }
+  const files = [];
+  const omittedKeys = [];
+  for (const filePath of paths) {
+    const owner = mostSpecificLibraryForPath(filePath);
+    if (pathIsSameOrDescendant(filePath, CACHE_DIR)) continue;
+    if (!owner || !canAccessFolderId(context, stableId(boundedAccessFolderPath(owner.path, path.dirname(filePath)))) || shouldHideTransferPath(filePath)) { omittedKeys.push(path.resolve(filePath).toLowerCase()); continue; }
+    try { files.push(await validateDownloadSource({ path: filePath, libraryId: owner.id, libraryName: owner.name, libraryPath: owner.path }, shouldHideTransferPath)); }
+    catch { omittedKeys.push(path.resolve(filePath).toLowerCase()); }
+  }
+  return { files, omittedKeys };
+}
+downloadService = createDownloadService({ requireViewerAccess, sendJson, readJson, shouldHidePath: shouldHideTransferPath,
+  resolveOriginal: (context, kind, id) => kind === 'video' ? originalVideo(context, id) : kind === 'music' ? musicService.resolveOriginal(context, id) : null,
+  resolveRelated: (context, kind, item) => kind === 'video' ? relatedVideo(context, item) : musicService.resolveRelated(context, item) });
+const uploadIndexer = createUploadIndexer({ getState: () => appState, refreshDirectories: (kind) => directoryService.markDirty(kind), scanners: {
+  video: { isScanning: () => Boolean(activeScan), scan: async ({ paths = [] } = {}) => {
+    await scanLibraries({ scopes: [...new Set(paths.map(file => path.dirname(file)))], trigger: "upload" });
+    if (lastScanContext?.phase !== "indexed") throw Object.assign(new Error("文件已发布，但索引被取消或未完成，请重试入库。"), { code: "INDEX_INCOMPLETE" });
+  } },
+  music: { isScanning: () => musicService.isScanning(), scan: () => musicService.scanLibraries() },
+  reading: { isScanning: () => readingService.isScanning(), scan: () => readingService.scanLibraries() },
+  photos: { isScanning: () => photoService.isScanning(), scan: () => photoService.scanLibraries() },
+  files: { isScanning: () => fileService.isScanning(), scan: () => fileService.scanLibraries() },
+} });
+uploadService = createUploadService({ dataDirectory: DATA_DIR, identify: directoryService.identify, listTargets: directoryService.listTargets,
+  resolveTarget: directoryService.resolveTarget, authorizePath: directoryService.authorizePath, onDirectoriesCreated: directoryService.onDirectoriesCreated,
+  isSupported: uploadFormatSupported, isProtectedPath: directoryService.isProtectedPath, onPublished: uploadIndexer.onPublished,
+  getSettings: () => appState.settings, readJson, sendJson });
+await uploadService.init();
+
+let cacheMaintenanceTimer = null;
+let cacheMaintenancePromise = null;
+async function maintainVideoCache() {
+  if (cacheMaintenancePromise) return cacheMaintenancePromise;
+  const resources = videoResourceService.status();
+  if (sharingServiceIsStopping || activeScan || playbackService.status().sessions || activeVideoTransfers.size || resources.active || resources.executing)
+    return { skipped: true, reason: 'busy', before: resources, after: resources };
+  const before = videoResourceService.status();
+  cacheMaintenancePromise = mediaTaskScheduler.schedule({ key: 'video-font-maintenance', sourcePath: CACHE_DIR, kind: 'maintenance', priority: 80,
+    run: async ({ signal }) => { signal.throwIfAborted(); await videoResourceService.collect(); return { skipped: false, before, after: videoResourceService.status() }; }
+  }).finally(() => { cacheMaintenancePromise = null; });
+  return cacheMaintenancePromise;
+}
+cacheMaintenanceTimer = setInterval(() => { void maintainVideoCache().catch(error => console.error('视频缓存维护失败：' + error.message)); }, 60 * 60 * 1000);
+cacheMaintenanceTimer.unref();
 
 const server = createServer(async (request, response) => {
   response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
@@ -3461,7 +3526,7 @@ const server = createServer(async (request, response) => {
   response.setHeader("Referrer-Policy", "no-referrer");
   response.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
   if (request.method === "OPTIONS") {
-    response.writeHead(204, { "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS", "Access-Control-Allow-Headers": "Content-Type" });
+    response.writeHead(204, { "Access-Control-Allow-Methods": "GET,HEAD,PUT,POST,PATCH,DELETE,OPTIONS", "Access-Control-Allow-Headers": "Content-Type, X-Chunk-Sha256, X-Upload-Offset" });
     return response.end();
   }
 
@@ -3481,6 +3546,20 @@ const server = createServer(async (request, response) => {
     // because it resolves to loopback. LAN viewers keep their existing hosts.
     if (isLoopbackRequest(request) && !hasTrustedLocalHost(request)) return sendJson(response, 403, { error: "本机访问地址无效，请使用 localhost 或本机 IP 地址。", code: "HOST_REJECTED" });
     if (!sameOriginMutation(request)) return sendJson(response, 403, { error: "已拒绝跨站操作。", code: "ORIGIN_REJECTED" });
+    // Catalog reads use the last directory snapshot; traversal is owned by the background refresher.
+    if (pathname === '/api/uploads/settings') {
+      if (!requireLocalManagement(request, response)) return;
+      if (request.method === 'PATCH') {
+        const body = await readJson(request);
+        if (!Number.isSafeInteger(body.maxFileBytes) || body.maxFileBytes < 1 || body.maxFileBytes > 1024 ** 5) return sendJson(response, 400, { error: '单文件上限须为 1 字节到 1 PiB 的整数。' });
+        appState.settings.uploadMaxFileBytes = body.maxFileBytes;
+        await saveState();
+      } else if (request.method !== 'GET') return sendJson(response, 405, { error: '不支持此操作。' });
+      return sendJson(response, 200, { maxFileBytes: appState.settings.uploadMaxFileBytes });
+    }
+    if (await uploadService.handleRequest(request, response, url, pathname)) return;
+    if (await downloadService.handleRequest(request, response, url, pathname)) return;
+    if (await fileService.handleRequest(request, response, url, pathname)) return;
     if (await playerTestService.handleRequest(request, response, url, pathname)) return;
     if (await playbackService.handleRequest(request, response, url, pathname)) return;
     if (await danmakuService.handleRequest(request, response, url, pathname)) return;
@@ -3512,12 +3591,15 @@ const server = createServer(async (request, response) => {
     }
     if (request.method === "GET" && pathname === "/api/health") {
       if (appState.accessControl.enabled && !isLanRequest(request)) return sendJson(response, 403, { error: "访问控制已开启，只允许局域网设备连接。", code: "LAN_ONLY" });
-      return sendJson(response, 200, { ok: true, name: "LMD", sharingService: "running", port: PORT, lanAddresses: getLanAddresses(), tools: mediaTools, playback: playbackService.status() });
+      const localAdmin = Boolean(accessContextForRequest(request)?.localAdmin), playback = playbackService.status();
+      return sendJson(response, 200, { ok: true, name: "LMD", sharingService: "running", port: PORT,
+        ...(localAdmin ? { lanAddresses: getLanAddresses(), tools: mediaTools, playback, mediaTasks: mediaTaskScheduler.snapshot(), persistence: { ...stateSaveMetrics } }
+          : { playback: { sessions: playback.sessions, pipelines: playback.pipelines } }) });
     }
     if ((pathname === "/admin" || pathname.startsWith("/admin/")) && !requireLocalManagement(request, response)) return;
     if (request.method === "GET" && pathname === "/api/auth/status") {
       if (!appState.accessControl.enabled) {
-        return sendJson(response, 200, { enabled: false, authenticated: true, localAdmin: isLoopbackRequest(request), user: null });
+        return sendJson(response, 200, { enabled: false, authenticated: true, localAdmin: isLoopbackRequest(request), canUpload: false, user: null });
       }
       if (!isLanRequest(request)) return sendJson(response, 403, { error: "访问控制已开启，只允许局域网设备连接。", code: "LAN_ONLY" });
       const context = accessContextForRequest(request);
@@ -3525,7 +3607,8 @@ const server = createServer(async (request, response) => {
         enabled: true,
         authenticated: Boolean(context),
         localAdmin: Boolean(context?.localAdmin),
-        user: context?.user ? { id: context.user.id } : null,
+        canUpload: Boolean(context?.localAdmin || context?.user?.canUpload),
+        user: context?.user ? { id: context.user.id, canUpload: context.user.canUpload === true } : null,
       });
     }
     if (request.method === "POST" && pathname === "/api/auth/login") {
@@ -3582,7 +3665,7 @@ const server = createServer(async (request, response) => {
       user.lastLoginAt = now.toISOString();
       await saveState();
       response.setHeader("Set-Cookie", accessSessionCookie(token));
-      return sendJson(response, 200, { enabled: true, authenticated: true, localAdmin: false, user: { id: user.id } });
+      return sendJson(response, 200, { enabled: true, authenticated: true, localAdmin: false, canUpload: user.canUpload === true, user: { id: user.id, canUpload: user.canUpload === true } });
     }
     if (request.method === "POST" && pathname === "/api/auth/logout") {
       const token = parseCookies(request)[ACCESS_SESSION_COOKIE];
@@ -3601,19 +3684,20 @@ const server = createServer(async (request, response) => {
       const displayIndex = createDisplayIndex(media);
       const visibleFolderIds = new Set(media.map((item) => stableId(folderPathForMedia(item))));
       return sendJson(response, 200, {
+        catalogRevision: catalogRevisionFor(context),
         media: media.map((item) => publicMedia(item, false, displayIndex)),
-        folders: catalogFolderNodes(media, displayIndex),
+        folders: directoryService.visibleNodes(context, 'video', catalogFolderNodes(media, displayIndex)),
         groups: displayFolderSummaries(displayIndex)
           .filter((group) => visibleFolderIds.has(group.id))
           .map(({ path: _path, customTitle: _customTitle, sampleAlias: _sampleAlias, ...group }) => group),
-        scan: catalogScanStatus(),
+        scan: viewerScanStatus(context),
       });
     }
     if (request.method === "POST" && pathname === "/api/catalog/scan") {
       const context = requireViewerAccess(request, response);
       if (!context) return;
       await scanLibraries();
-      return sendJson(response, 200, { count: accessibleMedia(context).length, scan: catalogScanStatus() });
+      return sendJson(response, 200, { protocolVersion: 2, completion: "indexed", count: accessibleMedia(context).length, scan: viewerScanStatus(context) });
     }
     if (request.method === "GET" && pathname === "/api/scan/status") {
       if (!requireLocalManagement(request, response)) return;
@@ -3622,6 +3706,9 @@ const server = createServer(async (request, response) => {
         scanning: Boolean(activeScan),
         scan: catalogScanStatus(),
         jobs: appState.jobs,
+        mediaTasks: mediaTaskScheduler.snapshot(),
+        videoResources: videoResourceService.status(),
+        persistence: { ...stateSaveMetrics },
         remuxAcceleration: remuxAccelerationStatus(),
       });
     }
@@ -3631,9 +3718,10 @@ const server = createServer(async (request, response) => {
       const compact = url.searchParams.get("compact") === "1";
       const displayIndex = createDisplayIndex();
       return sendJson(response, 200, {
+        catalogRevision,
         libraries: appState.libraries,
         media: compact ? [] : appState.media.map((item) => publicMedia(item, true, displayIndex)),
-        displayFolders: [...displayFolderSummaries(displayIndex), ...musicService.displayFolderSummaries(), ...readingService.displayFolderSummaries(), ...photoService.displayFolderSummaries()],
+        displayFolders: [...displayFolderSummaries(displayIndex), ...musicService.displayFolderSummaries(), ...readingService.displayFolderSummaries(), ...photoService.displayFolderSummaries(), ...fileService.displayFolderSummaries()],
         accessFolders: accessFolderInventory().folders,
         jobs: appState.jobs,
         settings: appState.settings,
@@ -3812,6 +3900,7 @@ const server = createServer(async (request, response) => {
           categoryIds,
           folderIds: [],
           enabled: true,
+          canUpload: body.canUpload === true,
           createdAt: now,
           updatedAt: now,
           lastLoginAt: null,
@@ -3830,6 +3919,10 @@ const server = createServer(async (request, response) => {
         const user = appState.accessControl.users.find((item) => item.id === userId);
         if (!user) return sendJson(response, 404, { error: "找不到这位访问用户。" });
         const updates = {};
+        if (body.canUpload !== undefined) {
+          if (typeof body.canUpload !== 'boolean') return sendJson(response, 400, { error: '请提供有效的上传权限。' });
+          updates.canUpload = body.canUpload;
+        }
         let revokeSessions = false;
         if (body.categoryIds !== undefined) {
           const submittedCategoryIds = [...new Set(Array.isArray(body.categoryIds) ? body.categoryIds.map(String) : [])];
@@ -3881,6 +3974,9 @@ const server = createServer(async (request, response) => {
         library = { id: stableId(folderPath), path: folderPath, name: body.name || path.basename(folderPath) || folderPath };
         appState.libraries.push(library);
         libraryRevision += 1;
+        directoryService.markDirty("video");
+        videoChangeMonitor?.synchronize();
+        videoChangeMonitor?.mark(folderPath);
         await saveState();
       }
       return sendJson(response, 201, { libraries: appState.libraries, library, added });
@@ -3891,6 +3987,7 @@ const server = createServer(async (request, response) => {
       const library = appState.libraries.find((item) => item.id === id);
       if (!library) return sendJson(response, 404, { error: "找不到这个视频目录，它可能已经被删除。" });
       libraryRevision += 1;
+      catalogRevision += 1; appState.catalogRevision = catalogRevision;
       const removedMedia = appState.media.filter((media) => media.libraryId === id);
       appState.libraries = appState.libraries.filter((library) => library.id !== id);
       appState.media = appState.media.filter((media) => media.libraryId !== id);
@@ -3907,6 +4004,7 @@ const server = createServer(async (request, response) => {
         category.folderIds = category.folderIds.filter((folderId) => !removedFolderIds.has(folderId));
       }
       await saveState();
+      directoryService.markDirty("video"); videoChangeMonitor?.synchronize();
       return sendJson(response, 200, { ok: true, removedMediaCount: removedMediaIds.size });
     }
     if (request.method === "PATCH" && /^\/api\/display-groups\/[^/]+$/.test(pathname)) {
@@ -3927,11 +4025,40 @@ const server = createServer(async (request, response) => {
       await saveState();
       return sendJson(response, 200, displayFolderSummaries().find((item) => item.id === groupId));
     }
+    if (request.method === 'GET' && pathname === '/api/video/cache/status') {
+      if (!requireLocalManagement(request, response)) return;
+      return sendJson(response, 200, { resources: videoResourceService.status(), maintenanceRunning: Boolean(cacheMaintenancePromise), retentionHours: 24 });
+    }
+    if (request.method === 'POST' && pathname === '/api/video/cache/maintain') {
+      if (!requireLocalManagement(request, response)) return;
+      return sendJson(response, 200, await maintainVideoCache());
+    }
+    if (request.method === "POST" && pathname === "/api/video/scans") {
+      const context = requireViewerAccess(request, response); if (!context) return;
+      const mode = normalizedScanMode(url.searchParams.get("mode") || "standard");
+      if (mode === 'turbo' && !context.localAdmin) return sendJson(response, 403, { code: 'LOCAL_MANAGEMENT_REQUIRED', error: '急速模式仅限服务器管理端。' });
+      void scanLibraries({ mode }).catch(error => console.error('视频索引扫描：', error.message));
+      return sendJson(response, 202, { taskId: activeScanContext?.id || lastScanContext?.id, protocolVersion: 2, completion: 'indexed', scan: viewerScanStatus(context) });
+    }
+    if (request.method === 'GET' && pathname === '/api/video/scans/current') {
+      const context = requireViewerAccess(request, response); if (!context) return;
+      return sendJson(response, 200, { taskId: activeScanContext?.id || lastScanContext?.id || null, scan: viewerScanStatus(context) });
+    }
+    if (request.method === 'GET' && /^\/api\/video\/scans\/[^/]+$/.test(pathname)) {
+      const context = requireViewerAccess(request, response); if (!context) return;
+      const task = scanHistory.get(pathname.split('/')[4]);
+      if (!task) return sendJson(response, 404, { code: 'SCAN_NOT_FOUND', error: '扫描状态已过期，请重新读取目录。' });
+      return sendJson(response, 200, { taskId: task.id, scan: viewerScanStatus(context, task) });
+    }
+    if (request.method === 'POST' && /^\/api\/video\/scans\/[^/]+\/cancel$/.test(pathname)) {
+      if (!requireLocalManagement(request, response)) return;
+      return sendJson(response, 202, await stopTurboScan({ wait: false, taskId: pathname.split('/')[4] }));
+    }
     if (request.method === "POST" && pathname === "/api/scan/start") {
       if (!requireLocalManagement(request, response)) return;
       const mode = normalizedScanMode(url.searchParams.get("mode") || "standard");
       scanLibraries({ mode }).catch((error) => console.error(`${mode === "turbo" ? "急速" : "普通"}扫描失败：${error.message}`));
-      return sendJson(response, 202, { scan: catalogScanStatus() });
+      return sendJson(response, 202, { taskId: activeScanContext?.id || lastScanContext?.id, protocolVersion: 2, completion: "indexed", scan: catalogScanStatus() });
     }
     if (request.method === "POST" && pathname === "/api/scan/stop") {
       if (!requireLocalManagement(request, response)) return;
@@ -3942,7 +4069,7 @@ const server = createServer(async (request, response) => {
       const mode = normalizedScanMode(url.searchParams.get("mode") || "standard");
       const media = await scanLibraries({ mode });
       const displayIndex = createDisplayIndex(media);
-      return sendJson(response, 200, { count: media.length, media: media.map((item) => publicMedia(item, true, displayIndex)), scan: catalogScanStatus() });
+      return sendJson(response, 200, { protocolVersion: 2, completion: "indexed", count: media.length, media: media.map((item) => publicMedia(item, true, displayIndex)), scan: catalogScanStatus() });
     }
     if (request.method === "PATCH" && pathname === "/api/settings/auto-scan") {
       if (!requireLocalManagement(request, response)) return;
@@ -3978,19 +4105,70 @@ const server = createServer(async (request, response) => {
       const job = startRemuxJob(media, body.convertAudioToAac !== false);
       return sendJson(response, 202, job);
     }
+    if (request.method === 'POST' && /^\/api\/video\/media\/[^/]+\/prepare$/.test(pathname)) {
+      const media = authorizedMediaForRequest(request, response, pathname.split('/')[4]); if (!media) return;
+      const context = accessContextForRequest(request), key = context?.user?.id || request.socket.remoteAddress;
+      if ((mediaPrepareCounts.get(key) || 0) >= 4) return sendJson(response, 429, { code: 'PREPARE_LIMIT', error: '正在准备当前可见的视频，请稍后重试。' });
+      const body = await readJson(request), resources = body.resources || ['metadata'];
+      if (!Array.isArray(resources) || !resources.length || resources.length > 2 || resources.some(kind => !['metadata','thumbnail'].includes(kind))) return sendJson(response, 400, { code: 'INVALID_RESOURCE', error: '只能准备视频信息或封面。' });
+      mediaPrepareCounts.set(key, (mediaPrepareCounts.get(key) || 0) + 1);
+      try {
+        await validateCurrentVideoSource(media);
+        if (resources.includes('metadata')) await playbackService.info(media);
+        if (resources.includes('thumbnail')) {
+          const acceptedSource = await validateCurrentVideoSource(media), source = acceptedSource.source;
+          const signature = mediaSourceSignature({ ...media, size: source.size, modifiedAt: source.mtime.toISOString() });
+          const verifySource = async () => {
+            const latest = await validateCurrentVideoSource(media);
+            if (latest.actual !== acceptedSource.actual || latest.version !== acceptedSource.version)
+              throw Object.assign(new Error('视频已变化，请重新打开。'), { code: 'SOURCE_CHANGED', statusCode: 409 });
+            return latest;
+          };
+          const thumbnailPath = await mediaTaskScheduler.schedule({ key: 'thumbnail:' + media.id + ':' + signature + ':v1', sourcePath: media.path, kind: 'thumbnail', priority: 40,
+            run: async ({ signal }) => {
+              await verifySource();
+              const result = await ensureVideoThumbnail(media.path, media.id, media.durationSeconds, media.thumbnailPath, signature, source.mtimeMs, true,
+                (executable,args,timeoutMs,options = {}) => runCommand(executable,args,timeoutMs,{...options,signal}));
+              await verifySource(); return result;
+            } });
+          const { current } = await verifySource();
+          if (!thumbnailPath) return sendJson(response, 422, { code: 'THUMBNAIL_FAILED', error: '暂时无法生成封面。' });
+          current.thumbnailPath = thumbnailPath; current.thumbnail = { state: 'ready' }; current.entryRevision = (current.entryRevision || 0) + 1;
+          catalogRevision += 1; appState.catalogRevision = catalogRevision; await saveState();
+        }
+        if (!canAccessMedia(accessContextForRequest(request), media)) return sendJson(response, 403, { code: 'ACCESS_REVOKED', error: '访问权限已变化。' });
+        return sendJson(response, 200, { media: publicMedia(media), catalogRevision: catalogRevisionFor(context) });
+      } finally { mediaPrepareCounts.set(key, Math.max(0, (mediaPrepareCounts.get(key) || 1) - 1)); }
+    }
     if ((request.method === "GET" || request.method === "HEAD") && /^\/api\/media\/[^/]+\/thumbnail$/.test(pathname)) {
       const mediaId = pathname.split("/")[3];
       const media = authorizedMediaForRequest(request, response, mediaId);
       if (!media) return;
-      if (!media?.thumbnailPath) return sendJson(response, 404, { error: "这个视频还没有生成缩略图，请在管理端重新扫描。" });
+      const thumbnailFile = media.thumbnailPath && await stat(media.thumbnailPath).catch(() => null);
+      if (!thumbnailFile?.isFile()) {
+        media.thumbnailPath = null; media.thumbnail = { state: 'unknown' };
+        return sendJson(response, 409, { code: 'RESOURCE_NOT_READY', state: 'unknown', error: '封面尚未准备，请刷新当前视频。' });
+      }
       return streamFile(request, response, media.thumbnailPath);
     }
     if ((request.method === "GET" || request.method === "HEAD") && /^\/api\/media\/[^/]+\/stream$/.test(pathname)) {
       const mediaId = pathname.split("/")[3];
       const media = authorizedMediaForRequest(request, response, mediaId);
       if (!media) return;
+      const validated = await validateCurrentVideoSource(media);
+      if (!authorizedMediaForRequest(request, response, mediaId)) return;
       const filePath = url.searchParams.get("variant") === "remux" && media.remuxPath ? media.remuxPath : media.path;
+      const release = mediaTaskScheduler.reservePlayback(validated.actual);
+      response.once("finish", release); response.once("close", release);
       return streamFile(request, response, filePath, true);
+    }
+    if (['GET', 'HEAD'].includes(request.method) && /^\/api\/media\/[^/]+\/download$/.test(pathname)) {
+      const context = requireViewerAccess(request, response);
+      if (!context) return;
+      const original = originalVideo(context, pathname.split('/')[3]);
+      if (!original) return sendJson(response, 404, { error: '视频不存在或没有访问权限。' });
+      await validateDownloadSource(original, shouldHideTransferPath);
+      return downloadService.withDownloadSlot(request, response, context, () => streamFile(request, response, original.path, false, { disposition: 'attachment', fileName: original.fileName }));
     }
     if (["GET", "HEAD"].includes(request.method) && /^\/api\/media\/[^/]+\/bitmap-subtitles\/[^/]+/.test(pathname)) {
       const handled = await bitmapSubtitleService.handleRequest(request, response, url, pathname,
@@ -4005,13 +4183,21 @@ const server = createServer(async (request, response) => {
       const [, , , mediaId, , subtitleId] = pathname.split("/");
       const media = authorizedMediaForRequest(request, response, mediaId);
       if (!media) return;
-      const subtitle = media?.subtitles.find((item) => item.id === subtitleId);
-      if (!subtitle) return sendJson(response, 404, { error: "找不到字幕。" });
+      const subtitle = await videoResourceService.resolveSubtitle(media, subtitleId);
+      const validated = await validateCurrentVideoSource(media);
+      if (!authorizedMediaForRequest(request, response, mediaId)) return;
+      if (validated.version !== videoSourceVersion(media) || (subtitle.source === "embedded" && subtitle.sourceVersion !== validated.version)) return sendJson(response, 409, { code: "RESOURCE_NOT_READY", state: "unknown", error: "字幕源版本已变化，请重新选择字幕。" });
+      if (!subtitle.path) return sendJson(response, 409, { code: "RESOURCE_NOT_READY", state: subtitle.state || "unknown", error: "字幕尚未准备，请先选择播放字幕。" });
+      if (shouldHideTransferPath(subtitle.path)) return sendJson(response, 404, { error: '字幕尚未发布。' });
       // 字幕是文本文件，异常超大文件不应整体读入内存。
       const subtitleStat = await stat(subtitle.path).catch(() => null);
-      if (!subtitleStat?.isFile()) return sendJson(response, 404, { error: "字幕文件不存在。" });
+      if (!subtitleStat?.isFile()) { subtitle.state = "unknown"; subtitle.path = null; return sendJson(response, 409, { code: "RESOURCE_NOT_READY", state: "unknown", error: "字幕缓存已失效，请重新选择字幕。" }); }
       if (subtitleStat.size > MAX_SUBTITLE_BYTES) return sendJson(response, 413, { error: "字幕文件过大，无法读取。" });
+      if (shouldHideTransferPath(subtitle.path)) return sendJson(response, 404, { error: '字幕尚未发布。' });
+      const resourcePath = await realpath(subtitle.path).catch(() => null);
+      if (!resourcePath || (!pathIsSameOrDescendant(resourcePath, validated.root) && !pathIsSameOrDescendant(resourcePath, CACHE_DIR))) return sendJson(response, 409, { code: "SOURCE_CHANGED", error: "字幕位置已变化，请重新选择。" });
       const originalContent = normalizeTextSubtitle(await readFile(subtitle.path));
+      if (!authorizedMediaForRequest(request, response, mediaId)) return;
       const needsWebVtt = subtitle.format === "SRT" && url.searchParams.get("format") === "vtt";
       const content = needsWebVtt ? srtToWebVtt(originalContent) : originalContent;
       response.writeHead(200, {
@@ -4025,19 +4211,21 @@ const server = createServer(async (request, response) => {
       const [, , , mediaId, , fontId] = pathname.split("/");
       const media = authorizedMediaForRequest(request, response, mediaId);
       if (!media) return;
-      const font = media?.fonts.find((item) => item.id === fontId);
-      if (!font) return sendJson(response, 404, { error: "找不到字体。" });
+      const font = await videoResourceService.resolveFont(media, fontId);
+      if (!authorizedMediaForRequest(request, response, mediaId)) { font.release(); return; }
+      response.once("finish", font.release); response.once("close", font.release);
       return streamFile(request, response, font.path);
     }
     if (!pathname.startsWith("/api/") && await serveStatic(response, pathname)) return;
     return sendJson(response, 404, { error: "没有找到这个地址。" });
   } catch (error) {
     console.error(error);
-    const statusCode = error.code === "INVALID_SCAN_MODE"
+    if (response.headersSent || response.destroyed) { response.destroy(); return; }
+    const statusCode = error.statusCode || error.status || (error.code === "INVALID_SCAN_MODE"
       ? 400
       : ["LIBRARY_CHANGED_DURING_SCAN", "READING_LIBRARY_CHANGED_DURING_SCAN", "PHOTO_LIBRARY_CHANGED_DURING_SCAN"].includes(error.code) ? 409
-        : ["READING_SCAN_CANCELLED", "PHOTO_SCAN_CANCELLED"].includes(error.code) ? 409 : 500;
-    return sendJson(response, statusCode, { error: error.message || "服务器内部错误" });
+        : ["READING_SCAN_CANCELLED", "PHOTO_SCAN_CANCELLED"].includes(error.code) ? 409 : 500);
+    return sendJson(response, statusCode, { error: statusCode >= 500 && !isLoopbackRequest(request) ? "资源处理失败，请稍后重试。" : error.message || "服务器内部错误", ...(error.code ? { code: error.code } : {}) });
   }
 });
 
@@ -4045,24 +4233,28 @@ let autoScanTimer = null;
 let scheduledScanRunning = false;
 
 async function runScheduledAutoScan(force = false) {
-  if (!appState.settings.autoScanEnabled || (!appState.libraries.length && !appState.musicLibraries.length && !appState.readingLibraries.length && !appState.photoLibraries.length) || activeScan || musicService.isScanning() || readingService.isScanning() || photoService.isScanning() || pendingScanMode || scheduledScanRunning || sharingServiceIsStopping) return;
-  const lastStartedMilliseconds = Math.max(
-    Date.parse(lastScanStartedAt || "") || 0,
-    Date.parse(musicService.scanStatus().lastStartedAt || "") || 0,
-    Date.parse(readingService.scanStatus().lastStartedAt || "") || 0,
-    Date.parse(photoService.scanStatus().lastStartedAt || "") || 0,
-  );
-  if (!force && Date.now() - lastStartedMilliseconds < normalizedAutoScanIntervalSeconds() * 1000) return;
+  if (!appState.settings.autoScanEnabled || activeScan || musicService.isScanning() || readingService.isScanning() || photoService.isScanning() || fileService.isScanning() || pendingScanMode || scheduledScanRunning || sharingServiceIsStopping) return;
+  if (!force && Date.now() < nextAutoScanAt) return;
+  // Reads for active viewers take priority over discovery and directory inventory.
+  if (!force && (playbackService.status().sessions > 0 || activeVideoTransfers.size > 0)) return;
+  videoChangeMonitor?.synchronize();
+  const dirty = videoChangeMonitor?.snapshot();
+  const full = force || Date.now() - lastFullVideoScanAt > 30 * 60 * 1000;
   scheduledScanRunning = true;
   try {
-    if (appState.libraries.length) await scanLibraries();
-    if (appState.musicLibraries.length) await musicService.scanLibraries();
-    if (appState.readingLibraries.length) await readingService.scanLibraries();
-    if (appState.photoLibraries.length) await photoService.scanLibraries();
-  } catch (error) {
-    console.error(`自动扫描媒体目录失败：${error.message}`);
-  } finally {
-    scheduledScanRunning = false;
+    if (appState.libraries.length && (full || dirty?.scopes.length)) {
+      await scanLibraries({ scopes: full ? null : dirty.scopes, trigger: full ? 'reconcile' : 'watcher' });
+      if (lastScanContext?.phase === 'indexed' && dirty) videoChangeMonitor.acknowledge(dirty);
+    }
+    if (lastScanContext?.phase === "cancelled") return;
+    if (appState.settings.autoScanEnabled && appState.musicLibraries.length) await musicService.scanLibraries();
+    if (appState.settings.autoScanEnabled && appState.readingLibraries.length) await readingService.scanLibraries();
+    if (appState.settings.autoScanEnabled && appState.photoLibraries.length) await photoService.scanLibraries();
+    if (appState.settings.autoScanEnabled && appState.fileLibraries.length) await fileService.scanLibraries();
+  } catch (error) { console.error('自动扫描媒体目录失败：' + error.message); }
+  finally {
+    nextAutoScanAt = Math.max(nextAutoScanAt, Date.now() + normalizedAutoScanIntervalSeconds() * 1000);
+    appState.settings.nextAutoScanAt = nextAutoScanAt; scheduledScanRunning = false;
   }
 }
 
@@ -4070,32 +4262,32 @@ function startAutoScanScheduler() {
   if (autoScanTimer) return;
   autoScanTimer = setInterval(() => void runScheduledAutoScan(), AUTO_SCAN_SCHEDULER_TICK_MS);
   autoScanTimer.unref();
+  videoChangeMonitor = createVideoChangeMonitor({ libraries: () => appState.libraries, onDirty: () => { directoryService.markDirty("video"); void runScheduledAutoScan(); } });
+  videoChangeMonitor.synchronize();
   void runScheduledAutoScan();
 }
 
 async function prepareStartupMedia() {
-  if (appState.settings.autoScanEnabled && (appState.libraries.length || appState.musicLibraries.length || appState.readingLibraries.length || appState.photoLibraries.length)) {
-    if (appState.libraries.length) await scanLibraries();
-    if (appState.musicLibraries.length) await musicService.scanLibraries();
-    if (appState.readingLibraries.length) await readingService.scanLibraries();
-    if (appState.photoLibraries.length) await photoService.scanLibraries();
-    return;
-  }
-  await queueAutomaticCompatibleCopies();
-  await musicService.queueAutomaticCompatibleCopies();
-  await cleanOrphanedCacheFiles().catch((error) => console.error(`启动时清理孤儿缓存失败：${error.message}`));
-  await musicService.cleanOrphanedCacheFiles().catch((error) => console.error(`启动时清理音乐缓存失败：${error.message}`));
-  await photoService.cleanOrphanedCacheFiles().catch((error) => console.error(`启动时清理图片缓存失败：${error.message}`));
+  // User pause survives startup. Background discovery never implies resource
+  // prewarming or destructive cache maintenance.
+  if (appState.settings.autoScanEnabled) await runScheduledAutoScan();
 }
 
 async function stopSharingService() {
   if (sharingServiceIsStopping) return;
   sharingServiceIsStopping = true;
-  const playbackStopping = playbackService.stop();
+  videoChangeMonitor?.close();
+  clearInterval(cacheMaintenanceTimer);
+  directoryService?.close();
+  if (activeScanContext) activeScanContext.cancelRequested = true;
+  const uploadsStopping = uploadService?.close();
+  const playbackStopping = Promise.all([playbackService.stop(), videoResourceService.stop()]);
+  void mediaTaskScheduler.close();
   const bitmapSubtitleStopping = bitmapSubtitleService.stop();
   musicService.requestStopScan();
   readingService.requestStopScan();
   photoService.requestStopScan();
+  fileService.requestStopScan();
   let serverClosed = false;
   let cleanupComplete = false;
   const exitWhenReady = () => {
@@ -4143,7 +4335,9 @@ async function stopSharingService() {
     .map((task) => task.executionPromise)
     .filter(Boolean);
   activeTaskPromises.push(playbackStopping);
+  if (cacheMaintenancePromise) activeTaskPromises.push(cacheMaintenancePromise);
   activeTaskPromises.push(bitmapSubtitleStopping);
+  if (uploadsStopping) activeTaskPromises.push(uploadsStopping);
   if (activeTaskPromises.length) {
     await Promise.race([
       Promise.allSettled(activeTaskPromises),

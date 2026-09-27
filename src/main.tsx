@@ -3,6 +3,11 @@ import { buildPrompt as buildLabelPrompt } from "../tools/label-prompt.mjs";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrandMark } from "./BrandMark";
+import { PlaybackSettingsCard } from "./PlaybackSettingsCard";
+import { FilesAdminPanel, FilesLibraryView } from "./files";
+import { UploadProvider, UploadLauncher, UploadSettingsCard } from "./uploads";
+import { DownloadSelection, useDownloadSelection } from "./downloads";
+import { VisibleResourceQueue } from "./video-catalog/visible-resource-queue";
 import { VideoPlayer as PlayerModal } from "./player/Player";
 import { PlayerTestPanel, playerTestRequested } from "./player/player-test";
 import {
@@ -63,7 +68,7 @@ import {
 } from "./photos";
 import "./styles.css";
 
-type Subtitle = { id: string; name: string; format: string; language: string; url: string; size?: number; modifiedAt?: string };
+type Subtitle = { id: string; name: string; format: string; language: string; url: string | null; default?: boolean; state?: string; size?: number; modifiedAt?: string };
 type FontAsset = { id: string; name: string; url: string; size?: number; modifiedAt?: string; aliases?: string[] };
 type BrowserCompatibility = {
   directPlayLikely: boolean;
@@ -81,6 +86,10 @@ type Media = {
   path?: string;
   extension: string;
   size: number;
+  sourceVersion?: string;
+  modifiedAt?: string;
+  metadata?: { state: string; errorCode?: string };
+  thumbnail?: { state: string; url: string | null };
   width?: number | null;
   height?: number | null;
   durationSeconds?: number;
@@ -90,6 +99,7 @@ type Media = {
   hdr?: string | null;
   posterHue: number;
   streamUrl: string;
+  downloadUrl?: string;
   remuxUrl?: string | null;
   thumbnailUrl?: string | null;
   subtitles: Subtitle[];
@@ -103,7 +113,7 @@ type Media = {
 };
 type LibraryFolder = { id: string; name: string; path: string };
 type DisplayGroup = { id: string; folderName?: string; title: string; season: number; configured: boolean; mediaCount: number };
-type DisplayFolder = DisplayGroup & { path: string; customTitle: string; sampleAlias: string; kind?: "music" | "video" | "reading" | "photo"; ebookCount?: number; spreadsheetCount?: number; libraryName?: string; relativePath?: string };
+type DisplayFolder = DisplayGroup & { path: string; customTitle: string; sampleAlias: string; kind?: "music" | "video" | "reading" | "photo" | "files"; ebookCount?: number; spreadsheetCount?: number; libraryName?: string; relativePath?: string };
 type CatalogFolder = {
   searchTitles?: string;
   originalTitle?: string;
@@ -140,6 +150,7 @@ type PlaybackStatus = { sessions: number; pipelines: number; cacheBytes: number;
 type DanmakuSettings = { appId: string; configured: boolean; environmentManaged: boolean };
 type AccessUser = {
   id: string;
+  canUpload: boolean;
   categoryIds: string[];
   enabled: boolean;
   createdAt: string;
@@ -148,7 +159,7 @@ type AccessUser = {
 };
 type AccessCategory = { id: string; name: string; folderIds: string[]; createdAt: string; updatedAt: string; system?: boolean };
 type AccessControlOverview = { enabled: boolean; users: AccessUser[]; categories: AccessCategory[]; activeSessions: number };
-type AccessStatus = { enabled: boolean; authenticated: boolean; localAdmin: boolean; user: { id: string } | null };
+type AccessStatus = { enabled: boolean; authenticated: boolean; localAdmin: boolean; canUpload?: boolean; user: { id: string; canUpload?: boolean } | null };
 type RemuxAccelerationStatus = {
   enabled: boolean;
   expiresAt: string | null;
@@ -159,6 +170,7 @@ type RemuxAccelerationStatus = {
   queuedJobs: number;
 };
 type Overview = {
+  catalogRevision?: string | number;
   libraries: LibraryFolder[];
   media: Media[];
   jobs: Job[];
@@ -184,7 +196,13 @@ type CatalogScanStatus = {
   id: string | null;
   mode: "standard" | "turbo" | null;
   pendingMode: "turbo" | null;
-  phase: "idle" | "waiting" | "discovering" | "processing" | "finalizing" | "cancelling" | "cancelled" | "completed" | "failed";
+  phase: "idle" | "waiting" | "discovering" | "indexing" | "indexed" | "processing" | "finalizing" | "cancelling" | "cancelled" | "completed" | "partial" | "failed";
+  catalogRevision?: string | number;
+  indexedFiles?: number;
+  failedFiles?: number;
+  nextAutoScanAt?: string | null;
+  canCancel?: boolean;
+  incompleteLibraries?: number;
   progressPercent: number | null;
   discoveredFiles: number;
   processedFiles: number;
@@ -194,13 +212,25 @@ type CatalogScanStatus = {
   maxParallelFiles: number;
   maxParallelMediaTools?: number;
 };
-type Catalog = { media: Media[]; folders?: CatalogFolder[]; groups: DisplayGroup[]; scan: CatalogScanStatus };
+type Catalog = { catalogRevision?: string | number; media: Media[]; folders?: CatalogFolder[]; groups: DisplayGroup[]; scan: CatalogScanStatus };
+type ScanActivity = { scanning: boolean; scan: CatalogScanStatus; jobs: Job[]; remuxAcceleration: RemuxAccelerationStatus };
+
+function acceptScan(scan: CatalogScanStatus) { window.dispatchEvent(new CustomEvent("lmd:video-scan", { detail: scan })); }
+async function startVideoScan(mode = "standard") {
+  const result = await api<{ taskId: string; scan: CatalogScanStatus }>(`/api/video/scans?mode=${mode}`, { method: "POST" });
+  acceptScan(result.scan); return result;
+}
+async function cancelVideoScan(scan: CatalogScanStatus) {
+  if (!scan.id) return;
+  const result = await api<{ scan: CatalogScanStatus }>(`/api/video/scans/${encodeURIComponent(scan.id)}/cancel`, { method: "POST" });
+  acceptScan(result.scan);
+}
 type ThemeMode = "dark" | "light";
 type AdminSection = "overview" | "access" | "settings";
 
 const THEME_STORAGE_KEY = "lmd-theme";
 
-const ACTIVE_SCAN_PHASES = new Set<CatalogScanStatus["phase"]>(["waiting", "discovering", "processing", "finalizing", "cancelling"]);
+const ACTIVE_SCAN_PHASES = new Set<CatalogScanStatus["phase"]>(["waiting", "discovering", "indexing", "processing", "finalizing", "cancelling"]);
 
 function scanIsActive(scan?: CatalogScanStatus | null) {
   return Boolean(scan && (scan.scanning || ACTIVE_SCAN_PHASES.has(scan.phase) || scan.pendingMode === "turbo"));
@@ -213,9 +243,12 @@ function scanPhaseLabel(scan?: CatalogScanStatus | null) {
     idle: "等待开始",
     waiting: "正在调度急速扫描",
     discovering: "正在发现视频文件",
+    indexing: "正在加入视频列表",
+    indexed: "基础索引已完成",
+    partial: "部分目录未完成，已保留现有视频",
     processing: "正在读取媒体信息",
     finalizing: "正在保存媒体索引",
-    cancelling: "正在停止最高性能扫描",
+    cancelling: "正在取消本轮扫描",
     cancelled: "扫描已手动停止",
     completed: "扫描已完成",
     failed: "扫描未完成",
@@ -298,7 +331,9 @@ function App() {
   const [photoOverview, setPhotoOverview] = useState<PhotoOverview | null>(null);
   const [rawCatalog, setCatalog] = useState<Catalog | null>(null);
   const titleLanguage = useTitleLanguage();
-  const catalog = useMemo(() => rawCatalog ? { ...rawCatalog, media: rawCatalog.media.map(m => ({ ...m, display: m.display ? localizedDisplay(m.display, titleLanguage) : undefined })), folders: rawCatalog.folders?.map(f => ({ ...f, searchTitles: `${f.title} ${f.originalTitle || ""}`, title: chooseTitle(f.title, f.originalTitle, titleLanguage) })) } : null, [rawCatalog, titleLanguage]);
+  const localizedMedia = useMemo(() => rawCatalog?.media.map(m => ({ ...m, display: m.display ? localizedDisplay(m.display, titleLanguage) : undefined })), [rawCatalog?.media, titleLanguage]);
+  const localizedFolders = useMemo(() => rawCatalog?.folders?.map(f => ({ ...f, searchTitles: `${f.title} ${f.originalTitle || ""}`, title: chooseTitle(f.title, f.originalTitle, titleLanguage) })), [rawCatalog?.folders, titleLanguage]);
+  const catalog = useMemo(() => rawCatalog ? { ...rawCatalog, media: localizedMedia || [], folders: localizedFolders } : null, [rawCatalog, localizedMedia, localizedFolders]);
   const [musicCatalog, setMusicCatalog] = useState<MusicCatalog | null>(null);
   const [readingCatalog, setReadingCatalog] = useState<ReadingCatalog | null>(null);
   const [photoCatalog, setPhotoCatalog] = useState<PhotoCatalog | null>(null);
@@ -310,14 +345,26 @@ function App() {
   const [selectedMedia, setSelectedMedia] = useState<Media | null>(null);
   const refreshSequence = useRef(0);
   const hasLoadedOnce = useRef(false);
-  const initialAdminOverviewLoaded = useRef(false);
-  const previousAdminScanActive = useRef(false);
-  const previousAdminJobsActive = useRef(false);
-  const adminScanActive = Boolean(overview?.scanning || scanIsActive(overview?.scan));
-  const adminJobsActive = Boolean(overview?.jobs.some((job) => job.status === "queued" || job.status === "running"));
+  const videoSequence = useRef(0);
+  const videoRevision = useRef<string | number | undefined>(undefined);
+  const activityRef = useRef({ active: false, jobsActive: false });
+  activityRef.current = { active: scanIsActive(isAdminPath ? overview?.scan : catalog?.scan), jobsActive: Boolean(overview?.jobs.some(job => ["queued", "running"].includes(job.status))) };
   const musicAdminActive = Boolean(musicOverview?.scanning || musicOverview?.jobs.some((job) => job.status === "queued" || job.status === "running"));
   const readingAdminActive = Boolean(readingOverview?.scanning);
   const photoAdminActive = Boolean(photoOverview?.scanning);
+
+  const refreshVideo = useCallback(async (signal?: AbortSignal) => {
+    const sequence = ++videoSequence.current;
+    if (isAdminPath) {
+      const next = await api<Overview>("/api/overview", { signal });
+      if (sequence !== videoSequence.current || signal?.aborted) return;
+      videoRevision.current = next.catalogRevision ?? next.scan.catalogRevision; setOverview(next);
+    } else {
+      const next = await api<Catalog>("/api/catalog", { signal });
+      if (sequence !== videoSequence.current || signal?.aborted) return;
+      videoRevision.current = next.catalogRevision ?? next.scan.catalogRevision; setCatalog(next);
+    }
+  }, [isAdminPath]);
 
   const refresh = useCallback(async (quiet = false) => {
     const sequence = ++refreshSequence.current;
@@ -326,28 +373,14 @@ function App() {
       // 不再整树卸载界面，避免播放器预览被中断。
       if (!quiet && !hasLoadedOnce.current) setLoading(true);
       if (isAdminPath) {
-        let bootstrapActivity: { scanning: boolean; scan: CatalogScanStatus; jobs: Job[]; remuxAcceleration: RemuxAccelerationStatus } | null = null;
-        if (!quiet && !initialAdminOverviewLoaded.current) {
-          bootstrapActivity = await api("/api/scan/status");
-        }
-        const [nextOverview, nextMusicOverview, nextReadingOverview, nextPhotoOverview] = await Promise.all([
-          api<Overview>(bootstrapActivity?.scanning ? "/api/overview?compact=1" : "/api/overview"),
-          optionalFeatureApi<MusicOverview>("/api/music/overview", { libraries: [], tracks: [], jobs: [], scanning: false, scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
-          optionalFeatureApi<ReadingOverview>("/api/reading/overview", { libraries: [], items: [], scanning: false, scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
-          optionalFeatureApi<PhotoOverview>("/api/photos/overview", { libraries: [], items: [], scanning: false, scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
-        ]);
-        if (sequence !== refreshSequence.current) return;
-        if (bootstrapActivity) {
-          nextOverview.scanning = bootstrapActivity.scanning;
-          nextOverview.scan = bootstrapActivity.scan;
-          nextOverview.jobs = bootstrapActivity.jobs;
-          nextOverview.remuxAcceleration = bootstrapActivity.remuxAcceleration;
-        }
-        initialAdminOverviewLoaded.current = true;
-        setOverview(nextOverview);
-        setMusicOverview(nextMusicOverview);
-        setReadingOverview(nextReadingOverview);
-        setPhotoOverview(nextPhotoOverview);
+        // Each category publishes independently; a slow music/photo drive must
+        // not hold the video index or unmount an already playing video.
+        void Promise.allSettled([
+          optionalFeatureApi<MusicOverview>("/api/music/overview", { libraries: [], tracks: [], jobs: [], scanning: false, scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }).then(next => { if (sequence === refreshSequence.current) setMusicOverview(next); }),
+          optionalFeatureApi<ReadingOverview>("/api/reading/overview", { libraries: [], items: [], scanning: false, scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }).then(next => { if (sequence === refreshSequence.current) setReadingOverview(next); }),
+          optionalFeatureApi<PhotoOverview>("/api/photos/overview", { libraries: [], items: [], scanning: false, scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }).then(next => { if (sequence === refreshSequence.current) setPhotoOverview(next); }),
+        ]).then(results => { const failure = results.find(result => result.status === "rejected"); if (failure?.status === "rejected" && sequence === refreshSequence.current) setError(`其他媒体目录暂时不可用：${failure.reason instanceof Error ? failure.reason.message : "连接失败"}`); });
+        await refreshVideo();
       } else {
         const nextAccessStatus = await api<AccessStatus>("/api/auth/status");
         if (sequence !== refreshSequence.current) return;
@@ -359,17 +392,12 @@ function App() {
           setPhotoCatalog(null);
         }
         else {
-          const [nextCatalog, nextMusicCatalog, nextReadingCatalog, nextPhotoCatalog] = await Promise.all([
-            api<Catalog>("/api/catalog"),
-            optionalFeatureApi<MusicCatalog>("/api/music/catalog", { tracks: [], folders: [], scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
-            optionalFeatureApi<ReadingCatalog>("/api/reading/catalog", { items: [], folders: [], scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
-            optionalFeatureApi<PhotoCatalog>("/api/photos/catalog", { items: [], folders: [], scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }),
-          ]);
-          if (sequence !== refreshSequence.current) return;
-          setCatalog(nextCatalog);
-          setMusicCatalog(nextMusicCatalog);
-          setReadingCatalog(nextReadingCatalog);
-          setPhotoCatalog(nextPhotoCatalog);
+          void Promise.allSettled([
+            optionalFeatureApi<MusicCatalog>("/api/music/catalog", { tracks: [], folders: [], scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }).then(next => { if (sequence === refreshSequence.current) setMusicCatalog(next); }),
+            optionalFeatureApi<ReadingCatalog>("/api/reading/catalog", { items: [], folders: [], scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }).then(next => { if (sequence === refreshSequence.current) setReadingCatalog(next); }),
+            optionalFeatureApi<PhotoCatalog>("/api/photos/catalog", { items: [], folders: [], scan: { scanning: false, phase: "idle", progressPercent: null, processedFiles: 0, totalFiles: 0, lastError: null } }).then(next => { if (sequence === refreshSequence.current) setPhotoCatalog(next); }),
+          ]).then(results => { const failure = results.find(result => result.status === "rejected"); if (failure?.status === "rejected" && sequence === refreshSequence.current) setError(`其他媒体目录暂时不可用：${failure.reason instanceof Error ? failure.reason.message : "连接失败"}`); });
+          await refreshVideo();
         }
       }
       setError("");
@@ -382,47 +410,50 @@ function App() {
         hasLoadedOnce.current = true;
       }
     }
-  }, [isAdminPath]);
-
-  const refreshAdminActivity = useCallback(async () => {
-    try {
-      const activity = await api<{ scanning: boolean; scan: CatalogScanStatus; jobs: Job[]; remuxAcceleration: RemuxAccelerationStatus }>("/api/scan/status");
-      setOverview((currentOverview) => currentOverview ? {
-        ...currentOverview,
-        scanning: activity.scanning,
-        scan: activity.scan,
-        jobs: activity.jobs,
-        remuxAcceleration: activity.remuxAcceleration,
-      } : currentOverview);
-      setError("");
-    } catch (fetchError) {
-      setError(fetchError instanceof Error ? fetchError.message : "无法读取扫描进度");
-    }
-  }, []);
+  }, [isAdminPath, refreshVideo]);
 
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => {
-    if (!isAdminPath || (!adminScanActive && !adminJobsActive)) return;
-    const timer = window.setInterval(() => void refreshAdminActivity(), adminScanActive ? 500 : 1800);
-    return () => window.clearInterval(timer);
-  }, [adminJobsActive, adminScanActive, isAdminPath, refreshAdminActivity]);
+    if (!isAdminPath && (!accessStatus || accessStatus.enabled && !accessStatus.authenticated)) return;
+    const controller = new AbortController(); let timer: ReturnType<typeof setTimeout>, busy = false, failures = 0, acceptedGeneration = 0;
+    const updateScan = (scan: CatalogScanStatus) => {
+      setOverview(current => current ? { ...current, scanning: scan.scanning, scan } : current);
+      setCatalog(current => current ? { ...current, scan } : current);
+      activityRef.current.active = scanIsActive(scan);
+    };
+    const tick = async () => {
+      if (busy || controller.signal.aborted) return;
+      busy = true;
+      try {
+        const previous = { ...activityRef.current }, generation = acceptedGeneration;
+        const activity = await api<ScanActivity>(isAdminPath ? "/api/scan/status" : "/api/video/scans/current", { signal: controller.signal });
+        if (controller.signal.aborted || generation !== acceptedGeneration) return;
+        updateScan(activity.scan);
+        if (isAdminPath) setOverview(current => current ? { ...current, jobs: activity.jobs, remuxAcceleration: activity.remuxAcceleration } : current);
+        const revision = activity.scan.catalogRevision;
+        if (revision !== videoRevision.current || previous.active && !scanIsActive(activity.scan) || previous.jobsActive && !activity.jobs?.some(job => ["queued", "running"].includes(job.status))) await refreshVideo(controller.signal);
+        if (failures) setError(current => current.startsWith("扫描状态") ? "" : current);
+        failures = 0;
+      } catch (failure) {
+        if (controller.signal.aborted) return;
+        failures++;
+        if (failure instanceof ApiError && [401, 403].includes(failure.status)) { setCatalog(null); setMusicCatalog(null); setReadingCatalog(null); setPhotoCatalog(null); void refresh(true); }
+        else if (failures >= 3) setError(failure instanceof Error ? `扫描状态暂时不可用：${failure.message}` : "扫描状态连接中断，将自动重试");
+      } finally {
+        busy = false;
+        if (!controller.signal.aborted) timer = setTimeout(tick, Math.min(15000, (document.hidden ? 5000 : activityRef.current.active ? 650 : activityRef.current.jobsActive ? 1800 : 4000) * 2 ** failures));
+      }
+    };
+    const accepted = (event: Event) => { acceptedGeneration++; updateScan((event as CustomEvent<CatalogScanStatus>).detail); clearTimeout(timer); void tick(); };
+    window.addEventListener("lmd:video-scan", accepted);
+    void tick();
+    return () => { controller.abort(); clearTimeout(timer); window.removeEventListener("lmd:video-scan", accepted); };
+  }, [isAdminPath, accessStatus?.authenticated, accessStatus?.enabled, refresh, refreshVideo]);
   useEffect(() => {
     if (!isAdminPath || (!musicAdminActive && !readingAdminActive && !photoAdminActive)) return;
     const timer = window.setInterval(() => void refresh(true), 1200);
     return () => window.clearInterval(timer);
   }, [isAdminPath, musicAdminActive, photoAdminActive, readingAdminActive, refresh]);
-  useEffect(() => {
-    const scanFinished = previousAdminScanActive.current && !adminScanActive;
-    const jobsFinished = previousAdminJobsActive.current && !adminJobsActive;
-    previousAdminScanActive.current = adminScanActive;
-    previousAdminJobsActive.current = adminJobsActive;
-    if (isAdminPath && (scanFinished || jobsFinished)) void refresh(true);
-  }, [adminJobsActive, adminScanActive, isAdminPath, refresh]);
-  useEffect(() => {
-    if (isAdminPath || (!catalog?.scan?.scanning && !catalog?.media.some((item) => ["waiting", "queued", "running"].includes(item.compatibleCopyStatus || "")))) return;
-    const timer = window.setInterval(() => refresh(true), 4000);
-    return () => window.clearInterval(timer);
-  }, [catalog?.media, catalog?.scan?.scanning, isAdminPath, refresh]);
   useEffect(() => {
     if (!selectedMedia || !catalog) return;
     const updatedMedia = catalog.media.find((item) => item.id === selectedMedia.id);
@@ -453,11 +484,9 @@ function App() {
   };
 
   if (loading) return <LoadingScreen />;
-  if (!isAdminPath && accessStatus?.enabled && !accessStatus.authenticated) {
-    return <AccessLoginScreen theme={theme} onToggleTheme={toggleTheme} onAuthenticated={refresh} />;
-  }
-
   return (
+    <UploadProvider accessStatus={accessStatus} onRefresh={refresh}>
+    {!isAdminPath && accessStatus?.enabled && !accessStatus.authenticated ? <AccessLoginScreen theme={theme} onToggleTheme={toggleTheme} onAuthenticated={refresh} /> :
     <MusicPlayerProvider catalog={musicCatalog}>
     <div className="app-shell">
       {isAdminPath ? (
@@ -483,6 +512,8 @@ function App() {
       {isAdminPath && selectedMedia && <PlayerModal media={selectedMedia} onClose={() => setSelectedMedia(null)} />}
     </div>
     </MusicPlayerProvider>
+    }
+    </UploadProvider>
   );
 }
 
@@ -580,8 +611,28 @@ function mediaFolderId(media: Media) {
   return media.display?.folderId || media.display?.groupId || "";
 }
 
-function compareCatalogTitles(left: { title: string }, right: { title: string }) {
-  return left.title.localeCompare(right.title, "zh-CN", { numeric: true, sensitivity: "base" });
+const catalogCollator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+function compareCatalogTitles(left: { title: string }, right: { title: string }) { return catalogCollator.compare(left.title, right.title); }
+
+function useCatalogPage<T extends { id: string }>(items: T[], scope: string) {
+  const [selection, setSelection] = useState<{ scope: string; anchor: string; offset: number } | null>(null);
+  const pageSize = 120;
+  const selectedOffset = selection?.scope === scope ? items.findIndex(item => item.id === selection.anchor) : 0;
+  const offset = Math.max(0, Math.min(selectedOffset < 0 ? selection?.offset || 0 : selectedOffset, Math.max(0, items.length - 1)));
+  const change = (target: number) => {
+    const next = Math.max(0, Math.min(target, Math.max(0, items.length - 1)));
+    if (items[next]) setSelection({ scope, anchor: items[next].id, offset: next });
+  };
+  return { items: items.slice(offset, offset + pageSize), total: items.length, offset, pageSize, change };
+}
+function CatalogPagination({ page, label }: { page: { total: number; offset: number; pageSize: number; change: (offset: number) => void }; label: string }) {
+  if (page.total <= page.pageSize) return null;
+  const change = (event: React.MouseEvent<HTMLButtonElement>, offset: number) => { page.change(offset); event.currentTarget.closest("section")?.scrollIntoView({ block: "start" }); };
+  return <nav className="catalog-pagination" aria-label={`${label}分页`}><span aria-live="polite">{page.offset + 1}–{Math.min(page.total, page.offset + page.pageSize)} / {page.total}</span><button type="button" className="btn btn--sm" disabled={page.offset === 0} onClick={event => change(event, page.offset - page.pageSize)}>上一页</button><button type="button" className="btn btn--sm" disabled={page.offset + page.pageSize >= page.total} onClick={event => change(event, page.offset + page.pageSize)}>下一页</button></nav>;
+}
+
+function folderMatchesSearch(folder: CatalogFolder, query: string) {
+  return `${folder.title} ${folder.originalTitle || ""} ${folder.searchTitles || ""} ${folder.name}`.toLowerCase().includes(query);
 }
 
 function ViewerSession({ accessStatus, onLogout }: { accessStatus: AccessStatus | null; onLogout: () => Promise<void> }) {
@@ -593,11 +644,11 @@ function ViewerSession({ accessStatus, onLogout }: { accessStatus: AccessStatus 
   );
 }
 
-type ViewerSection = "video" | "music" | "reading" | "photos";
+type ViewerSection = "video" | "music" | "reading" | "photos" | "files";
 
 function sectionFromLocation(): ViewerSection {
   const value = new URLSearchParams(window.location.search).get("section");
-  return value === "music" || value === "reading" || value === "photos" ? value : "video";
+  return value === "music" || value === "reading" || value === "photos" || value === "files" ? value : "video";
 }
 
 function ClientHeader({ section, onSelectSection, onHome, theme, onToggleTheme, accessStatus, onLogout, scanTitle, onScan, scanBusy, search, onSearchChange, searchPlaceholder, searchAriaLabel }: {
@@ -616,19 +667,34 @@ function ClientHeader({ section, onSelectSection, onHome, theme, onToggleTheme, 
   searchPlaceholder?: string;
   searchAriaLabel?: string;
 }) {
+  const searchInput = useRef<HTMLInputElement>(null);
+  const clearSearch = () => {
+    onSearchChange?.("");
+    searchInput.current?.focus();
+  };
   return (
     <header className="appbar">
       <button type="button" className="appbar-brand" onClick={onHome} aria-label="返回视频库首页" title="返回视频库首页"><BrandMark /><strong>LMD</strong></button>
       <nav className="segmented appbar-nav" aria-label="媒体板块">
-        <button type="button" className={section === "video" ? "is-active" : ""} onClick={() => onSelectSection("video")}><Film size={17} /><span>视频</span></button>
-        <button type="button" className={section === "music" ? "is-active" : ""} onClick={() => onSelectSection("music")}><Music2 size={17} /><span>音乐</span></button>
-        <button type="button" className={section === "reading" ? "is-active" : ""} onClick={() => onSelectSection("reading")}><BookOpen size={17} /><span>电子书</span></button>
-        <button type="button" className={section === "photos" ? "is-active" : ""} onClick={() => onSelectSection("photos")}><Images size={17} /><span>图片</span></button>
+        <button type="button" className={section === "video" ? "is-active" : ""} aria-current={section === "video" ? "page" : undefined} onClick={() => onSelectSection("video")}><Film size={17} /><span>视频</span></button>
+        <button type="button" className={section === "music" ? "is-active" : ""} aria-current={section === "music" ? "page" : undefined} onClick={() => onSelectSection("music")}><Music2 size={17} /><span>音乐</span></button>
+        <button type="button" className={section === "reading" ? "is-active" : ""} aria-current={section === "reading" ? "page" : undefined} onClick={() => onSelectSection("reading")}><BookOpen size={17} /><span>电子书</span></button>
+        <button type="button" className={section === "photos" ? "is-active" : ""} aria-current={section === "photos" ? "page" : undefined} onClick={() => onSelectSection("photos")}><Images size={17} /><span>图片</span></button>
+        <button type="button" className={section === "files" ? "is-active" : ""} aria-current={section === "files" ? "page" : undefined} onClick={() => onSelectSection("files")}><FolderOpen size={17} /><span>其他文件</span></button>
       </nav>
       <div className="appbar-actions">
-        {typeof search === "string" && onSearchChange && <label className="search-box"><Search size={14} /><input aria-label={searchAriaLabel || "搜索"} value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder={searchPlaceholder || "搜索…"} /></label>}
+        {typeof search === "string" && onSearchChange && <div className="search-box" role="search" aria-label="搜索当前媒体库">
+          <Search size={14} aria-hidden="true" />
+          <input ref={searchInput} type="search" aria-label={searchAriaLabel || "搜索"} value={search} onChange={(event) => onSearchChange(event.target.value)} onKeyDown={(event) => {
+            if (event.key === "Escape" && !event.nativeEvent.isComposing && search) {
+              event.preventDefault();
+              clearSearch();
+            }
+          }} placeholder={searchPlaceholder || "搜索…"} />
+          <button type="button" className="search-clear" onClick={clearSearch} disabled={!search} aria-hidden={!search} tabIndex={search ? 0 : -1} aria-label="清空搜索" title="清空搜索（Esc）"><X size={14} /></button>
+        </div>}
         {onScan && <button type="button" className="icon-btn" onClick={onScan} disabled={scanBusy} title={scanTitle} aria-label={scanTitle}><RefreshCw size={15} className={scanBusy ? "spin" : ""} /></button>}
-        <TitleLanguageToggle /><ThemeToggle theme={theme} onToggle={onToggleTheme} />
+        <UploadLauncher kind={section} /><TitleLanguageToggle /><ThemeToggle theme={theme} onToggle={onToggleTheme} />
         <ViewerSession accessStatus={accessStatus} onLogout={onLogout} />
       </div>
     </header>
@@ -648,6 +714,8 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, photoCatalog, error,
   onToggleTheme: () => void;
 }) {
   const [search, setSearch] = useState("");
+  const videoSelection = useDownloadSelection();
+  const [selectedFilesFolderId, setSelectedFilesFolderId] = useState<string | null>(() => sectionFromLocation() === "files" ? new URLSearchParams(window.location.search).get("folder") : null);
   const [section, setSection] = useState<ViewerSection>(sectionFromLocation);
   const [selectedMusicFolderId, setSelectedMusicFolderId] = useState<string | null>(() => {
     const parameters = new URLSearchParams(window.location.search);
@@ -716,13 +784,13 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, photoCatalog, error,
   const directMedia = useMemo(() => allMedia
     .filter((item) => currentFolder && mediaFolderId(item) === currentFolder.id)
     .sort((left, right) => (left.display?.episode || 0) - (right.display?.episode || 0)
-      || left.fileName.localeCompare(right.fileName, "zh-CN", { numeric: true, sensitivity: "base" })), [allMedia, currentFolder]);
+      || catalogCollator.compare(left.fileName, right.fileName)), [allMedia, currentFolder]);
   const matchesSearch = (item: Media) => `${mediaQuickSelectionName(item)} ${mediaDisplayName(item)} ${item.display?.searchTitles || ""} ${item.display?.title || ""} ${item.display?.originalTitle || ""} ${item.display?.originalEpisodeTitle || ""} ${item.title} ${item.fileName} ${item.tags.join(" ")}`.toLowerCase().includes(normalizedSearch);
   const matchingFolderIds = useMemo(() => {
     const matches = new Set<string>();
     if (!normalizedSearch) return matches;
     for (const folder of folders) {
-      if (`${folder.title} ${folder.originalTitle || ""} ${folder.searchTitles || ""} ${folder.name}`.toLowerCase().includes(normalizedSearch)) matches.add(folder.id);
+      if (folderMatchesSearch(folder, normalizedSearch)) matches.add(folder.id);
     }
     for (const item of allMedia) {
       if (matchesSearch(item) && mediaFolderId(item)) matches.add(mediaFolderId(item));
@@ -741,6 +809,8 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, photoCatalog, error,
   const visibleFolders = (currentFolder ? childFolders : rootFolders)
     .filter((folder) => !normalizedSearch || matchingFolderIds.has(folder.id));
   const visibleMedia = directMedia.filter((item) => !normalizedSearch || matchesSearch(item));
+  const videoPage = useCatalogPage(visibleMedia, `${currentFolder?.id || "root"}:${normalizedSearch}`);
+  const folderPage = useCatalogPage(visibleFolders, `${currentFolder?.id || "root"}:${normalizedSearch}`);
   const hasQuickSelections = visibleMedia.some((item) => Boolean(item.display?.quickSelection));
   const selectedMedia = allMedia.find((item) => item.id === selectedMediaId) || null;
   const selectedMediaFolder = selectedMedia ? mediaFolderId(selectedMedia) : "";
@@ -753,7 +823,7 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, photoCatalog, error,
   const selectedFolderMedia = useMemo(() => allMedia
     .filter((item) => selectedMediaFolder && mediaFolderId(item) === selectedMediaFolder)
     .sort((left, right) => (left.display?.episode || 0) - (right.display?.episode || 0)
-      || left.fileName.localeCompare(right.fileName, "zh-CN", { numeric: true, sensitivity: "base" })), [allMedia, selectedMediaFolder]);
+      || catalogCollator.compare(left.fileName, right.fileName)), [allMedia, selectedMediaFolder]);
   const selectedMediaIndex = selectedMedia ? selectedFolderMedia.findIndex((item) => item.id === selectedMedia.id) : -1;
   const previousMedia = selectedMediaIndex > 0 ? selectedFolderMedia[selectedMediaIndex - 1] || null : null;
   const nextMedia = selectedMediaIndex >= 0 ? selectedFolderMedia[selectedMediaIndex + 1] || null : null;
@@ -775,6 +845,7 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, photoCatalog, error,
       const parameters = new URLSearchParams(window.location.search);
       const nextSection = sectionFromLocation();
       setSection(nextSection);
+      setSelectedFilesFolderId(nextSection === "files" ? parameters.get("folder") : null);
       setSelectedMusicFolderId(nextSection === "music" ? parameters.get("folder") : null);
       setSelectedTrackId(nextSection === "music" ? parameters.get("track") : null);
       setSelectedReadingFolderId(nextSection === "reading" ? parameters.get("folder") : null);
@@ -799,6 +870,7 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, photoCatalog, error,
     else nextUrl.searchParams.set("section", nextSection);
     window.history.pushState({ section: nextSection }, "", nextUrl);
     setSection(nextSection);
+    setSelectedFilesFolderId(null);
     setSelectedFolderId(null);
     setSelectedMediaId(null);
     setSelectedMusicFolderId(null);
@@ -813,9 +885,10 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, photoCatalog, error,
   };
 
   const openFolder = (folderId: string) => {
+    if (folderId === currentFolder?.id && !selectedMediaId) return;
     const folder = folderById.get(folderId);
     const folderNameMatchesSearch = Boolean(normalizedSearch && folder
-      && `${folder.title} ${folder.name}`.toLowerCase().includes(normalizedSearch));
+      && folderMatchesSearch(folder, normalizedSearch));
     const nextUrl = new URL(window.location.href);
     nextUrl.searchParams.set("folder", folderId);
     nextUrl.searchParams.delete("series");
@@ -1050,15 +1123,30 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, photoCatalog, error,
     const musicMode = section === "music";
     const readingMode = section === "reading";
     const photoMode = section === "photos";
+    const filesMode = section === "files";
     setScanNotice({ text: musicMode ? "正在扫描音乐目录、标签、封面与歌词…" : readingMode ? "正在扫描电子书与表格目录…" : photoMode ? "正在扫描图片尺寸并生成瀑布流缩略图…" : "正在扫描视频目录并刷新文件列表…", tone: "success" });
     try {
-      const result = await api<{ count: number }>(musicMode ? "/api/music/catalog/scan" : readingMode ? "/api/reading/catalog/scan" : photoMode ? "/api/photos/catalog/scan" : "/api/catalog/scan", { method: "POST" });
+      if (section === "video") {
+        await startVideoScan();
+        setScanNotice(null);
+        return;
+      }
+      const result = await api<{ count: number }>(filesMode ? "/api/files/catalog/scan" : musicMode ? "/api/music/catalog/scan" : readingMode ? "/api/reading/catalog/scan" : photoMode ? "/api/photos/catalog/scan" : "/api/catalog/scan", { method: "POST" });
       await onRefresh(true);
+      if (filesMode) { window.dispatchEvent(new Event("lmd:files-refresh")); setScanNotice({ text: `扫描完成，当前共有 ${result.count} 个共享文件。`, tone: "success" }); return; }
       setScanNotice({ text: musicMode ? `扫描完成，当前共有 ${result.count} 首歌曲。` : readingMode ? `扫描完成，当前共有 ${result.count} 个阅读文件。` : photoMode ? `扫描完成，当前共有 ${result.count} 张图片。` : `扫描完成，当前共有 ${result.count} 个视频文件。`, tone: "success" });
     } catch (operationError) {
       setScanNotice({ text: operationError instanceof Error ? operationError.message : "扫描刷新失败", tone: "warning" });
     } finally { setScanBusy(false); }
   };
+
+  if (section === "files") {
+    const openFilesFolder = (id: string | null) => {
+      const url = new URL(window.location.href); if (id) url.searchParams.set("folder", id); else url.searchParams.delete("folder");
+      window.history.pushState({ section: "files", folder: id }, "", url); setSelectedFilesFolderId(id); setSearch("");
+    };
+    return <div className="client-page"><ClientHeader section={section} onSelectSection={switchSection} onHome={openLibrary} theme={theme} onToggleTheme={onToggleTheme} accessStatus={accessStatus} onLogout={onLogout} scanTitle="刷新共享文件" onScan={scanNow} scanBusy={scanBusy} search={search} onSearchChange={setSearch} searchPlaceholder="搜索共享文件…" searchAriaLabel="搜索共享文件" /><main className="app-main"><TimedStatusBanner notice={scanNotice} onDismiss={dismissScanNotice} /><FilesLibraryView folderId={selectedFilesFolderId} search={search} onOpenFolder={openFilesFolder} /></main></div>;
+  }
 
   if (section === "photos" && photoCatalog) {
     return (
@@ -1131,36 +1219,42 @@ function ClientApp({ catalog, musicCatalog, readingCatalog, photoCatalog, error,
 
   return (
     <div className="client-page">
-      <ClientHeader section={section} onSelectSection={switchSection} onHome={openLibrary} theme={theme} onToggleTheme={onToggleTheme} accessStatus={accessStatus} onLogout={onLogout} scanTitle="立即扫描并刷新文件" onScan={scanNow} scanBusy={scanBusy} search={search} onSearchChange={setSearch} searchPlaceholder="搜索文件夹、视频…" searchAriaLabel="搜索文件夹或视频" />
+      <ClientHeader section={section} onSelectSection={switchSection} onHome={openLibrary} theme={theme} onToggleTheme={onToggleTheme} accessStatus={accessStatus} onLogout={onLogout} scanTitle="立即扫描并刷新文件" onScan={scanNow} scanBusy={scanBusy || scanIsActive(catalog?.scan)} search={search} onSearchChange={setSearch} searchPlaceholder="搜索文件夹、视频…" searchAriaLabel="搜索文件夹或视频" />
       <main className="app-main" key={currentFolder?.id || "root"}>
         {error && <StatusBanner tone="warning" icon={<AlertTriangle size={14} />}>{error}</StatusBanner>}
         <TimedStatusBanner notice={scanNotice} onDismiss={dismissScanNotice} />
+        {catalog?.scan && catalog.scan.phase !== "idle" && <ScanProgress scan={catalog.scan} />}
         <div className="lib-toolbar">
           <nav className="crumbs" aria-label="当前文件夹路径">
             {!atVideoLibraryRoot && currentFolder ? <>
               <button type="button" onClick={openLibrary}>全部视频</button>
-              {folderTrail.map((folder) => <React.Fragment key={folder.id}><span className="crumbs-sep">/</span><button type="button" onClick={() => openFolder(folder.id)} aria-current={folder.id === currentFolder.id ? "page" : undefined}>{folder.title}</button></React.Fragment>)}
-            </> : <span className="crumbs-current">全部视频</span>}
+              {folderTrail.map((folder) => <React.Fragment key={folder.id}><span className="crumbs-sep" aria-hidden="true">/</span>{folder.id === currentFolder.id ? <span className="crumbs-current" aria-current="page" title={folder.title}>{folder.title}</span> : <button type="button" onClick={() => openFolder(folder.id)} title={folder.title}>{folder.title}</button>}</React.Fragment>)}
+            </> : <span className="crumbs-current" aria-current="page">全部视频</span>}
           </nav>
-          <span className="lib-stats">{currentFolder ? `${visibleFolders.length} 个文件夹 · ${visibleMedia.length} 个视频` : `${rootFolders.length} 个根目录 · ${totalVideos} 个视频`}</span>
+          <span className="lib-stats" role="status">{currentFolder ? `${visibleFolders.length} 个文件夹 · ${visibleMedia.length} 个视频` : normalizedSearch ? `匹配 ${visibleFolders.length} 个根目录` : `${rootFolders.length} 个根目录 · ${totalVideos} 个视频`}</span>
         </div>
+        <DownloadSelection kind="video" items={visibleMedia} selected={videoSelection.selected} onSelect={videoSelection.setSelected} />
         {visibleFolders.length || visibleMedia.length ? (
           <div className="media-sections">
             {visibleMedia.length > 0 && <section className={`media-section${hasQuickSelections ? " media-section--selection" : ""}`} aria-labelledby="video-selection-section-title">
               {currentFolder && <div className="media-section-head"><h2 id="video-selection-section-title">{hasQuickSelections ? "选集" : "视频"}</h2><span>{visibleMedia.length} 个</span></div>}
+              <CatalogPagination page={videoPage} label="视频" />
               <div className="media-grid">
-                {visibleMedia.map((item) => <MediaCard key={item.id} media={item} onPlay={() => openMedia(item)} />)}
+                {videoPage.items.map((item) => <MediaCard key={item.id} media={item} onPlay={() => openMedia(item)} selected={videoSelection.selected.has(item.id)} onToggle={() => videoSelection.toggle(item.id)} />)}
               </div>
+              <CatalogPagination page={videoPage} label="视频" />
             </section>}
             {visibleFolders.length > 0 && <section className="media-section" aria-labelledby={currentFolder ? "video-folder-section-title" : undefined}>
               {currentFolder && <div className="media-section-head"><h2 id="video-folder-section-title">文件夹</h2><span>{visibleFolders.length} 个</span></div>}
+              <CatalogPagination page={folderPage} label="文件夹" />
               <div className="media-grid">
-                {visibleFolders.map((folder) => <FolderCard key={folder.id} folder={folder} cover={folder.coverMediaId ? mediaById.get(folder.coverMediaId) || null : null} onOpen={() => openFolder(folder.id)} />)}
+                {folderPage.items.map((folder) => <FolderCard key={folder.id} folder={folder} cover={folder.coverMediaId ? mediaById.get(folder.coverMediaId) || null : null} onOpen={() => openFolder(folder.id)} />)}
               </div>
+              <CatalogPagination page={folderPage} label="文件夹" />
             </section>}
           </div>
         ) : (
-          <div className="empty-state"><Library size={24} /><strong>{normalizedSearch ? "没有匹配的内容" : !atVideoLibraryRoot && currentFolder ? "这个文件夹暂时为空" : "媒体库暂时为空"}</strong><span>{normalizedSearch ? "请尝试其他文件夹名或视频名。" : !atVideoLibraryRoot && currentFolder ? "此处没有可播放视频或包含视频的子文件夹。" : "请添加视频目录，或把视频放入已有目录后重新扫描。"}</span></div>
+          <div className="empty-state"><Library size={24} /><strong>{normalizedSearch ? "没有匹配的内容" : !atVideoLibraryRoot && currentFolder ? "这个文件夹暂时为空" : "媒体库暂时为空"}</strong><span>{normalizedSearch ? "请尝试其他文件夹名或视频名。" : !atVideoLibraryRoot && currentFolder ? "此处没有可播放视频或包含视频的子文件夹。" : "请添加视频目录，或把视频放入已有目录后重新扫描。"}</span>{normalizedSearch && <button type="button" className="btn btn--sm" onClick={() => setSearch("")}>清空搜索</button>}</div>
         )}
       </main>
     </div>
@@ -1172,7 +1266,7 @@ function FolderCard({ folder, cover, onOpen }: { folder: CatalogFolder; cover: M
     <article className="mcard mcard--folder" style={{ "--poster-hue": cover?.posterHue || 205 } as React.CSSProperties}>
       <button type="button" className="mcard-hit" onClick={onOpen} aria-label={`打开文件夹 ${folder.title}`} />
       <div className="mcard-poster">
-        {cover?.thumbnailUrl && <img className="mcard-img" src={cover.thumbnailUrl} alt="" loading="lazy" onError={(event) => { event.currentTarget.hidden = true; }} />}
+        {cover && <VideoThumbnail media={cover} />}
         <span className="tag mcard-badge">文件夹</span>
       </div>
       <h3 className="mcard-title">{folder.title}</h3>
@@ -1181,39 +1275,64 @@ function FolderCard({ folder, cover, onOpen }: { folder: CatalogFolder; cover: M
   );
 }
 
-function MediaCard({ media, onPlay }: { media: Media; onPlay: () => void }) {
+const visibleThumbnailQueue = new VisibleResourceQueue(2);
+function VideoThumbnail({ media }: { media: Media }) {
+  const anchor = useRef<HTMLSpanElement>(null);
+  const [visible, setVisible] = useState(false), [retry, setRetry] = useState(0);
+  const [url, setUrl] = useState(media.thumbnailUrl || media.thumbnail?.url || "");
+  const [failed, setFailed] = useState(false);
+  useEffect(() => { setUrl(media.thumbnailUrl || media.thumbnail?.url || ""); setFailed(false); }, [media.id, media.sourceVersion, media.thumbnailUrl, media.thumbnail?.url]);
+  useEffect(() => {
+    if (!anchor.current) return;
+    const observer = new IntersectionObserver(entries => setVisible(entries.some(entry => entry.isIntersecting)), { rootMargin: "100px" });
+    observer.observe(anchor.current); return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    if (!visible || url || failed || media.demo) return;
+    const controller = new AbortController();
+    void visibleThumbnailQueue.request(() => api<{ media: Media }>(`/api/video/media/${encodeURIComponent(media.id)}/prepare`, { method: "POST", body: JSON.stringify({ resources: ["thumbnail"] }), signal: controller.signal }), controller.signal)
+      .then(result => { if (!controller.signal.aborted) { const prepared = result.media.thumbnailUrl || result.media.thumbnail?.url; if (prepared) setUrl(prepared); else setFailed(true); } })
+      .catch(error => { if (!controller.signal.aborted && (error as Error).name !== "AbortError") setFailed(true); });
+    return () => controller.abort();
+  }, [media.id, media.sourceVersion, media.demo, visible, url, failed, retry]);
+  return <span ref={anchor} className="mcard-thumbnail">{url && <img className="mcard-img" src={url} alt="" loading="lazy" onError={() => { setUrl(""); setFailed(true); }} />}{failed && <button type="button" className="mcard-thumbnail-retry" aria-label={`重试 ${media.fileName} 的封面`} onClick={() => { setFailed(false); setRetry(value => value + 1); }}>重试封面</button>}</span>;
+}
+
+function MediaCard({ media, onPlay, selected, onToggle }: { media: Media; onPlay: () => void; selected?: boolean; onToggle?: () => void }) {
   const displayName = mediaDisplayName(media);
   const quickSelectionName = mediaQuickSelectionName(media);
   const quickSelection = media.display?.quickSelection || null;
   return (
     <article className="mcard" style={{ "--poster-hue": media.posterHue } as React.CSSProperties} title={quickSelection ? media.fileName : undefined}>
       <button type="button" className="mcard-hit" onClick={onPlay} aria-label={quickSelection ? `播放 ${quickSelectionName}，原文件 ${media.fileName}` : `播放 ${displayName}`} />
+      <div className="mcard-transfer-actions">{onToggle && <input type="checkbox" aria-label={`选择下载 ${media.fileName}`} checked={!!selected} onChange={onToggle} />}<a className="icon-btn" href={media.downloadUrl || `/api/media/${encodeURIComponent(media.id)}/download`} download aria-label={`下载原件 ${media.fileName}`}><Download size={15} /></a></div>
       <div className="mcard-poster">
-        {media.thumbnailUrl && <img className="mcard-img" src={media.thumbnailUrl} alt="" loading="lazy" onError={(event) => { event.currentTarget.hidden = true; }} />}
+        <VideoThumbnail media={media} />
         {quickSelection && <span className="mcard-episode-number" aria-hidden="true">{quickSelection.number}</span>}
         <span className="tag mcard-badge">{media.extension}</span>
         {media.hdr && <span className="tag mcard-hdr">{media.hdr}</span>}
-        <span className="mcard-res">{media.height ? `${media.height}P` : "原画"}</span>
+        <span className="mcard-res">{media.height ? `${media.height}P` : "待探测"}</span>
       </div>
       <h3 className={`mcard-title${quickSelection ? " mcard-title--quick" : ""}`}>{quickSelectionName}</h3>
-      <p className="mcard-meta">{codecName(media.videoCodec)} · {media.bitDepth || 8}-bit · {formatDuration(media.durationSeconds)}{media.subtitles.length ? ` · ${media.subtitles.length} 字幕` : ""}</p>
+      <p className="mcard-meta">{media.videoCodec ? `${codecName(media.videoCodec)}${media.bitDepth ? ` · ${media.bitDepth}-bit` : ""} · ${formatDuration(media.durationSeconds)}` : "已加入列表 · 播放时读取媒体信息"}{media.subtitles.length ? ` · ${media.subtitles.length} 字幕` : ""}</p>
     </article>
   );
 }
 
 function ScanProgress({ scan, compact = false }: { scan: CatalogScanStatus; compact?: boolean }) {
+  const [cancelling, setCancelling] = useState(false), [cancelError, setCancelError] = useState("");
   const numericProgress = typeof scan.progressPercent === "number" && Number.isFinite(scan.progressPercent)
     ? Math.max(0, Math.min(100, Math.round(scan.progressPercent)))
     : null;
-  const totalFiles = Math.max(scan.totalFiles, scan.discoveredFiles);
-  const countLabel = scan.phase === "discovering"
-    ? `${scan.discoveredFiles} 个文件 · ${scan.processedLibraries}/${scan.totalLibraries} 个目录`
-    : totalFiles > 0
-      ? `${Math.min(scan.processedFiles, totalFiles)}/${totalFiles} 个文件`
-      : "正在统计文件";
-  const parallelLabel = scan.maxParallelFiles > 0
-    ? `最多 ${scan.maxParallelFiles} 路文件并行${(scan.maxParallelMediaTools || 0) > 0 ? ` · ${scan.maxParallelMediaTools} 路媒体进程` : ""}`
-    : "正在分配处理资源";
+  const countLabel = `已发现 ${scan.discoveredFiles ?? 0} 个，已加入列表 ${scan.indexedFiles ?? scan.processedFiles ?? 0} 个${scan.failedFiles ? ` · ${scan.failedFiles} 个未完成` : ""}`;
+  const scheduleLabel = !scan.enabled ? "自动扫描已暂停（全部媒体）" : scan.nextAutoScanAt
+    ? `下次自动扫描不早于 ${new Date(scan.nextAutoScanAt).toLocaleTimeString()}` : "自动扫描已启用";
+  const cancel = async () => {
+    setCancelling(true); setCancelError("");
+    try { await cancelVideoScan(scan); }
+    catch (error) { setCancelError(error instanceof Error ? error.message : "取消请求失败，可重试"); }
+    finally { setCancelling(false); }
+  };
   return (
     <div className={`scan-progress${compact ? " is-compact" : ""}`}>
       <div className="scan-progress-heading"><span>{scanPhaseLabel(scan)}</span><b>{numericProgress === null ? "…" : `${numericProgress}%`}</b></div>
@@ -1226,7 +1345,9 @@ function ScanProgress({ scan, compact = false }: { scan: CatalogScanStatus; comp
         aria-valuenow={numericProgress ?? undefined}
         aria-valuetext={`${scanPhaseLabel(scan)}，${countLabel}`}
       ><span style={numericProgress === null ? undefined : { width: `${numericProgress}%` }} /></div>
-      <div className="scan-progress-meta"><span>{countLabel}</span><span>{parallelLabel}</span></div>
+      <div className="scan-progress-meta"><span>{countLabel}</span><span>{scheduleLabel}</span></div>
+      <div className="scan-progress-meta"><span>{scanIsActive(scan) ? "基础条目陆续加入列表；播放时准备媒体与字幕。" : "封面与播放资源按需要单独准备。"}</span>{scanIsActive(scan) && scan.canCancel !== false && <button type="button" className="btn btn--sm" disabled={cancelling || scan.phase === "cancelling"} onClick={() => void cancel()}>{cancelling || scan.phase === "cancelling" ? "正在取消…" : "取消本轮"}</button>}</div>
+      {(cancelError || scan.lastError) && <p className="scan-progress-error" role="status">{cancelError || scan.lastError}</p>}
     </div>
   );
 }
@@ -1248,13 +1369,13 @@ function RapidScanDialog({ state, scan, starting, startError, onStart, onClose }
     scan.pendingMode === "turbo"
     || (scan.mode === "turbo" && (scan.id !== progressState.priorScanId || progressState.priorScanMode !== "turbo"))
   ));
-  const terminal = Boolean(observedTurboScan && scan && !scanIsActive(scan) && (scan.phase === "completed" || scan.phase === "cancelled" || scan.phase === "failed"));
+  const terminal = Boolean(observedTurboScan && scan && !scanIsActive(scan) && ["completed", "indexed", "partial", "cancelled", "failed"].includes(scan.phase));
   const canRunInBackground = state.view === "progress" && !startError && !terminal;
   const dialogTitle = state.view === "prompt"
     ? "为新目录开启急速扫描？"
     : startError
       ? "急速扫描启动失败"
-      : terminal && scan?.phase === "completed"
+      : terminal && ["completed", "indexed"].includes(scan?.phase || "")
         ? "急速扫描已完成"
         : terminal && scan?.phase === "cancelled"
           ? "急速扫描已停止"
@@ -1274,7 +1395,7 @@ function RapidScanDialog({ state, scan, starting, startError, onStart, onClose }
             <>
               <p>已添加视频目录“{state.library.name}”。是否立即开启“急速扫描模式”？</p>
               <div className="rapid-path">{state.library.path}</div>
-              <div className="banner banner--warning"><AlertTriangle size={14} /><span>最高性能模式仅对本次任务生效，会按本机处理器数量大幅提高文件检查和媒体分析并发，尽可能拉满 CPU 与磁盘吞吐。</span></div>
+              <p>优先建立基础目录；封面在可见时准备，字幕和字体在播放选中时准备。磁盘处理始终遵守设备预算。</p>
             </>
           ) : (
             <>
@@ -1283,7 +1404,7 @@ function RapidScanDialog({ state, scan, starting, startError, onStart, onClose }
               ) : (
                 <>
                   <ScanProgress scan={scan} />
-                  <p>本次任务最多并行检查 {Math.max(1, scan.maxParallelFiles)} 个文件，并同时运行 {Math.max(1, scan.maxParallelMediaTools || 1)} 个媒体分析进程。扫描期间风扇转速、CPU 或磁盘活动显著增加属于正常现象。</p>
+                  <p>新视频加入列表后即可打开。首次播放会按需读取媒体信息，字幕另行准备，不阻塞音视频开始。</p>
                   {scan.phase === "failed" && scan.lastError && <div className="banner banner--error"><AlertTriangle size={14} /><span>{scan.lastError}</span></div>}
                 </>
               )}
@@ -1295,7 +1416,7 @@ function RapidScanDialog({ state, scan, starting, startError, onStart, onClose }
           {state.view === "prompt" ? (
             <>
               <button type="button" className="btn" onClick={onClose}>稍后处理</button>
-              <button type="button" className="btn btn--primary" onClick={onStart}><Gauge size={15} />开启最高性能扫描</button>
+              <button type="button" className="btn btn--primary" onClick={onStart}><Gauge size={15} />开始快速索引</button>
             </>
           ) : (
             <button type="button" className={canRunInBackground ? "btn" : "btn btn--primary"} onClick={onClose}>{canRunInBackground ? "转至后台运行" : "关闭"}</button>
@@ -1371,9 +1492,8 @@ function AdminApp(props: {
     onError("");
     onNotice("");
     try {
-      await api<{ scan?: CatalogScanStatus }>("/api/scan/start?mode=turbo", { method: "POST" });
-      await onRefresh(true);
-      onNotice("最高性能急速扫描已启动；本次任务会临时拉满文件检查和媒体分析并发，完成后自动恢复。");
+      await startVideoScan("turbo");
+      onNotice("快速索引扫描已受理；新视频会陆续加入列表，媒体资源遵守设备并发预算。");
     } catch (operationError) {
       const message = operationError instanceof Error ? operationError.message : "无法启动急速扫描";
       setTurboStartError(message);
@@ -1390,12 +1510,10 @@ function AdminApp(props: {
     onError("");
     onNotice("");
     try {
-      const result = await api<{ stopped: boolean; scan: CatalogScanStatus }>("/api/scan/stop", { method: "POST" });
+      if (overview?.scan) await cancelVideoScan(overview.scan);
       setRapidScanDialog(null);
       await onRefresh(true);
-      onNotice(result.stopped
-        ? "本次最高性能扫描已停止；已完成的媒体信息已保留，自动扫描设置保持不变。"
-        : "当前没有正在运行或排队的最高性能扫描。");
+      onNotice("取消请求已受理，正在停止本轮扫描；已加入列表的视频会保留。");
     } catch (operationError) {
       onError(operationError instanceof Error ? operationError.message : "无法停止最高性能扫描");
     } finally {
@@ -1415,7 +1533,7 @@ function AdminApp(props: {
         <a className="admin-status" href="/" target="_blank" rel="noopener noreferrer" aria-label="打开观看端（端口 8096）" title="在新标签页打开观看端"><span className={error ? "status-dot status-dot--warning" : "status-dot"} /><div><strong>{error ? "服务异常" : "服务在线"}</strong><span>端口 8096 · 打开观看端</span></div></a>
       </aside>
       <main className="admin-main">
-        <header className="admin-topbar"><h1>{sectionTitle}</h1><TitleLanguageToggle /><ThemeToggle theme={theme} onToggle={onToggleTheme} /></header>
+        <header className={`admin-topbar${section === "overview" ? " admin-topbar--overview" : ""}`}><h1>{sectionTitle}</h1><div className="adm-actions"><TitleLanguageToggle /><ThemeToggle theme={theme} onToggle={onToggleTheme} /></div></header>
         {error && <StatusBanner tone="warning" icon={<AlertTriangle size={14} />}>{error}</StatusBanner>}
         <TimedStatusBanner notice={notice ? { text: notice, tone: "success" } : null} onDismiss={dismissNotice} />
         {section === "overview" && <OverviewPanel overview={overview} musicOverview={musicOverview} readingOverview={readingOverview} photoOverview={photoOverview} onRefresh={onRefresh} onNotice={onNotice} onLibraryAdded={promptForTurboScan} onPlay={onPlay} />}
@@ -1493,9 +1611,8 @@ function OverviewPanel({ overview, musicOverview, readingOverview, photoOverview
     setBusy(true);
     onNotice("正在扫描目录。视频较多时需要等待片刻…");
     try {
-      const result = await api<{ count: number }>("/api/scan", { method: "POST" });
-      onNotice(`扫描完成，共发现 ${result.count} 个视频。`);
-      await onRefresh();
+      await startVideoScan();
+      onNotice("扫描已受理，新发现的视频会陆续加入列表。");
     } catch (operationError) {
       onNotice(operationError instanceof Error ? operationError.message : "扫描失败");
     } finally { setBusy(false); }
@@ -1508,8 +1625,8 @@ function OverviewPanel({ overview, musicOverview, readingOverview, photoOverview
     try {
       await api("/api/settings/auto-scan", { method: "PATCH", body: JSON.stringify({ enabled }) });
       onNotice(enabled
-        ? `已开启自动扫描，每 ${overview.settings.autoScanIntervalSeconds} 秒检查一次媒体目录。`
-        : "已关闭自动扫描；仍可在管理端手动重新扫描。");
+        ? `已恢复全部媒体的自动扫描；每轮结束后至少间隔 ${overview.settings.autoScanIntervalSeconds} 秒。`
+        : "已暂停全部媒体的自动扫描；当前任务继续运行，可另行取消本轮。");
       await onRefresh(true);
     } catch (operationError) {
       onNotice(operationError instanceof Error ? operationError.message : "无法修改自动扫描状态");
@@ -1543,11 +1660,11 @@ function OverviewPanel({ overview, musicOverview, readingOverview, photoOverview
         <div className="adm-section-head">
           <div><h2>视频目录</h2><p>使用 Windows 选择窗口添加文件夹，程序只读取文件，不会移动原视频；自动扫描统一在管理端控制。</p></div>
           <div className="adm-actions">
-            <button type="button" className="btn btn--sm" onClick={toggleAutoScan} disabled={busy || !overview} aria-pressed={Boolean(overview?.settings.autoScanEnabled)}><RefreshCw size={14} className={scanActive ? "spin" : ""} />{overview?.settings.autoScanEnabled ? `自动扫描 ${overview.settings.autoScanIntervalSeconds}s` : "自动扫描已关闭"}</button>
+            <button type="button" className="btn btn--sm" onClick={toggleAutoScan} disabled={busy || !overview} aria-pressed={Boolean(overview?.settings.autoScanEnabled)}><RefreshCw size={14} className={scanActive ? "spin" : ""} />{overview?.settings.autoScanEnabled ? "暂停全部自动扫描" : "恢复全部自动扫描"}</button>
             <button type="button" className="btn btn--sm" onClick={scan} disabled={busy || scanActive || !overview?.libraries.length}><RefreshCw size={14} className={busy || scanActive ? "spin" : ""} />重新扫描</button>
           </div>
         </div>
-        {overview?.scan && scanIsActive(overview.scan) && <ScanProgress scan={overview.scan} compact />}
+        {overview?.scan && overview.scan.phase !== "idle" && <ScanProgress scan={overview.scan} compact />}
         <div className="adm-add">
           <button type="button" className="btn" onClick={chooseFolder} disabled={busy}><FolderSearch size={15} />选择并添加文件夹</button>
           <input className="input" aria-label="视频目录路径" value={folderPath} onChange={(event) => setFolderPath(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !busy && folderPath.trim()) { event.preventDefault(); void addLibrary(); } }} placeholder="也可以手动输入路径，按 Enter 添加" />
@@ -1569,8 +1686,9 @@ function OverviewPanel({ overview, musicOverview, readingOverview, photoOverview
       <ReadingAdminPanel overview={readingOverview} onRefresh={onRefresh} onNotice={onNotice} />
 
       <PhotoAdminPanel overview={photoOverview} onRefresh={onRefresh} onNotice={onNotice} />
+      <FilesAdminPanel onNotice={onNotice} />
 
-      <DisplayFoldersPanel folders={(overview?.displayFolders || []).filter((folder) => folder.kind !== "music" && folder.kind !== "reading" && folder.kind !== "photo")} onRefresh={onRefresh} onNotice={onNotice} />
+      <DisplayFoldersPanel folders={(overview?.displayFolders || []).filter((folder) => folder.kind !== "music" && folder.kind !== "reading" && folder.kind !== "photo" && folder.kind !== "files")} onRefresh={onRefresh} onNotice={onNotice} />
 
       <section className="adm-section">
         <div className="adm-section-head">
@@ -1786,6 +1904,7 @@ function AccessControlPanel({ overview, onRefresh, onNotice }: {
   const categories = accessControl?.categories || [];
   const [accessCode, setAccessCode] = useState(generateAccessCode);
   const [categoryIds, setCategoryIds] = useState<string[]>([]);
+  const [canUpload, setCanUpload] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const toggleCategory = (categoryId: string) => {
@@ -1797,9 +1916,10 @@ function AccessControlPanel({ overview, onRefresh, onNotice }: {
     if (!categoryIds.length) return onNotice("请至少选择一个允许该访问码查看的文件夹分类。");
     setBusy(true);
     try {
-      await api<AccessUser>("/api/access-control/users", { method: "POST", body: JSON.stringify({ accessCode, categoryIds }) });
+      await api<AccessUser>("/api/access-control/users", { method: "POST", body: JSON.stringify({ accessCode, categoryIds, canUpload }) });
       onNotice(`访问码 ${accessCode} 已关联一个用户。请复制后通过可信方式交给对方；服务端不会保存明文。`);
       setCategoryIds([]);
+      setCanUpload(false);
       await onRefresh(true);
     } catch (operationError) {
       onNotice(operationError instanceof Error ? operationError.message : "无法创建访问用户");
@@ -1810,7 +1930,7 @@ function AccessControlPanel({ overview, onRefresh, onNotice }: {
     <div className="adm-content">
       <section className="adm-section">
         <div className="adm-section-head">
-          <div><h2>分类访问控制</h2><p>未归类的视频、音乐、阅读或图片文件夹会自动进入“未分类”，可与“全年龄”“R-18”等分类一样授权给六位访问码用户。关闭功能请前往“运行设置”。</p></div>
+          <div><h2>分类访问控制</h2><p>未归类的视频、音乐、阅读、图片或其他文件夹会自动进入“未分类”，可与“全年龄”“R-18”等分类一样授权给六位访问码用户。关闭功能请前往“运行设置”。</p></div>
           <div className="adm-stats">
             <span><strong>{accessControl?.users.filter((user) => user.enabled).length || 0}</strong> 位已启用用户</span>
             <span><strong>{categories.length}</strong> 个文件夹分类</span>
@@ -1828,6 +1948,7 @@ function AccessControlPanel({ overview, onRefresh, onNotice }: {
           <div className="field"><span>允许访问的分类</span><div className="chip-checks">
             {categories.map((category) => <label key={category.id} className={`chip-check${categoryIds.includes(category.id) ? " is-selected" : ""}`}><input type="checkbox" checked={categoryIds.includes(category.id)} onChange={() => toggleCategory(category.id)} /><strong>{category.name}</strong><small>{category.system ? `自动归类 · ${category.folderIds.length} 个文件夹` : `${category.folderIds.length} 个文件夹`}</small></label>)}
           </div></div>
+          <label className="transfer-check"><input type="checkbox" checked={canUpload} onChange={event => setCanUpload(event.target.checked)} />允许向已授权目录上传和新建文件夹</label>
           <div><button type="button" className="btn btn--primary" onClick={createUser} disabled={busy || !/^\d{6}$/.test(accessCode) || !categoryIds.length}><UserRoundPlus size={15} />关联为新用户</button></div>
         </div>
       </section>
@@ -1898,8 +2019,8 @@ function FolderCategoriesPanel({ folders, categories, onRefresh, onNotice }: {
       </div>
       <div className="adm-rows folder-classification-list">
         {folders.length ? folders.map((folder) => {
-          const typeLabel = folder.kind === "music" ? "音乐" : folder.kind === "reading" ? "阅读" : folder.kind === "photo" ? "图片" : "视频";
-          const countLabel = folder.kind === "music" ? `${folder.mediaCount} 首歌曲` : folder.kind === "reading" ? `${folder.ebookCount || 0} 本书 · ${folder.spreadsheetCount || 0} 个表格` : folder.kind === "photo" ? `${folder.mediaCount} 张图片` : `${folder.mediaCount} 个视频`;
+          const typeLabel = folder.kind === "music" ? "音乐" : folder.kind === "reading" ? "阅读" : folder.kind === "photo" ? "图片" : folder.kind === "files" ? "其他文件" : "视频";
+          const countLabel = folder.kind === "music" ? `${folder.mediaCount} 首歌曲` : folder.kind === "reading" ? `${folder.ebookCount || 0} 本书 · ${folder.spreadsheetCount || 0} 个表格` : folder.kind === "photo" ? `${folder.mediaCount} 张图片` : folder.kind === "files" ? `${folder.mediaCount} 个文件` : `${folder.mediaCount} 个视频`;
           return <div className="adm-row" key={folder.id}><div className="adm-row-main"><strong>{folder.title}</strong><span>{folder.libraryName || folder.folderName} · {countLabel} · {typeLabel}</span></div><select className="select" value={categoryForFolder(folder.id)} onChange={(event) => void assignFolder(folder, event.target.value)} disabled={busy} aria-label={`${folder.title} 的分类`}><option value="">未分类</option>{editableCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></div>;
         }) : <div className="adm-rows-empty">请先在“总览”添加媒体目录并完成扫描。</div>}
       </div>
@@ -2003,6 +2124,7 @@ function AccessUserCard({ user, userNumber, categories, onRefresh, onNotice }: {
         {categories.map((category) => <label key={category.id} className={`chip-check${categoryIds.includes(category.id) ? " is-selected" : ""}`}><input type="checkbox" checked={categoryIds.includes(category.id)} onChange={() => toggleCategory(category.id)} disabled={busy} /><strong>{category.name}</strong><small>{category.system ? `自动归类 · ${category.folderIds.length} 个文件夹` : `${category.folderIds.length} 个文件夹`}</small></label>)}
       </div>
       <div className="user-foot">
+        <label className="transfer-check"><input type="checkbox" checked={!!user.canUpload} disabled={busy} onChange={event => void updateUser({ canUpload: event.target.checked }, event.target.checked ? "已授予上传权限" : "已撤销上传权限，正在上传的任务将暂停")} />允许上传</label>
         <button type="button" className="btn btn--sm" disabled={busy || !permissionsChanged || !categoryIds.length} onClick={() => void updateUser({ categoryIds }, `访问码用户 ${userNumber} 的分类权限已保存并立即生效。`)}><Check size={13} />保存分类权限</button>
         <button type="button" className="btn btn--sm" disabled={busy} onClick={() => void resetAccessCode()}><KeyRound size={13} />重置六位访问码</button>
         {newAccessCode && <span className="access-code"><span>新访问码</span><code>{newAccessCode}</code><button type="button" className="icon-btn" onClick={() => void copyAccessCode(newAccessCode, onNotice)} title="复制新访问码"><Copy size={13} /></button></span>}
@@ -2219,8 +2341,8 @@ function SettingsPanel({ overview, onRefresh, onNotice, onError, onOpenAccess, o
           <div className="setting-control"><button type="button" className={acceleration?.enabled ? "btn btn--sm" : "btn btn--primary btn--sm"} onClick={toggleRemuxAcceleration} disabled={!overview || accelerationBusy || (!overview.tools.available && !acceleration?.enabled)} aria-pressed={Boolean(acceleration?.enabled)} aria-busy={accelerationBusy}>{accelerationBusy ? <LoaderCircle size={14} className="spin" /> : <Gauge size={14} />}{accelerationBusy ? (acceleration?.enabled ? "正在关闭加速" : "正在开启加速") : acceleration?.enabled ? "立即关闭加速" : "开启 12 小时加速"}</button></div>
         </div>
         <div className="setting-row">
-          <div className="setting-label"><strong>最高性能扫描{turboScanActive ? "（进行中）" : ""}</strong><span>按本机处理器数量大幅提高文件检查和媒体分析并发，适合添加大型目录后使用；仅对本次任务生效。</span>{scanStatus && turboScanActive && <ScanProgress scan={scanStatus} compact />}</div>
-          <div className="setting-control"><button type="button" className={turboScanActive ? "btn btn--danger btn--sm" : "btn btn--sm"} onClick={turboScanActive ? onStopTurboScan : onStartTurboScan} disabled={!overview?.libraries.length || turboActionBusy} aria-busy={turboActionBusy} aria-pressed={turboScanActive}>{turboActionBusy ? <LoaderCircle size={14} className="spin" /> : turboScanActive ? <X size={14} /> : <FolderSearch size={14} />}{turboActionBusy ? (turboScanActive ? "正在停止" : "正在启动") : turboScanActive ? "停止最高性能扫描" : "开启最高性能扫描"}</button></div>
+          <div className="setting-label"><strong>快速索引扫描{turboScanActive ? "（进行中）" : ""}</strong><span>快速更新可浏览的视频目录；播放、字幕与封面分别按需准备，遵守设备并发预算。</span>{scanStatus && turboScanActive && <ScanProgress scan={scanStatus} compact />}</div>
+          <div className="setting-control"><button type="button" className={turboScanActive ? "btn btn--danger btn--sm" : "btn btn--sm"} onClick={turboScanActive ? onStopTurboScan : onStartTurboScan} disabled={!overview?.libraries.length || turboActionBusy} aria-busy={turboActionBusy} aria-pressed={turboScanActive}>{turboActionBusy ? <LoaderCircle size={14} className="spin" /> : turboScanActive ? <X size={14} /> : <FolderSearch size={14} />}{turboActionBusy ? (turboScanActive ? "正在取消" : "正在启动") : turboScanActive ? "取消本轮" : "开始快速索引"}</button></div>
         </div>
       </section>
       <section className="adm-section">
@@ -2234,21 +2356,16 @@ function SettingsPanel({ overview, onRefresh, onNotice, onError, onOpenAccess, o
           <div className="setting-control"><button type="button" className={overview?.accessControl.enabled ? "btn btn--sm" : "btn btn--primary btn--sm"} onClick={toggleAccessControl}>{overview?.accessControl.enabled ? "关闭并返回简洁版" : "开启访问控制"}</button></div>
         </div>
       </section>
-            <section className="adm-section">
-        <div className="adm-section-head"><div><h2>视频播放缓存与会话</h2><p>兼容播放按需生成临时分片，容量与租约在这里统一限制；不影响原视频与音乐模块。</p></div></div>
-        <PlaybackSettingsCard settings={playbackSettings} status={playbackStatus} onSave={async (patch) => {
-          try { await onPlaybackSettings(patch); onNotice("播放设置已保存，新的播放会话立即生效。"); }
-          catch (operationError) { onError(operationError instanceof Error ? operationError.message : "无法保存播放设置"); }
-        }} />
-      </section>
+      <UploadSettingsCard onNotice={onNotice} />
+      <PlaybackSettingsCard settings={playbackSettings} status={playbackStatus} onSave={async (patch) => {
+        await onPlaybackSettings(patch);
+        onNotice("播放设置已保存，新的播放会话立即生效。");
+      }} />
+      <DanmakuSettingsCard settings={danmakuSettings} onSave={async (body) => {
+        try { await onDanmakuSettings(body); onNotice(body.clear ? "已清除本机弹弹play凭证。" : "弹幕凭证已保存到本机后端。"); }
+        catch (operationError) { onError(operationError instanceof Error ? operationError.message : "无法保存弹幕凭证"); throw operationError; }
+      }} />
       <section className="adm-section">
-        <div className="adm-section-head"><div><h2>弹弹play 凭证</h2><p>凭证只保存在本机后端文件，不进入前端包、观看端响应或发布包；没有凭证时仍可导入本地弹幕。</p></div></div>
-        <DanmakuSettingsCard settings={danmakuSettings} onSave={async (body) => {
-          try { await onDanmakuSettings(body); onNotice(body.clear ? "已清除本机弹弹play凭证。" : "弹幕凭证已保存到本机后端。"); }
-          catch (operationError) { onError(operationError instanceof Error ? operationError.message : "无法保存弹幕凭证"); }
-        }} />
-      </section>
-<section className="adm-section">
         <div className="adm-section-head"><div><h2>关于</h2><p>不是一个云玩家呢 · Codex —— 共同参与 LMD 的设计、开发与维护。</p></div></div>
       </section>
     </div>
@@ -2283,51 +2400,6 @@ function TimedStatusBanner({ notice, onDismiss }: { notice: { text: string; tone
 }
 
 /** Playback cache, buffer and lease limits; values mirror the server defaults. */
-function PlaybackSettingsCard({ settings, status, onSave }: { settings: PlaybackSettings | null; status: PlaybackStatus | null; onSave: (patch: Partial<PlaybackSettings>) => Promise<void> }) {
-  const [busy, setBusy] = useState(false);
-  const [form, setForm] = useState({ cacheGib: 10, ttlHours: 6, ahead: 30, back: 30, heartbeat: 10, lease: 45, initialLease: 20, noOutput: 30 });
-  useEffect(() => {
-    if (!settings) return;
-    setForm({ cacheGib: Math.round(settings.cacheMaxBytes / 1024 ** 3 * 10) / 10, ttlHours: Math.round(settings.cacheTtlSeconds / 360) / 10,
-      ahead: settings.aheadSeconds, back: settings.backBufferSeconds, heartbeat: settings.heartbeatSeconds,
-      lease: settings.leaseSeconds, initialLease: settings.initialLeaseSeconds, noOutput: settings.noOutputSeconds });
-  }, [settings]);
-  const number = (label: string, key: keyof typeof form, min: number, max: number, step: number) =>
-    <label>{label}<input type="number" min={min} max={max} step={step} value={form[key]}
-      onChange={(event) => setForm(current => ({ ...current, [key]: Number(event.target.value) }))} /></label>;
-  const submit = async () => {
-    setBusy(true);
-    try {
-      await onSave({ cacheMaxBytes: Math.round(form.cacheGib * 1024 ** 3), cacheTtlSeconds: Math.round(form.ttlHours * 3600),
-        aheadSeconds: form.ahead, backBufferSeconds: form.back, heartbeatSeconds: form.heartbeat,
-        leaseSeconds: form.lease, noOutputSeconds: form.noOutput });
-    } finally { setBusy(false); }
-  };
-  const usage = status ? `${formatBytes(status.cacheBytes)} / ${formatBytes(status.cacheMaxBytes)}` : "正在读取…";
-  return <section className="panel setting-card playback-settings-card">
-    <div className="setting-icon ready"><Gauge /></div>
-    <div>
-      <span className="eyebrow">PLAYBACK CORE</span>
-      <h2>视频播放缓存与会话</h2>
-      <p>兼容播放按需生成临时分片，容量与租约在这里统一限制；这些值不会写入原视频，也不影响音乐模块。当前占用 {usage}，活跃会话 {status?.sessions ?? 0} 个、处理进程 {status?.pipelines ?? 0} 个。</p>
-      <div className="setting-fields">
-        {number("缓存上限（GiB）", "cacheGib", 0.06, 1024, 0.5)}
-        {number("缓存保留（小时）", "ttlHours", 0.02, 168, 0.5)}
-        {number("前向准备窗口（秒）", "ahead", 6, 120, 1)}
-        {number("后向缓冲（秒）", "back", 0, 120, 1)}
-        {number("心跳间隔（秒）", "heartbeat", 3, 30, 1)}
-        {number("无心跳租约（秒）", "lease", 15, 180, 1)}
-        {number("首次心跳前回收（秒）", "initialLease", 10, 180, 1)}
-        {number("FFmpeg 无输出超时（秒）", "noOutput", 5, 120, 1)}
-      </div>
-      <div className="setting-card-actions">
-        <button className="primary-button" onClick={() => void submit()} disabled={busy || !settings}>{busy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}保存播放设置</button>
-      </div>
-      <small className="setting-hint">租约必须至少是心跳间隔的两倍；首次心跳前的回收窗口用于清理浏览器导航时来不及释放的会话。缓存上限过低会让播放提前等待生成。</small>
-    </div>
-  </section>;
-}
-
 /** Danmaku provider credentials. The secret never leaves the backend. */
 function DanmakuSettingsCard({ settings, onSave }: { settings: DanmakuSettings | null; onSave: (body: { appId?: string; appSecret?: string; clear?: boolean }) => Promise<void> }) {
   const [busy, setBusy] = useState(false);
@@ -2336,23 +2408,23 @@ function DanmakuSettingsCard({ settings, onSave }: { settings: DanmakuSettings |
   const submit = async (body: { appId?: string; appSecret?: string; clear?: boolean }) => {
     setBusy(true);
     try { await onSave(body); if (body.clear) { setAppId(""); setAppSecret(""); } else setAppSecret(""); }
+    catch { /* The parent displays the error; retain the draft so it can be retried. */ }
     finally { setBusy(false); }
   };
   const managed = settings?.environmentManaged;
-  return <section className={`panel setting-card danmaku-settings-card${settings?.configured ? " is-enabled" : ""}`}>
-    <div>
-      <span className="eyebrow">ONLINE DANMAKU</span>
-      <h2>弹弹play 凭证{settings?.configured ? "已配置" : "未配置"}</h2>
+  return <section className="adm-section danmaku-settings-card">
+    <div className="adm-section-head"><div>
+      <h2>弹弹play 凭证</h2>
       <p>{managed ? "凭证由服务器环境变量提供，网页端不会覆盖它。" : "AppId 与 AppSecret 只保存在本机后端文件里，不会进入前端包、观看端响应或发布包。没有凭证时仍可导入本地弹幕，视频播放不受影响。启用联网匹配前会提示会发送文件名、大小、时长和局部文件哈希（在服务器计算）。"}</p>
+    </div><span className="tag">{settings?.configured ? "已配置" : "未配置"}</span></div>
       <div className="setting-fields">
-        <label>AppId<input value={appId} onChange={(event) => setAppId(event.target.value)} placeholder="弹弹play 开放平台 AppId" disabled={managed || busy} /></label>
-        <label>AppSecret<input type="password" value={appSecret} onChange={(event) => setAppSecret(event.target.value)} placeholder={settings?.configured ? "已保存，留空表示不修改" : "弹弹play AppSecret"} disabled={managed || busy} /></label>
+        <label><span>AppId</span><input value={appId} onChange={(event) => setAppId(event.target.value)} placeholder="弹弹play 开放平台 AppId" disabled={managed || busy} /></label>
+        <label><span>AppSecret</span><input type="password" value={appSecret} onChange={(event) => setAppSecret(event.target.value)} placeholder={settings?.configured ? "已保存，留空表示不修改" : "弹弹play AppSecret"} disabled={managed || busy} /></label>
       </div>
       <div className="setting-card-actions">
-        <button className="primary-button" onClick={() => void submit({ appId, ...(appSecret ? { appSecret } : {}) })} disabled={managed || busy || !appId.trim()}>{busy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}保存凭证</button>
-        <button className="secondary-button" onClick={() => void submit({ appId, clear: true })} disabled={managed || busy || !settings?.configured}><X size={16} />清除凭证</button>
+        <button type="button" className="btn btn--primary btn--sm" onClick={() => void submit({ appId, ...(appSecret ? { appSecret } : {}) })} disabled={managed || busy || !settings || !appId.trim()}>{busy ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />}{busy ? "正在处理" : "保存凭证"}</button>
+        <button type="button" className="btn btn--sm" onClick={() => void submit({ appId, clear: true })} disabled={managed || busy || !settings?.configured}><X size={14} />清除凭证</button>
       </div>
-    </div>
   </section>;
 }
 

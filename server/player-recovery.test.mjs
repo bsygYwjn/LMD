@@ -6,7 +6,7 @@ import ts from 'typescript';
 const project = path.resolve(import.meta.dirname, '..');
 const temporary = await mkdtemp(path.join(project, '.player-recovery-'));
 const source = await readFile(path.join(project, 'src/player/core.ts'), 'utf8');
-await writeFile(path.join(temporary, 'core.mjs'), ts.transpileModule(source.replace(/"\.\/latest-task-queue(?:\.ts)?"/, '"../src/player/latest-task-queue.ts"'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText);
+await writeFile(path.join(temporary, 'core.mjs'), ts.transpileModule(source.replace(/"\.\/(latest-task-queue|subtitle-preparation)(?:\.ts)?"/g, '"../src/player/$1.ts"'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText);
 const oldFetch = globalThis.fetch;
 globalThis.window = new EventTarget();
 class Video extends EventTarget {
@@ -24,7 +24,7 @@ try {
   core = new PlaybackCore(new Video());
   let infos = 0, posts = 0;
   globalThis.fetch = async (url, options = {}) => {
-    if (url.endsWith('/info')) { infos++; await new Promise(resolve => setTimeout(resolve, 15)); return infos === 1 ? reply({ error: '无法分析这个媒体文件', code: 'PROBE_FAILED' }, 422) : reply(info); }
+    if (url.includes('/info')) { infos++; await new Promise(resolve => setTimeout(resolve, 15)); return infos === 1 ? reply({ error: '无法分析这个媒体文件', code: 'PROBE_FAILED' }, 422) : reply(info); }
     if (options.method === 'POST') { posts++; return reply(session, 201); }
     return reply({ ok: true });
   };
@@ -55,11 +55,12 @@ try {
   let requested = [];
   globalThis.fetch = async (url, options = {}) => {
     requested.push([url, options.method]);
-    if (url.endsWith('/info')) return reply({ error: '无法分析这个媒体文件', code: 'PROBE_FAILED' }, 422);
+    if (url.includes('/info')) return reply({ error: '无法分析这个媒体文件', code: 'PROBE_FAILED' }, 422);
     return reply({ ok: true });
   };
   await core.load('broken'); await core.retry();
-  assert.equal(requested.filter(([url]) => url === '/api/media/broken/info').length, 2);
+  assert.equal(requested.filter(([url]) => url.startsWith('/api/media/broken/info')).length, 2);
+  assert.ok(requested.some(([url]) => url === '/api/media/broken/info?retry=1'));
   assert.equal(requested.filter(([, method]) => method === 'POST').length, 0);
   assert.equal(core.getState().buffering, false);
   await core.destroy(); core = new PlaybackCore(new Video());

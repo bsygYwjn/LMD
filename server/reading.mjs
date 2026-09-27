@@ -38,7 +38,7 @@ async function mapWithConcurrency(items, limit, mapper, onSettled = null) {
   return results;
 }
 
-async function walkReadingFiles(rootDirectory, depth = 0, output = [], status = { complete: true, errors: [], truncated: false }) {
+async function walkReadingFiles(rootDirectory, depth = 0, output = [], status = { complete: true, errors: [], truncated: false }, shouldHidePath = () => false) {
   if (depth > MAX_DEPTH || output.length >= MAX_ITEMS) {
     status.complete = false;
     status.truncated = true;
@@ -55,7 +55,8 @@ async function walkReadingFiles(rootDirectory, depth = 0, output = [], status = 
   for (const entry of entries) {
     if (entry.name.startsWith(".")) continue;
     const fullPath = path.join(rootDirectory, entry.name);
-    if (entry.isDirectory()) await walkReadingFiles(fullPath, depth + 1, output, status);
+    if (shouldHidePath(fullPath)) continue;
+    if (entry.isDirectory()) await walkReadingFiles(fullPath, depth + 1, output, status, shouldHidePath);
     else if (entry.isFile() && READING_FORMATS.has(path.extname(entry.name).toLowerCase())) output.push(fullPath);
     if (output.length >= MAX_ITEMS) {
       status.complete = false;
@@ -78,6 +79,8 @@ export function createReadingService({
   requireViewerAccess,
   canAccessFolderId,
   pathIsSameOrDescendant,
+  shouldHidePath = () => false,
+  decorateFolders = (_context, _kind, nodes) => nodes,
 }) {
   appState.readingLibraries ||= [];
   appState.readingItems ||= [];
@@ -125,6 +128,7 @@ export function createReadingService({
   }
 
   function canAccessItem(context, item) {
+    if (shouldHidePath(item.path)) return false;
     if (context?.fullAccess) return true;
     return canAccessFolderId(context, accessFolderIdForItem(item));
   }
@@ -219,7 +223,7 @@ export function createReadingService({
       for (const library of libraries) {
         if (scanContext.cancelRequested) throw Object.assign(new Error("阅读库扫描已停止"), { code: "READING_SCAN_CANCELLED" });
         const status = { complete: true, errors: [], truncated: false };
-        const found = await walkReadingFiles(library.path, 0, [], status);
+        const found = await walkReadingFiles(library.path, 0, [], status, shouldHidePath);
         if (!status.complete) incompleteLibraries.push({ library, status });
         for (const filePath of found) {
           const identity = await realpath(filePath).catch(() => path.resolve(filePath));
@@ -410,7 +414,7 @@ export function createReadingService({
       const context = requireViewerAccess(request, response);
       if (!context) return true;
       const items = accessibleItems(context);
-      return sendJson(response, 200, { items: items.map((item) => publicItem(item)), folders: folderNodes(items).map(({ path: _path, ...folder }) => folder), scan: scanStatus() }), true;
+      return sendJson(response, 200, { items: items.map((item) => publicItem(item)), folders: decorateFolders(context, "reading", folderNodes(items)).map(({ path: _path, ...folder }) => folder), scan: scanStatus() }), true;
     }
     if (request.method === "POST" && pathname === "/api/reading/catalog/scan") {
       const context = requireViewerAccess(request, response);
@@ -487,6 +491,10 @@ export function createReadingService({
     isScanning: () => Boolean(activeScan),
     requestStopScan: () => { if (scanContext) scanContext.cancelRequested = true; },
     folderNodes,
+    folderId: readingFolderId,
+    libraryForItem,
+    canAccessItem,
+    accessFolderIdForPath: (libraryId, filePath) => accessFolderIdForItem({ libraryId, path: filePath }),
     displayFolderSummaries,
     accessFolderSummaries,
     accessFolderAliases,

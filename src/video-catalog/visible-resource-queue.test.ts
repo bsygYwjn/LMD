@@ -1,0 +1,14 @@
+import assert from "node:assert/strict";
+import { VisibleResourceQueue } from "./visible-resource-queue.ts";
+const queue = new VisibleResourceQueue(2), started: number[] = [], finished: Array<() => void> = [];
+const controls = Array.from({ length: 5 }, () => new AbortController());
+const tasks = controls.map((controller, index) => queue.request(() => { started.push(index); return new Promise<number>(resolve => finished.push(() => resolve(index))); }, controller.signal).catch(error => error.name));
+assert.deepEqual(started, [0, 1]);
+controls[2].abort();
+finished.shift()!(); await new Promise(resolve => setImmediate(resolve));
+assert.deepEqual(started, [0, 1, 3], "scrolling away removes queued work before it reads media");
+finished.shift()!(); await new Promise(resolve => setImmediate(resolve));
+assert.deepEqual(started, [0, 1, 3, 4]);
+finished.splice(0).forEach(finish => finish());
+assert.deepEqual(await Promise.all(tasks), [0, 1, "AbortError", 3, 4]);
+console.log("PASS: visible resource concurrency bound and queued cancellation");

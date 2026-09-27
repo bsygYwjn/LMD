@@ -35,7 +35,8 @@ try {
   const catalog = await scan.json(); assert.equal(catalog.count, 2, JSON.stringify(catalog));
   const damaged = catalog.media.find(item => item.fileName.includes('S01E09'));
   const healthy = catalog.media.find(item => item.fileName.includes('S01E01'));
-  assert.ok(damaged.probeError); assert.ok(!healthy.probeError);
+  assert.equal(damaged.metadata.state, 'unknown'); assert.equal(healthy.metadata.state, 'unknown');
+  assert.ok(!damaged.probeError && !healthy.probeError, '基础索引不为损坏或正常视频提前启动探测');
   const healthyInfo = await (await request(`/api/media/${healthy.id}/info`)).json();
   assert.ok(healthyInfo.duration > 0); assert.ok(healthyInfo.tracks.some(track => track.type === 'video'));
   const status = async () => (await (await request('/api/settings/video-playback')).json()).status;
@@ -48,11 +49,29 @@ try {
     }
   }
   assert.deepEqual(await status(), before);
+  const afterFailure = await (await request('/api/catalog')).json();
+  const failedEntry = afterFailure.media.find(item => item.id === damaged.id);
+  assert.equal(failedEntry.metadata.state, 'failed'); assert.equal(failedEntry.metadata.errorCode, 'PROBE_FAILED');
+  assert.equal(failedEntry.metadata.failedAttempts, 1, '重复详情/播放请求在源版本失败退避期间不重复探测');
   assert.equal((await request(`/api/media/${healthy.id}/info`)).status, 200);
   // Repair only this test's damaged fixture, then retry without restarting.
   await copyFile(good, bad);
   assert.equal((await request(`/api/media/${damaged.id}/info`)).status, 200);
+  const repaired = (await (await request('/api/catalog')).json()).media.find(item => item.id === damaged.id);
+  assert.equal(repaired.metadata.state, 'ready'); assert.equal(repaired.metadata.errorCode, undefined);
+  const prepareThumbnail = async () => {
+    const response = await request(`/api/video/media/${healthy.id}/prepare`, 'POST', { resources: ['metadata', 'thumbnail'] });
+    const payload = await response.json(); assert.equal(response.status, 200, JSON.stringify(payload));
+    const image = await request(payload.media.thumbnailUrl); assert.equal(image.status, 200);
+    return { version: payload.media.playbackMetadata.sourceSignature, bytes: Buffer.from(await image.arrayBuffer()) };
+  };
+  const firstThumbnail = await prepareThumbnail();
+  await run(path.join(project, 'tools/ffmpeg/bin/ffmpeg.exe'), ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=red:size=160x90:rate=24:duration=1', '-c:v', 'libx264', good]);
+  const replacementThumbnail = await prepareThumbnail();
+  assert.notEqual(replacementThumbnail.version, firstThumbnail.version);
+  assert.notDeepEqual(replacementThumbnail.bytes, firstThumbnail.bytes, '按需重探测源变化后不能复用旧源thumbnailPath');
   console.log('PASS: real scan keeps good and corrupt media, 422 PROBE_FAILED, repeated failure zero sessions/cache, repaired source recovers');
+  console.log('PASS: replaced source receives a new thumbnail after on-demand metadata refresh');
   await request('/api/service/stop', 'POST', {});
 } finally {
   if (server && server.exitCode === null) { server.kill(); await Promise.race([new Promise(resolve => server.once('close', resolve)), delay(5000)]); }

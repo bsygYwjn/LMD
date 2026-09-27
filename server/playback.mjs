@@ -3,6 +3,7 @@ import { mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promis
 import path from "node:path";
 import { METADATA_VERSION, normalizePlaybackSettings, planPlayback, playbackError } from "./playback-planner.mjs";
 import { readMp4Boxes, bufferMp4Box, parseInitialization, fragmentTiming, rewriteInitializationDuration } from "./playback-mp4.mjs";
+import { publicVideoResource, validateMediaSourcePath } from "./video-resources.mjs";
 
 const hash = value => createHash("sha256").update(value).digest("hex");
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -13,7 +14,7 @@ export const sourceSignature = media => `${Number(media.size)}:${media.modifiedA
 
 export function createPlaybackService(deps) {
   const { appState, cacheDirectory, getMediaTools, probeVideo, saveState, spawnTracked, runCommand,
-    authorizedMediaForRequest, accessContextForRequest, requireLocalManagement, readJson, sendJson, streamFile } = deps;  const root = path.join(cacheDirectory, "playback");
+    authorizedMediaForRequest, accessContextForRequest, requireLocalManagement, readJson, sendJson, streamFile, resources, scheduler } = deps;  const root = path.join(cacheDirectory, "playback");
   const sessions = new Map(), pipelines = new Map(), probes = new Map(), entries = new Map();
   let stopped = false, cacheBytes = 0, cleaning = null, encoderProbe = null;
   let settings = normalizePlaybackSettings(appState.settings.videoPlayback);
@@ -34,7 +35,9 @@ export function createPlaybackService(deps) {
     }
   })();
 
-  async function info(media) {
+  async function info(media, { signal, retry = false } = {}) {
+    signal?.throwIfAborted();
+    await validateMediaSourcePath(appState, media);
     const fileStat = await stat(media.path).catch(() => null);
     if (!fileStat?.isFile()) throw playbackError("SOURCE_MISSING", "原始视频不存在，可能已移动", 404);
     const signature = `${fileStat.size}:${fileStat.mtime.toISOString()}`;
@@ -43,31 +46,77 @@ export function createPlaybackService(deps) {
     // file replaced under a session) must be re-probed instead of trusting a
     // signature that was computed from older stat data.
     const recordSignature = media.size !== undefined ? `${Number(media.size)}:${media.modifiedAt}` : signature;
+    if (!retry && media.metadata?.state === 'failed' && media.metadata.sourceVersion === signature && media.metadata.retryAt > Date.now())
+      throw playbackError('PROBE_FAILED', '无法分析这个媒体文件，请检查文件是否损坏后重试', 422);
     if (media.playbackMetadata?.version === METADATA_VERSION && media.playbackMetadata.sourceSignature === signature
-      && media.playbackMetadata.sourceSignature === recordSignature) return media.playbackMetadata;
+      && media.playbackMetadata.sourceSignature === recordSignature && (!resources || media.resourceDescriptorVersion === 1)) return media.playbackMetadata;
     const key = `${media.id}:${signature}`;
-    if (!probes.has(key)) probes.set(key, (async () => {
+    let job = probes.get(key);
+    if (!job || job.controller.signal.aborted) {
+    job = { controller: new AbortController(), consumers: new Set(), promise: null }; probes.set(key, job);
+    job.promise = (async () => {
       if (!getMediaTools().available) throw playbackError("TOOLS_UNAVAILABLE", "FFmpeg 尚未就绪，请在服务器运行设置中安装", 503);
       let result;
-      try { result = await probeVideo(media.path); }
+      try { result = media.playbackMetadata?.version === METADATA_VERSION && media.playbackMetadata.sourceSignature === signature && signature === recordSignature
+        ? media : await probeVideo(media.path, undefined, { signal: job.controller.signal }); }
       catch (error) {
+        if (job.controller.signal.aborted || error.name === 'AbortError') throw error;
+        if (error.code === 'SOURCE_CHANGED') throw playbackError('SOURCE_CHANGED', '分析期间视频文件发生变化，请重试', 409);
         console.error(`[playback probe ${media.id}] ${error.message}`);
         throw playbackError("PROBE_FAILED", "无法分析这个媒体文件，请检查文件是否损坏后重试", 422);
       }
       if (!result.playbackMetadata?.tracks.some(track => track.type === "video" && !track.attachedPicture)) throw playbackError("PROBE_FAILED", "无法分析这个媒体文件", 422);
+      const after = await stat(media.path).catch(() => null);
+      await validateMediaSourcePath(appState, media);
+      if (!after?.isFile() || `${after.size}:${after.mtime.toISOString()}` !== signature) throw playbackError("SOURCE_CHANGED", "分析期间视频文件发生变化，请重试", 409);
       const metadata = { ...result.playbackMetadata, sourceSignature: signature };
+      const described = resources ? await resources.describe({ ...media, size: fileStat.size, modifiedAt: fileStat.mtime.toISOString() }, result) : {};
+      job.controller.signal.throwIfAborted();
+      await validateMediaSourcePath(appState, media);
+      const latestStat = await stat(media.path);
+      if (`${latestStat.size}:${latestStat.mtime.toISOString()}` !== signature) throw playbackError('SOURCE_CHANGED', '分析期间视频文件发生变化，请重试', 409);
       const current = appState.media.find(item => item.id === media.id);
+      if (!current) throw playbackError("SOURCE_CHANGED", "视频已从媒体库移除", 409);
       if (current) {
-        current.playbackMetadata = metadata;
+        if (current.path !== media.path || (current.size !== undefined && sourceSignature(current) !== recordSignature && sourceSignature(current) !== signature)) throw playbackError("SOURCE_CHANGED", "视频来源已变更，请重试", 409);
+        const fields = { ...result, ...described, playbackMetadata: metadata, probeError: null, size: fileStat.size, modifiedAt: fileStat.mtime.toISOString(), sourceVersion: signature,
+          metadata: { state: 'ready', version: METADATA_VERSION, updatedAt: new Date().toISOString() }, entryRevision: (current.entryRevision || 0) + 1,
+          ...(resources ? { resourceDescriptorVersion: 1 } : {}) };
+        // Never merge an old whole media record over labels edited during probe.
+        const keys = ['playbackMetadata', 'probeError', 'size', 'modifiedAt', 'sourceVersion', 'durationSeconds', 'container', 'width', 'height', 'videoCodec', 'videoProfile', 'audioCodec', 'pixelFormat', 'bitDepth', 'hdr', 'colorPrimaries', 'embeddedSubtitleStreams', 'embeddedFontStreams', 'subtitles', 'fonts', 'resourceDescriptorVersion', 'metadata', 'entryRevision'];
+        const previous = new Map(keys.filter(key => key in fields).map(key => [key, { existed: Object.hasOwn(current, key), value: current[key] }]));
+        for (const [key] of previous) current[key] = fields[key];
         // Keep the catalog identity aligned with the probed bytes so later
         // session requests agree with the stored signature.
-        current.size = fileStat.size; current.modifiedAt = fileStat.mtime.toISOString();
-        await saveState();
+        try { await saveState(); }
+        catch (failure) { for (const [key, old] of previous) { if (current[key] !== fields[key]) continue; if (old.existed) current[key] = old.value; else delete current[key]; } throw failure; }
       }
       media.playbackMetadata = metadata;
       return metadata;
-    })().finally(() => probes.delete(key)));
-    return probes.get(key);
+    })().catch(async error => {
+      if (error.code === 'PROBE_FAILED' && !job.controller.signal.aborted) {
+        const current = appState.media.find(item => item.id === media.id), latest = await stat(media.path).catch(() => null);
+        if (current && current.path === media.path && latest && `${latest.size}:${latest.mtime.toISOString()}` === signature) {
+          const previous = { metadata: current.metadata, probeError: current.probeError, entryRevision: current.entryRevision };
+          const attempts = previous.metadata?.sourceVersion === signature ? (previous.metadata.failedAttempts || 0) + 1 : 1;
+          const failed = { state: 'failed', version: METADATA_VERSION, sourceVersion: signature, errorCode: 'PROBE_FAILED',
+            failedAttempts: attempts, retryAt: Date.now() + Math.min(300_000, 5000 * 2 ** Math.min(attempts - 1, 6)), updatedAt: new Date().toISOString() };
+          current.metadata = failed; current.probeError = '无法分析这个媒体文件，请检查文件是否损坏后重试'; current.entryRevision = (current.entryRevision || 0) + 1;
+          try { await saveState(); }
+          catch { if (current.metadata === failed) Object.assign(current, previous); }
+        }
+      }
+      throw error;
+    }).finally(() => { if (probes.get(key) === job) probes.delete(key); });
+    }
+    const consumer = {}; job.consumers.add(consumer);
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const finish = (callback, value) => { if (done) return; done = true; signal?.removeEventListener('abort', abort); job.consumers.delete(consumer); callback(value); };
+      const abort = () => { finish(reject, signal.reason || playbackError('PROBE_CANCELLED', '媒体分析已取消', 409)); if (!job.consumers.size) job.controller.abort(); };
+      signal?.addEventListener('abort', abort, { once: true }); job.promise.then(value => finish(resolve, value), failure => finish(reject, failure));
+      if (signal?.aborted) abort();
+    });
   }
 
   async function clean(required = 0) {
@@ -182,7 +231,10 @@ export function createPlaybackService(deps) {
     let encoder = pipeline.plan.video.action === "COPY" ? "copy" : software ? "libx264" : await chooseEncoder();
     if (pipeline.cancelled) return;
     await mkdir(pipeline.directory, { recursive: true });
-    const child = spawnTracked(getMediaTools().ffmpeg, command(pipeline, encoder), { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const releaseDevice = scheduler?.reservePlayback(pipeline.media.path) || (() => {});
+    let child;
+    try { child = spawnTracked(getMediaTools().ffmpeg, command(pipeline, encoder), { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (error) { releaseDevice(); throw error; }
     pipeline.child = child; pipeline.encoder = encoder; metrics.pipelinesCreated++;
     let stderr = "", lines = "", firstInputTime = null, moof = null, initialization = [], tracks = null;
     let lastOutput = Date.now(), backpressured = false, processError = null;
@@ -264,6 +316,7 @@ export function createPlaybackService(deps) {
         console.error(`[playback ${pipeline.key.slice(0, 10)}] ${error.message}\n${stderr.slice(-2000)}`);
       }
     } finally {
+      releaseDevice();
       clearInterval(watchdog);
       if (pipeline.child === child) pipeline.child = null;
       metrics.pipelinesReleased++;
@@ -289,7 +342,45 @@ export function createPlaybackService(deps) {
   }
   function release(session) {
     if (!sessions.has(session.id)) return;
+    session.subtitleController?.abort(); session.releaseFonts?.(); session.releaseFonts = null;
     releasePipeline(session); sessions.delete(session.id); metrics.sessionsReleased++;
+  }
+
+  function selectSubtitle(session, body) {
+    if (body.subtitleTrackId === undefined) return;
+    const selectionGeneration = Number(body.subtitleSelectionGeneration);
+    if (!Number.isSafeInteger(selectionGeneration) || selectionGeneration < 1) throw playbackError("INVALID_SUBTITLE_GENERATION", "字幕选择代次无效", 400);
+    const trackId = body.subtitleTrackId === null || body.subtitleTrackId === 'off' ? null : String(body.subtitleTrackId);
+    const previous = session.subtitle;
+    if (selectionGeneration <= previous.selectionGeneration) {
+      if (selectionGeneration === previous.selectionGeneration && trackId === previous.trackId) return;
+      throw playbackError("STALE_SUBTITLE_SELECTION", "字幕选择已更新", 409);
+    }
+    if (trackId && !session.media.subtitles?.some(track => track.id === trackId)) throw playbackError("SUBTITLE_NOT_FOUND", "所选字幕不存在", 404);
+    if (trackId && !resources) throw playbackError("RESOURCE_UNAVAILABLE", "字幕准备服务尚未就绪", 503);
+    session.subtitleController?.abort(); session.releaseFonts?.(); session.releaseFonts = null;
+    const controller = new AbortController(); session.subtitleController = controller;
+    const sourceVersion = session.metadata.sourceSignature;
+    const selection = { selectionGeneration, sourceVersion, trackId, state: trackId ? 'queued' : 'off', subtitle: null, fonts: [], error: null };
+    session.subtitle = selection;
+    if (!trackId) return;
+    const valid = () => !stopped && !controller.signal.aborted && sessions.get(session.id) === session && session.subtitle === selection
+      && sourceSignature(session.media) === sourceVersion;
+    // This promise is deliberately independent of attach/waitForReady. Captured
+    // source/session/selection tokens gate both descriptor adoption and pins.
+    session.subtitlePromise = resources.ensureSubtitle(session.media, trackId, {
+      signal: controller.signal, retry: Boolean(body.subtitleRetry), onState: state => { if (valid()) selection.state = state; },
+    }).then(async prepared => {
+      if (!valid()) return;
+      const releaseFonts = await resources.pinFonts(session.media, prepared.fonts);
+      if (!valid()) { releaseFonts(); return; }
+      session.releaseFonts = releaseFonts;
+      Object.assign(selection, prepared, { state: 'ready' });
+    }).catch(error => {
+      if (!valid()) return;
+      selection.state = error.name === 'AbortError' ? 'cancelled' : 'failed';
+      selection.error = { code: error.code || 'SUBTITLE_PREPARATION_FAILED', message: error.status ? error.message : '字幕准备失败，请重试' };
+    });
   }
 
   async function attach(session, target) {
@@ -312,7 +403,9 @@ export function createPlaybackService(deps) {
 
   function descriptor(session) {
     const pipeline = session.pipeline;
-    return { sessionId: session.id, generation: session.generation, mediaId: session.media.id,
+    return { sessionId: session.id, generation: session.generation, mediaId: session.media.id, sourceVersion: session.metadata.sourceSignature,
+      subtitle: session.subtitle, subtitleTracks: (session.media.subtitles || []).map(item => publicVideoResource(session.media, item)),
+      fontTracks: (session.media.fonts || []).map(item => publicVideoResource(session.media, item, 'fonts')),
       strategy: session.plan.strategy, plan: session.plan, transport: session.plan.transport, duration: session.metadata.duration,
       requestedTime: session.position, timeOffset: pipeline?.timeOffset ?? 0,
       sourceStart: pipeline?.fragments[0]?.sourceStart ?? session.position,
@@ -386,14 +479,20 @@ export function createPlaybackService(deps) {
       if (mediaRoute) {
         const media = authorizedMediaForRequest(request, response, mediaRoute[1]); if (!media) return true;
         allow(mediaRoute[2] === "info" ? ["GET", "HEAD"] : ["POST"]);
-        const metadata = await info(media);
-        if (mediaRoute[2] === "info") { sendJson(response, 200, { mediaId: media.id, ...metadata }); return true; }
+        const controller = new AbortController(), onAbort = () => controller.abort();
+        request.once('aborted', onAbort); response.once('close', onAbort);
+        let metadata;
+        try { metadata = await info(media, { signal: controller.signal, retry: url.searchParams.get('retry') === '1' }); }
+        finally { request.off('aborted', onAbort); response.off('close', onAbort); }
+        if (!authorizedMediaForRequest(request, response, media.id)) return true;
+        if (mediaRoute[2] === "info") { sendJson(response, 200, { mediaId: media.id, ...metadata, sourceVersion: metadata.sourceSignature,
+          subtitles: (media.subtitles || []).map(item => publicVideoResource(media, item)), fonts: (media.fonts || []).map(item => publicVideoResource(media, item, 'fonts')) }); return true; }
         if (sessions.size >= (appState.settings.maxStreams || 10)) throw playbackError("STREAM_LIMIT", "同时播放的会话已达上限", 503);
         const body = await readJson(request), capabilities = body.capabilities || {};
         const plan = planPlayback(metadata, capabilities, body);
         const session = { id: randomUUID(), generation: 1, owner: ownerFor(request), media, metadata, capabilities, plan,
           position: Math.max(0, Math.min(finite(body.startTime), Math.max(0, metadata.duration - 0.05))), lastSeen: Date.now(), pipeline: null,
-          retirement: null, createdAt: Date.now() };
+          retirement: null, createdAt: Date.now(), subtitle: { selectionGeneration: 0, sourceVersion: metadata.sourceSignature, trackId: null, state: 'off', subtitle: null, fonts: [], error: null } };
         sessions.set(session.id, session); metrics.sessionsCreated++; if (plan.fallbackLevel) metrics.fallbacks++;
         // The client only adopts the session once it has read the response. Until
         // the body is actually flushed, an aborted request (the player unmounting
@@ -403,8 +502,12 @@ export function createPlaybackService(deps) {
         const abandon = () => { if (!handedOff && sessions.has(session.id)) release(session); };
         response.once("close", abandon);
         try {
+          selectSubtitle(session, body);
           if (plan.strategy !== "DIRECT") await attach(session, session.position);
           await waitForReady(session, 1);
+          if (!authorizedMediaForRequest(request, response, media.id)) { release(session); return true; }
+          await validateMediaSourcePath(appState, media);
+          if (sourceSignature(media) !== metadata.sourceSignature) throw playbackError('SOURCE_CHANGED', '视频来源已变化', 409);
           if (response.destroyed) { abandon(); return true; }
           handedOff = true;
           sendJson(response, 201, descriptor(session));
@@ -416,11 +519,16 @@ export function createPlaybackService(deps) {
       allow(route[2] ? ["GET", "HEAD"] : ["GET", "HEAD", "PATCH", "DELETE"]);
       const session = sessions.get(route[1]);
       if (!session) throw playbackError("SESSION_EXPIRED", "播放会话已过期", 410);
-      if (!authorizedMediaForRequest(request, response, session.media.id)) { release(session); return true; }
+      const authorizedMedia = authorizedMediaForRequest(request, response, session.media.id);
+      if (!authorizedMedia) { release(session); return true; }
       if (ownerFor(request) !== session.owner) throw playbackError("SESSION_OWNER", "不能访问其他设备的播放会话", 403);
+      session.media = authorizedMedia;
       // A replaced original file invalidates the session, its pipeline and the
       // client that owns it, so the player can restart from a clean state.
-      if (sourceSignature(session.media) !== session.metadata.sourceSignature) {
+      const currentFile = await stat(session.media.path).catch(() => null);
+      await validateMediaSourcePath(appState, session.media);
+      if (!authorizedMediaForRequest(request, response, session.media.id)) { release(session); return true; }
+      if (!currentFile?.isFile() || `${currentFile.size}:${currentFile.mtime.toISOString()}` !== session.metadata.sourceSignature || sourceSignature(session.media) !== session.metadata.sourceSignature) {
         release(session);
         throw playbackError("SOURCE_CHANGED", "视频文件已更新，请重新打开这个视频", 409);
       }
@@ -433,6 +541,7 @@ export function createPlaybackService(deps) {
           throw playbackError("STALE_SESSION", "播放请求已被替换", 409);
         if ((body.seekTime !== undefined || body.audioTrackId !== undefined) && body.generation === undefined)
           throw playbackError("STALE_SESSION", "播放请求已被替换", 409);
+        selectSubtitle(session, body);
         session.lastSeen = Date.now(); session.heartbeatSeen = true;
         if (body.position !== undefined) session.position = Math.max(0, Math.min(finite(body.position), session.metadata.duration));
         if (body.seekTime !== undefined || body.audioTrackId !== undefined) {
@@ -456,6 +565,8 @@ export function createPlaybackService(deps) {
           if (session.plan.strategy !== "DIRECT") await attach(session, session.position);
           await waitForReady(session, generation);
           if (generation !== session.generation) throw playbackError("STALE_SESSION", "播放请求已被替换", 409);
+          if (!authorizedMediaForRequest(request, response, session.media.id)) { release(session); return true; }
+          await validateMediaSourcePath(appState, session.media);
         }
         if (session.pipeline) { refreshPublished(session.pipeline); wake(session.pipeline); }
         sendJson(response, 200, descriptor(session)); return true;
@@ -463,7 +574,13 @@ export function createPlaybackService(deps) {
       if (!resource && ["GET", "HEAD"].includes(request.method)) { session.lastSeen = Date.now(); sendJson(response, 200, descriptor(session)); return true; }
       if (!["GET", "HEAD"].includes(request.method)) throw playbackError("METHOD_NOT_ALLOWED", "不支持的操作", 405);
       if (Number(url.searchParams.get("generation")) !== session.generation) throw playbackError("STALE_SESSION", "旧播放地址已失效", 409);
-      if (resource === "file" && session.plan.strategy === "DIRECT") { await streamFile(request, response, session.media.path, false); return true; }
+      if (resource === "file" && session.plan.strategy === "DIRECT") {
+        const releaseDevice = scheduler?.reservePlayback(session.media.path) || (() => {});
+        response.once('close', releaseDevice); response.once('finish', releaseDevice);
+        try { await streamFile(request, response, session.media.path, false); }
+        catch (error) { releaseDevice(); throw error; }
+        return true;
+      }
       const pipeline = session.pipeline;
       if (!pipeline) throw playbackError("NOT_FOUND", "分片不存在", 404);
       pipeline.accessed = Date.now();
@@ -495,11 +612,13 @@ export function createPlaybackService(deps) {
       return true;
     }
   }
-  function status() { return { sessions: sessions.size, pipelines: [...pipelines.values()].filter(item => item.child).length, cacheBytes, cacheMaxBytes: settings.cacheMaxBytes, ...metrics }; }
+  function status() { return { sessions: sessions.size, pipelines: [...pipelines.values()].filter(item => item.child).length, cacheBytes, cacheMaxBytes: settings.cacheMaxBytes, ...metrics, ...(resources ? { resources: resources.status() } : {}) }; }
   async function stop() {
     stopped = true; clearInterval(timers); clearInterval(cleaner);
     for (const session of [...sessions.values()]) release(session);
     for (const pipeline of pipelines.values()) { clearTimeout(pipeline.releaseTimer); pipeline.cancelled = true; pipeline.child?.kill(); wake(pipeline); }
+    for (const job of probes.values()) job.controller.abort();
+    await Promise.allSettled([...probes.values()].map(job => job.promise));
     await Promise.allSettled([...pipelines.values()].map(item => item.promise));
   }
   return { handleRequest, info, status, stop };

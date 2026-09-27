@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { chooseTitle, useTitleLanguage } from "../title-language";
-import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, LockKeyhole, UnlockKeyhole, Settings2, Captions, MessageSquare, SkipBack, SkipForward, RotateCcw, RotateCw, X, LoaderCircle } from "lucide-react";
+import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, LockKeyhole, UnlockKeyhole, Settings2, Captions, MessageSquare, SkipBack, SkipForward, RotateCcw, RotateCw, X, LoaderCircle, Download } from "lucide-react";
 import { PlaybackCore, audioTrackLabel, type PlaybackState } from "./core";
 import { SubtitleOverlay, type Subtitle, type FontAsset } from "./subtitles";
 import { DanmakuOverlay, DanmakuPanel, useDanmaku, stored, persist } from "./danmaku";
@@ -8,6 +8,7 @@ import { releaseMediaSession, updateMediaSession } from "../media-session";
 import "./player.css";
 
 export type PlayerMedia = { id: string; title: string; fileName: string; extension: string; size: number; modifiedAt?: string; subtitles: Subtitle[]; fonts: FontAsset[];
+  downloadUrl?: string;
   videoCodec?: string | null; audioCodec?: string | null; width?: number | null; height?: number | null; bitDepth?: number; hdr?: string | null; posterHue: number; demo?: boolean;
   display?: { configured: boolean; alias: string; title?: string; originalTitle?: string; seriesTitle?: string; season?: number; episode?: number; episodeTitle?: string; originalEpisodeTitle?: string } };
 type Props = { media: PlayerMedia; pageMode?: boolean; onClose?: () => void; previousMedia?: PlayerMedia | null; nextMedia?: PlayerMedia | null; onPrevious?: () => void; onNext?: () => void };
@@ -32,6 +33,7 @@ export function VideoPlayer(props: Props) {
   const [locked, setLocked] = useState(false), [pageFullscreen, setPageFullscreen] = useState(false), [systemFullscreen, setSystemFullscreen] = useState(false);
   const [subtitleId, setSubtitleId] = useState("off"), [delay, setDelay] = useState(0), [subtitleMode, setSubtitleMode] = useState<"styled" | "text">("styled");
   const [subtitleError, setSubtitleError] = useState(""), [subtitleFallbackReason, setSubtitleFallbackReason] = useState("");
+  const subtitleDefaultApplied = useRef<string | null>(null);
   const [toast, setToast] = useState(""), [preview, setPreview] = useState<number | null>(null);
   const [holdRate, setHoldRate] = useState(() => stored("lmd:player:holdRate", 3)), [brightness, setBrightness] = useState(1);
   const [boosting, setBoosting] = useState(false);
@@ -85,6 +87,7 @@ export function VideoPlayer(props: Props) {
   useEffect(() => {
     if (!video.current || media.demo) return;
     setState(initial); setSubtitleId("off"); setDelay(0); setLocked(false); setPanel(""); setSubtitleError(""); setSubtitleFallbackReason("");
+    subtitleDefaultApplied.current = null;
     const current = new PlaybackCore(video.current); coreRef.current = current; setCore(current);
     current.setVolume(stored("lmd:player:volume", 1)); current.setPlaybackRate(stored("lmd:player:rate", 1));
     const unsubscribe = current.subscribe((value, event) => {
@@ -102,6 +105,21 @@ export function VideoPlayer(props: Props) {
     void current.load(media.id);
     return () => { endBoost(); unsubscribe(); void current.destroy(); coreRef.current = null; releaseMediaSession("video"); };
   }, [media.id]);
+  const subtitleTracks = state.subtitleTracks || media.subtitles;
+  useEffect(() => {
+    if (!core || core.getState().mediaId !== media.id || subtitleDefaultApplied.current === media.id) return;
+    // An empty basic index entry does not mean that probing found no tracks.
+    if (!state.subtitleTracks && !media.subtitles.length) return;
+    subtitleDefaultApplied.current = media.id;
+    const preferred = stored("lmd:player:subtitlesEnabled", true) ? subtitleTracks.find(track => track.default) : undefined;
+    const id = preferred?.id || "off";
+    setSubtitleId(id); core.selectSubtitle(id === "off" ? null : id);
+  }, [core, media.id, media.subtitles, state.subtitleTracks, subtitleTracks]);
+  const selectSubtitle = (id: string) => {
+    subtitleDefaultApplied.current = media.id;
+    setSubtitleId(id); setSubtitleError(""); setSubtitleFallbackReason("");
+    persist("lmd:player:subtitlesEnabled", id !== "off"); core?.selectSubtitle(id === "off" ? null : id);
+  };
   useEffect(() => { if (state.paused) setVisible(true); else show(); }, [state.paused, show]);
   useEffect(() => {
     const changed = () => setSystemFullscreen(document.fullscreenElement === stage.current);
@@ -177,7 +195,12 @@ export function VideoPlayer(props: Props) {
     else { tapTime.current = now; singleTap.current = setTimeout(() => { if (visibleRef.current && !stateRef.current.paused) setVisible(false); else show(); }, 280); }
   };
   const openPanel = (name: typeof panel) => { keyHeld.current = false; leftSeekTarget.current = null; setPreview(null); endBoost(); if (panel === name) { closePanel(); return; } if (!settingsPanel.current?.contains(document.activeElement)) panelOpener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; setPanel(name); setVisible(true); };
-  const selected = media.subtitles.find(s => s.id === subtitleId);
+  const selected = subtitleTracks.find(s => s.id === subtitleId);
+  const preparation = state.subtitlePreparation?.trackId === subtitleId ? state.subtitlePreparation : undefined;
+  const preparedSubtitle = preparation?.state === "ready" && preparation.subtitle?.url ? preparation.subtitle : undefined;
+  const preparingSubtitle = Boolean(selected && (!preparation || ["queued", "running"].includes(preparation.state)));
+  const preparationError = selected && preparation?.state === "failed" ? preparation.error?.message || "字幕准备失败" : "";
+  const subtitleNotice = preparingSubtitle ? "字幕与所需字体正在准备，画面和声音可继续播放。" : preparationError || subtitleError;
   const player = <div className={`player-modal${pageMode ? " player-page-panel" : ""} lmd-player`}>
     <div className="player-topbar"><div><strong>{label(media)}</strong><span>{media.extension} · {media.videoCodec?.toUpperCase() || "原始媒体"}{media.bitDepth ? ` · ${media.bitDepth}-bit` : ""}</span></div>{!pageMode && onClose && <button className="close-button" aria-label="关闭播放器" onClick={onClose}><X size={20} /></button>}</div>
     <div ref={stage} tabIndex={0} aria-label="视频播放器" className={`lmd-stage${pageFullscreen ? " is-page-fullscreen" : ""}${visible ? " controls-visible" : ""}${locked ? " is-locked" : ""}`}
@@ -185,13 +208,13 @@ export function VideoPlayer(props: Props) {
       onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={e => pointerUp(e)} onPointerCancel={e => pointerUp(e, true)} onMouseMove={() => { inputMode.current = "pointer"; if (!locked) show(); }} onContextMenu={e => { if (boosting) e.preventDefault(); }}>
       {media.demo ? <div className="lmd-demo"><Play size={56} /><h2>你的私人放映室</h2><p>原片直放 · 按需兼容 · 字幕与弹幕</p></div> : <video ref={video} playsInline preload="metadata" />}
       <div className="lmd-brightness" style={{ opacity: 1 - brightness }} />
-      {core && <><DanmakuOverlay core={core} controller={danmaku} /><SubtitleOverlay core={core} subtitle={selected} fonts={media.fonts} delay={delay} mode={subtitleMode}
+      {core && <><DanmakuOverlay core={core} controller={danmaku} /><SubtitleOverlay core={core} subtitle={preparedSubtitle} fonts={preparation?.fonts || []} delay={delay} mode={subtitleMode}
         fallbackReason={subtitleFallbackReason} onFallback={handleSubtitleFallback} report={setSubtitleError} /></>}
       {!media.demo && state.buffering && !state.error && <div className="lmd-loading"><LoaderCircle className="spin" size={32} /><span>{state.seeking ? "正在定位…" : "准备播放…"}</span></div>}
       {!media.demo && (state.autoplayBlocked || state.error) && <div className="lmd-play-message"><p>{state.error || "点击开始播放"}</p><button onClick={() => state.error ? void core?.retry() : void core?.play()}><Play size={18} />{state.error ? "重试播放" : "播放"}</button></div>}
       {preview !== null && <div className="lmd-seek-feedback"><strong>{time(preview)}</strong><span>/ {time(state.duration)}</span></div>}
       {(toast || boosting) && <div className="lmd-toast" role="status">{boosting ? `${holdRate}× 倍速播放 · 松开恢复` : toast}</div>}
-      <div className="lmd-stage-heading"><span>{label(media)}</span>{fullscreen && <button aria-label="退出全屏" onClick={() => void fullscreenToggle()}><Minimize size={19} /></button>}</div>
+      <div className="lmd-stage-heading"><span>{label(media)}</span>{!media.demo && <a className="lmd-original-download" href={media.downloadUrl || `/api/media/${encodeURIComponent(media.id)}/download`} download aria-label="下载视频原件" title="下载视频原件" onPointerDown={event => event.stopPropagation()} onPointerUp={event => event.stopPropagation()}><Download size={19} /></a>}{fullscreen && <button aria-label="退出全屏" onClick={() => void fullscreenToggle()}><Minimize size={19} /></button>}</div>
       <button className="lmd-lock" aria-label={locked ? "解锁播放器" : "锁定播放器"} onClick={() => { endBoost(); setLocked(!locked); setPanel(""); show(); }}>{locked ? <LockKeyhole size={20} /> : <UnlockKeyhole size={20} />}</button>
       {!locked && <div className="lmd-controls" onPointerDown={e => e.stopPropagation()} onPointerUp={e => e.stopPropagation()}>
         <div className="lmd-progress"><div className="lmd-buffer-ranges">{state.buffered.map(([start, end], i) => <i key={i} style={{ left: `${start / state.duration * 100}%`, width: `${(end - start) / state.duration * 100}%` }} />)}</div><input aria-label="播放进度" type="range" min="0" max={state.duration || 1} step="0.01" value={preview ?? state.currentTime}
@@ -211,9 +234,9 @@ export function VideoPlayer(props: Props) {
         </div>
       </div>}
       {!locked && panel && <dialog ref={settingsPanel} onCancel={e => { e.preventDefault(); closePanel(); }} className="lmd-settings-panel" aria-label={panel === "subtitles" ? "字幕" : panel === "danmaku" ? "弹幕" : "播放设置"} onPointerDown={e => e.stopPropagation()}><header><strong>{panel === "subtitles" ? "字幕" : panel === "danmaku" ? "弹幕" : "播放设置"}</strong><button aria-label="关闭设置" onClick={closePanel}><X size={18} /></button></header>
-        {panel === "subtitles" && <div className="lmd-panel-fields"><label>字幕轨道<select value={subtitleId} onChange={e => { setSubtitleId(e.target.value); setSubtitleError(""); setSubtitleFallbackReason(""); }}><option value="off">关闭字幕</option>{media.subtitles.map(s => <option key={s.id} value={s.id}>{s.language} · {s.format} · {s.name}</option>)}</select></label>
+        {panel === "subtitles" && <div className="lmd-panel-fields"><label>字幕轨道<select value={subtitleId} onChange={e => selectSubtitle(e.target.value)}><option value="off">关闭字幕</option>{subtitleTracks.map(s => <option key={s.id} value={s.id}>{s.language} · {s.format} · {s.name}{s.default ? " · 默认" : ""}</option>)}</select></label>
           {selected && ["ASS", "SSA"].includes(selected.format) && <label>渲染方式<select value={subtitleMode} onChange={e => { setSubtitleMode(e.target.value as "styled" | "text"); setSubtitleError(""); setSubtitleFallbackReason(""); }}><option value="styled">ASS 特效 · libass</option><option value="text">纯文本后备模式</option></select></label>}
-          <label>延后秒数<input type="number" min="-3600" max="3600" step="0.1" value={delay} onChange={e => setDelay(Number(e.target.value) || 0)} /></label><p>正值延后，负值提前。字幕与原视频时间同步。</p>{subtitleError && <p role="status" className="lmd-panel-message">{subtitleError}</p>}</div>}
+          <label>延后秒数<input type="number" min="-3600" max="3600" step="0.1" value={delay} onChange={e => setDelay(Number(e.target.value) || 0)} /></label><p>正值延后，负值提前。字幕就绪后接入当前播放位置。</p>{subtitleNotice && <p role="status" className="lmd-panel-message">{subtitleNotice}</p>}{preparationError && <button onClick={() => core?.selectSubtitle(subtitleId, true)}>重试字幕准备</button>}</div>}
         {panel === "danmaku" && <DanmakuPanel controller={danmaku} currentTime={state.currentTime} />}
         {panel === "settings" && <div className="lmd-panel-fields"><label>播放速度<select value={state.playbackRate} onChange={e => core?.setPlaybackRate(+e.target.value)}>{[0.5, 0.75, 1, 1.25, 1.5, 2, 3].map(rate => <option key={rate} value={rate}>{rate}×</option>)}</select></label>
           <label>长按倍速<select value={holdRate} onChange={e => { setHoldRate(+e.target.value); persist("lmd:player:holdRate", +e.target.value); }}><option value={2}>2×</option><option value={3}>3×</option></select></label>
@@ -222,7 +245,7 @@ export function VideoPlayer(props: Props) {
           <details><summary>播放信息</summary><p>{state.strategy || "准备中"} · {state.transport}</p><p>首帧 {state.firstFrameMs ?? "—"} ms · Seek {state.lastSeekMs ?? "—"} ms</p><p>{media.width} × {media.height}{media.hdr ? ` · ${media.hdr}` : ""}</p></details></div>}
       </dialog>}
     </div>
-    {subtitleError && !panel && <div className="lmd-subtitle-notice" role="status">{subtitleError}<button onClick={() => openPanel("subtitles")}>字幕设置</button></div>}
+    {subtitleNotice && !panel && <div className="lmd-subtitle-notice" role="status">{subtitleNotice}{preparationError && <button onClick={() => core?.selectSubtitle(subtitleId, true)}>重试字幕</button>}<button onClick={() => openPanel("subtitles")}>字幕设置</button></div>}
     {pageMode && !fullscreen && <div className="player-episode-nav" aria-label="剧集导航"><button className="previous-episode-button" onClick={onPrevious} disabled={!previousMedia}><SkipBack size={18} /><span>{previousMedia ? "上一集" : "已是第一集"}</span></button><button className="next-episode-button" onClick={nextEpisode} disabled={!nextMedia}><span>{nextMedia ? "下一集" : "已是最后一集"}</span><SkipForward size={18} /></button></div>}
   </div>;
   return pageMode ? player : <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label={`播放 ${label(media)}`}>{player}</div>;

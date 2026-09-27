@@ -61,7 +61,7 @@ try {
     assert.equal((await response.json()).code, 'PROBE_FAILED');
   }
   assert.equal(service.status().sessions, 0); assert.equal(service.status().pipelinesCreated, 0);
-  broken = false; assert.equal((await request('/api/media/sample/info')).status, 200);
+  broken = false; assert.equal((await request('/api/media/sample/info?retry=1')).status, 200);
   console.log('PASS: method matrix, Allow, HEAD, zero side effects, stale generations, probe recovery');
 } finally {
   await service.stop(); await new Promise(resolve => server.close(resolve));
