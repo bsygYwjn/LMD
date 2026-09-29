@@ -37,4 +37,17 @@ jobs:
           Copy-Item -LiteralPath $binary.FullName -Destination tools/ffmpeg/bin/ffmpeg.exe
           Copy-Item -LiteralPath (Join-Path $binary.DirectoryName 'ffprobe.exe') -Destination tools/ffmpeg/bin/ffprobe.exe
       - run: pnpm run build
-      - run: pnpm run test:all
+      - name: Run tests with a physical temporary directory
+        shell: pwsh
+        run: |
+          # Windows runner temp paths can be aliases. Source safety checks require the physical path.
+          $testTemp = Join-Path $env:RUNNER_TEMP 'lmd-tests'
+          New-Item -ItemType Directory -Path $testTemp -Force | Out-Null
+          $physicalTemp = node -p "require('node:fs').realpathSync.native(process.argv[1])" $testTemp
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to resolve the test temporary directory' }
+          $env:TEMP = $physicalTemp
+          $env:TMP = $physicalTemp
+          $resolvedTemp = node -p "require('node:fs').realpathSync.native(require('node:os').tmpdir())"
+          if ($LASTEXITCODE -ne 0 -or $resolvedTemp -ine $physicalTemp) { throw 'Test temporary directory is not physical' }
+          Write-Host "Test temporary directory: $physicalTemp"
+          pnpm run test:all
