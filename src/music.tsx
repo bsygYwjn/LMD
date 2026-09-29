@@ -1,8 +1,10 @@
 import React, { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { updateMediaSession, releaseMediaSession } from "./media-session";
+import { DownloadSelection, useDownloadSelection } from "./downloads";
 import {
   Disc3,
+  Download,
   FileMusic,
   FolderOpen,
   HardDrive,
@@ -47,6 +49,7 @@ export type MusicTrack = {
   tags: string[];
   folderId: string;
   streamUrl: string;
+  downloadUrl?: string;
   compatibleUrl: string | null;
   preferredMime: string;
   coverUrls: { 256?: string; 1024?: string } | null;
@@ -387,7 +390,7 @@ function tracksUnderFolder(catalog: MusicCatalog, folderId: string) {
   return queue;
 }
 
-function MusicFolderCard({ folder, catalog, onOpen, action = "open" }: { folder: MusicFolder; catalog: MusicCatalog; onOpen: () => void; action?: "open" | "play" }) {
+function MusicFolderCard({ folder, catalog, onOpen, onPlay }: { folder: MusicFolder; catalog: MusicCatalog; onOpen: () => void; onPlay?: () => void }) {
   const cover = folderCover(folder, catalog);
   const presentsAlbum = Boolean(cover?.album && !folder.childCount);
   const title = presentsAlbum ? cover!.album : folder.title;
@@ -397,12 +400,13 @@ function MusicFolderCard({ folder, catalog, onOpen, action = "open" }: { folder:
   const kindLabel = presentsAlbum ? "专辑" : "音乐文件夹";
   return (
     <article className="music-folder-card">
-      <button type="button" className="music-folder-cover" onClick={onOpen} aria-label={`${action === "play" ? "播放" : "打开"}${kindLabel} ${title}`}>
+      <button type="button" className="music-folder-cover" onClick={onOpen} aria-label={`打开${kindLabel} ${title}`}>
         <MusicArtwork track={cover} large />
-        <span className="music-folder-badge">{action === "play" ? <Play size={13} fill="currentColor" /> : <FileMusic size={13} />}{action === "play" ? "播放" : presentsAlbum ? "专辑" : "文件夹"}</span>
+        <span className="music-folder-badge"><FileMusic size={13} />{presentsAlbum ? "专辑" : "文件夹"}</span>
       </button>
       <h3 title={title}>{title}</h3>
       <p>{detail}</p>
+      {onPlay && <button className="btn btn--sm music-folder-play" aria-label={`播放文件夹 ${title}`} onClick={onPlay}><Play size={13} />播放</button>}
     </article>
   );
 }
@@ -448,18 +452,12 @@ export function MusicHomeSection({ catalog, search, onOpenFolder, onOpenTrack }:
     onOpenTrack(track);
   };
   const openFolder = (folder: MusicFolder) => {
-    const queue = catalog ? tracksUnderFolder(catalog, folder.id) : [];
-    if (!folder.childCount && queue.length) {
-      player.playTrack(queue[0], queue, true);
-      onOpenTrack(queue[0]);
-      return;
-    }
     onOpenFolder(folder.id);
   };
   return (
     <section className="media-section music-library-section">
       <div className="section-heading"><div><span className="section-kicker">MUSIC</span><h2>全部音乐目录</h2></div><span className="media-count">{roots.length} 个文件夹 · {catalog?.tracks.length || 0} 首歌曲</span></div>
-      {roots.length ? <div className="music-folder-grid">{roots.map((folder) => <MusicFolderCard key={folder.id} folder={folder} catalog={catalog!} action={!folder.childCount && folder.mediaCount ? "play" : "open"} onOpen={() => openFolder(folder)} />)}</div> : !normalizedSearch && <div className="client-empty music-home-empty"><Disc3 size={30} /><strong>音乐库暂时为空</strong><span>在本机管理端添加音乐目录并扫描后，会在这里按磁盘层级显示。</span></div>}
+      {roots.length ? <div className="music-folder-grid">{roots.map((folder) => <MusicFolderCard key={folder.id} folder={folder} catalog={catalog!} onOpen={() => openFolder(folder)} onPlay={folder.mediaCount ? () => { const queue = tracksUnderFolder(catalog!, folder.id); if (queue.length) player.playTrack(queue[0], queue, true); } : undefined} />)}</div> : !normalizedSearch && <div className="client-empty music-home-empty"><Disc3 size={30} /><strong>音乐库暂时为空</strong><span>在本机管理端添加音乐目录并扫描后，会在这里按磁盘层级显示。</span></div>}
       {normalizedSearch && <div className="music-search-results"><h3>歌曲搜索结果</h3><MusicTrackList tracks={matchingTracks} onOpen={openTrack} emptyText="没有匹配的歌曲、艺术家或专辑" /></div>}
     </section>
   );
@@ -474,6 +472,7 @@ export function MusicFolderView({ catalog, folderId, search, onOpenFolder, onOpe
   onBackToLibrary: () => void;
 }) {
   const player = useMusicPlayer();
+  const selection = useDownloadSelection();
   const folderById = useMemo(() => new Map(catalog.folders.map((folder) => [folder.id, folder])), [catalog.folders]);
   const rootFolders = catalog.folders.filter((folder) => folder.parentId === null);
   const singleRootFolder = rootFolders.length === 1 ? rootFolders[0] : null;
@@ -499,12 +498,6 @@ export function MusicFolderView({ catalog, folderId, search, onOpenFolder, onOpe
     onOpenTrack(track);
   };
   const openFolder = (folder: MusicFolder) => {
-    const queue = tracksUnderFolder(catalog, folder.id);
-    if (!folder.childCount && queue.length) {
-      player.playTrack(queue[0], queue, true);
-      onOpenTrack(queue[0]);
-      return;
-    }
     onOpenFolder(folder.id);
   };
   if (!catalog.folders.length) return <div className="empty-state"><Music2 size={24} /><strong>音乐目录暂时为空</strong><span>在管理端添加音乐目录并扫描后，会在这里列出你的音乐。</span></div>;
@@ -516,8 +509,9 @@ export function MusicFolderView({ catalog, folderId, search, onOpenFolder, onOpe
         <span className="lib-stats">{childFolders.length} 个文件夹 · {normalizedSearch ? visibleTracks.length : currentFolder ? currentQueue.length : catalog.tracks.length} 首歌曲</span>
         {currentFolder && !!currentQueue.length && <div className="lib-toolbar-actions"><button type="button" className="btn btn--sm" onClick={() => player.playTrack(currentQueue[0], currentQueue, true)}><Play size={14} fill="currentColor" />播放当前文件夹</button></div>}
       </div>
-      {childFolders.length > 0 && <div className="mus-folders">{childFolders.map((folder) => <MusicFolderCard key={folder.id} folder={folder} catalog={catalog} action={!folder.childCount && folder.mediaCount ? "play" : "open"} onOpen={() => openFolder(folder)} />)}</div>}
-      {visibleTracks.length > 0 && <div className="track-list">{visibleTracks.map((track, index) => <button type="button" className={`track-row${player.currentTrack?.id === track.id ? " is-playing" : ""}`} key={track.id} onClick={() => play(track)}><span className="track-index">{player.currentTrack?.id === track.id ? <span className="track-eq" aria-hidden="true"><i /><i /><i /></span> : index + 1}</span><MusicArtwork track={track} className="track-art" /><span className="track-main"><span className="track-title">{track.title}</span><span className="track-artist">{artistLabel(track)}</span></span><span className="track-album">{track.album || "未标记专辑"}</span><span className="track-duration">{durationLabel(track.durationSeconds)}</span></button>)}</div>}
+      {childFolders.length > 0 && <div className="mus-folders">{childFolders.map((folder) => <MusicFolderCard key={folder.id} folder={folder} catalog={catalog} onOpen={() => openFolder(folder)} onPlay={folder.mediaCount ? () => { const queue = tracksUnderFolder(catalog, folder.id); if (queue.length) player.playTrack(queue[0], queue, true); } : undefined} />)}</div>}
+      <DownloadSelection kind="music" items={visibleTracks} selected={selection.selected} onSelect={selection.setSelected} />
+      {visibleTracks.length > 0 && <div className="track-list">{visibleTracks.map((track, index) => <div className={`track-row${player.currentTrack?.id === track.id ? " is-playing" : ""}`} key={track.id}><input type="checkbox" aria-label={`选择下载 ${track.fileName}`} checked={selection.selected.has(track.id)} onChange={() => selection.toggle(track.id)} /><button className="track-play-content" onClick={() => play(track)} aria-label={`播放 ${track.title}`}><span className="track-index">{player.currentTrack?.id === track.id ? <span className="track-eq" aria-hidden="true"><i /><i /><i /></span> : index + 1}</span><MusicArtwork track={track} className="track-art" /><span className="track-main"><span className="track-title">{track.title}</span><span className="track-artist">{artistLabel(track)}</span></span><span className="track-album">{track.album || "未标记专辑"}</span><span className="track-duration">{durationLabel(track.durationSeconds)}</span></button><a className="icon-btn" href={track.downloadUrl || `/api/music/tracks/${encodeURIComponent(track.id)}/download`} download aria-label={`下载原件 ${track.fileName}`}><Download size={15} /></a></div>)}</div>}
       {!visibleTracks.length && (normalizedSearch || !childFolders.length) && <div className="empty-state"><Music2 size={24} /><strong>{normalizedSearch ? "没有匹配的歌曲、艺术家或专辑" : "这个文件夹暂时没有歌曲"}</strong></div>}
     </div>
   );
@@ -882,6 +876,7 @@ export function MusicFullPlayer({ catalog, trackId }: { catalog: MusicCatalog; t
           {!queueInOverlay && queueAnchor}
         </div>
         <div className="music-technical">
+          <a className="btn btn--sm" href={track.downloadUrl || `/api/music/tracks/${encodeURIComponent(track.id)}/download`} download aria-label={`下载原件 ${track.fileName}`}><Download size={14} />下载原件</a>
           <span>{track.extension}</span><span>{track.codec || track.container}</span>
           {track.sampleRate && <span>{(track.sampleRate / 1000).toFixed(1)} kHz</span>}
           {track.bitDepth && <span>{track.bitDepth}-bit</span>}

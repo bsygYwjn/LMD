@@ -104,6 +104,7 @@ const WEBM_AUDIO_CODECS = new Set(["opus", "vorbis"]);
 const MP4_COPYABLE_VIDEO_CODECS = new Set(["h264", "hevc", "av1", "mpeg4"]);
 const MP4_BROWSER_AUDIO_CODECS = new Set(["aac", "mp3"]);
 const COMPATIBLE_COPY_VERSION = 2;
+const THUMBNAIL_VERSION = 2;
 const LEGACY_CACHE_MTIME_TOLERANCE_MS = 2000;
 const SCAN_CHECKPOINT_ITEM_COUNT = 12;
 const SCAN_CHECKPOINT_INTERVAL_MS = 2000;
@@ -236,6 +237,17 @@ async function loadState() {
 }
 
 let appState = await loadState();
+// Version 1 previews often captured a black first frame before duration was
+// known. Detach those generated images so visible cards request a new preview.
+let outdatedThumbnailCount = 0;
+for (const media of appState.media) {
+  if (!media.thumbnailPath || path.resolve(media.thumbnailPath) === path.resolve(thumbnailCachePath(media.id, mediaSourceSignature(media)))) continue;
+  media.thumbnailPath = null;
+  media.thumbnail = { state: 'unknown' };
+  media.entryRevision = (media.entryRevision || 0) + 1;
+  outdatedThumbnailCount++;
+}
+if (outdatedThumbnailCount) appState.catalogRevision = (Number(appState.catalogRevision) || 0) + 1;
 const labelService = await createLabelService({ directory: DATA_DIR, getState: () => appState, folderForMedia: folderPathForMedia, stableId, episodeForMedia: m => detectedEpisodeNumber(m.fileName) });
 let musicService = null;
 let readingService = null;
@@ -1734,38 +1746,95 @@ async function extractEmbeddedAssets(filePath, mediaId, probe, sidecars, sourceS
   return { subtitles, fonts };
 }
 
-// Generate one real preview frame per video. The JPG lives in data/cache, so
-// original videos are never modified and later scans can reuse the same image.
-async function ensureVideoThumbnail(filePath, mediaId, durationSeconds = 0, existingPath = null, sourceSignature = "", sourceModifiedAt = 0, allowLegacyCache = true, executeCommand = runCommand) {
-  const legacyPath = path.join(THUMBNAIL_CACHE_DIR, `${mediaId}.jpg`);
-  const outputPath = path.join(THUMBNAIL_CACHE_DIR, `${mediaId}${sourceSignature ? `-${sourceSignature}` : ""}.jpg`);
-  // The caller may have just re-probed a replaced source while still retaining
-  // its old thumbnail field. Only this version's exact filename is reusable.
+function thumbnailCachePath(mediaId, sourceSignature) {
+  return path.join(THUMBNAIL_CACHE_DIR, `${mediaId}-v${THUMBNAIL_VERSION}${sourceSignature ? `-${sourceSignature}` : ''}.jpg`);
+}
+
+function thumbnailSeekPoints(durationSeconds) {
+  const duration = Number(durationSeconds);
+  const points = Number.isFinite(duration) && duration > 0
+    ? duration > 60
+      ? [Math.min(duration * 0.12, 300), Math.min(duration * 0.35, 900), Math.min(duration * 0.7, 1800)]
+      : [duration * 0.2, duration * 0.5, duration * 0.75]
+    : [10, 5, 2];
+  // An inaccurate container duration or broken seek index may still allow the
+  // opening frame to decode, so retain zero as the final fallback.
+  return [...new Set([...points, 0].map(point => Math.max(0, Math.min(point, duration > 0 ? Math.max(0, duration - 0.25) : point)).toFixed(3)))];
+}
+
+function thumbnailFrameQuality(output) {
+  const number = key => Number(output.match(new RegExp(`lavfi\\.signalstats\\.${key}=([\\d.]+)`))?.[1]);
+  const low = number('YLOW'), average = number('YAVG'), high = number('YHIGH');
+  if (![low, average, high].every(Number.isFinite)) return { usable: false, score: null };
+  const contrast = high - low;
+  return { usable: contrast >= 30 && average > 8 && average < 247, score: contrast + Math.min(average, 255 - average) * 0.25 };
+}
+
+// Generate one real preview frame per video. Unknown duration is probed only
+// when this video's card becomes visible; the regular library scan stays fast.
+async function ensureVideoThumbnail(filePath, mediaId, durationSeconds = 0, existingPath = null, sourceSignature = "", executeCommand = runCommand) {
+  const outputPath = thumbnailCachePath(mediaId, sourceSignature);
   const existingFile = existingPath && path.resolve(existingPath) === path.resolve(outputPath) && await usableCacheFile(existingPath, { signatureBound: true });
   if (existingFile) return existingFile.path;
-  const cached = await reusableGeneratedCachePath(outputPath, legacyPath, { sourceModifiedAt,
-    allowLegacyCache: allowLegacyCache && (!existingPath || path.resolve(existingPath) === path.resolve(legacyPath)) });
+  const cached = await usableCacheFile(outputPath, { signatureBound: true });
   if (cached) return cached.path;
   if (!mediaTools.available) return null;
 
-  const seekSeconds = durationSeconds > 60
-    ? Math.min(durationSeconds * 0.12, 300)
-    : Math.min(Math.max(durationSeconds * 0.2, 0), 10);
-  const args = [
-    "-hide_banner", "-loglevel", "error", "-y",
-    "-ss", seekSeconds.toFixed(3), "-i", filePath,
-    "-map", "0:v:0", "-frames:v", "1", "-an", "-sn", "-dn",
-    "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2",
-    "-threads", "1", "-q:v", "3", outputPath,
-  ];
+  const deadline = Date.now() + 90000;
+  let duration = Number(durationSeconds) || 0;
+  if (!(duration > 0)) {
+    try {
+      // This runs inside the thumbnail scheduler task; calling probeVideo here
+      // would queue another device task and could deadlock the same device.
+      const result = await executeCommand(mediaTools.ffprobe,
+        ['-v', 'error', '-show_entries', 'format=duration:stream=duration', '-of', 'json', filePath], Math.min(20000, deadline - Date.now()));
+      const probe = JSON.parse(result.stdout);
+      duration = [probe.format?.duration, ...(probe.streams || []).map(stream => stream.duration)]
+        .map(Number).find(value => Number.isFinite(value) && value > 0) || 0;
+    } catch (error) {
+      if (error?.code === 'TASK_CANCELLED' || error?.name === 'AbortError') throw error;
+    }
+  }
+
+  let best = null, lastError = null;
   try {
-    await executeCommand(mediaTools.ffmpeg, args, 60000);
-    const thumbnailStat = await stat(outputPath).catch(() => null);
-    return thumbnailStat?.size ? outputPath : null;
-  } catch (error) {
-    await unlink(outputPath).catch(() => {});
-    console.error(`无法生成视频缩略图 ${filePath}: ${error.message}`);
+    for (const seekSeconds of thumbnailSeekPoints(duration)) {
+      if (deadline - Date.now() < 1000) break;
+      const temporaryPath = `${outputPath}.${randomUUID()}.tmp.jpg`;
+      const args = [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-ss', seekSeconds, '-i', filePath,
+        '-map', '0:v:0', '-frames:v', '1', '-an', '-sn', '-dn',
+        '-vf', 'scale=640:360:force_original_aspect_ratio=decrease,format=yuv420p,signalstats,metadata=mode=print:file=-,pad=640:360:(ow-iw)/2:(oh-ih)/2',
+        '-threads', '1', '-q:v', '3', temporaryPath,
+      ];
+      try {
+        const result = await executeCommand(mediaTools.ffmpeg, args, Math.min(60000, deadline - Date.now()));
+        const generated = await usableCacheFile(temporaryPath, { signatureBound: true });
+        if (!generated) throw new Error('FFmpeg 未输出图像');
+        const quality = thumbnailFrameQuality(result.stdout);
+        if (quality.usable) {
+          const published = await publishGeneratedCacheFile(temporaryPath, outputPath);
+          return published?.path || null;
+        }
+        // If an older FFmpeg omits the statistics, prefer the candidate with
+        // more image detail instead of immediately accepting the first frame.
+        const score = quality.score ?? Math.log2(generated.stat.size) * 4;
+        if (!best || score > best.score) {
+          if (best) await unlink(best.path).catch(() => {});
+          best = { path: temporaryPath, score };
+        } else await unlink(temporaryPath).catch(() => {});
+      } catch (error) {
+        await unlink(temporaryPath).catch(() => {});
+        if (error?.code === 'TASK_CANCELLED' || error?.name === 'AbortError') throw error;
+        lastError = error;
+      }
+    }
+    if (best) return (await publishGeneratedCacheFile(best.path, outputPath))?.path || null;
+    console.error(`无法生成视频缩略图 ${filePath}: ${lastError?.message || '无法提取任何画面'}`);
     return null;
+  } finally {
+    if (best) await unlink(best.path).catch(() => {});
   }
 }
 
@@ -4124,10 +4193,10 @@ const server = createServer(async (request, response) => {
               throw Object.assign(new Error('视频已变化，请重新打开。'), { code: 'SOURCE_CHANGED', statusCode: 409 });
             return latest;
           };
-          const thumbnailPath = await mediaTaskScheduler.schedule({ key: 'thumbnail:' + media.id + ':' + signature + ':v1', sourcePath: media.path, kind: 'thumbnail', priority: 40,
+          const thumbnailPath = await mediaTaskScheduler.schedule({ key: 'thumbnail:' + media.id + ':' + signature + ':v' + THUMBNAIL_VERSION, sourcePath: media.path, kind: 'thumbnail', priority: 40,
             run: async ({ signal }) => {
               await verifySource();
-              const result = await ensureVideoThumbnail(media.path, media.id, media.durationSeconds, media.thumbnailPath, signature, source.mtimeMs, true,
+              const result = await ensureVideoThumbnail(media.path, media.id, media.durationSeconds, media.thumbnailPath, signature,
                 (executable,args,timeoutMs,options = {}) => runCommand(executable,args,timeoutMs,{...options,signal}));
               await verifySource(); return result;
             } });

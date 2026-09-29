@@ -8,6 +8,7 @@ pnpm-debug.log*
 
 # Generated web and TypeScript output
 dist/
+dist-transfer-preview/
 *.tsbuildinfo
 coverage/
 .nyc_output/
